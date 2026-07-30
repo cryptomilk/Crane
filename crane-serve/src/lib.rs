@@ -391,6 +391,11 @@ fn resolve_dtype(
     if device.is_cuda() {
         return Ok(DType::BF16);
     }
+    // ROCm backend is experimental: F16 has the broadest kernel coverage on candle's
+    // rocm path today, whereas BF16 support is still incomplete. Default there.
+    if device.is_rocm() {
+        return Ok(DType::F16);
+    }
     if device.is_metal()
         && matches!(model_type, ModelType::Qwen3_5 | ModelType::VoxCpm2)
     {
@@ -405,11 +410,18 @@ pub async fn run(args: Args) -> Result<()> {
     let device = if args.cpu {
         crane_core::models::Device::Cpu
     } else {
+        // Exactly one backend is selected, in priority order: cuda → rocm → metal → cpu.
+        // cuda and rocm are mutually exclusive builds; the cfg gates below never overlap.
         #[cfg(feature = "cuda")]
         {
             crane_core::models::Device::cuda_if_available(0)?
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(all(not(feature = "cuda"), feature = "rocm"))]
+        {
+            // Fall back to CPU when no AMD GPU is present, mirroring the metal idiom.
+            crane_core::models::Device::new_rocm(0).unwrap_or(crane_core::models::Device::Cpu)
+        }
+        #[cfg(all(not(feature = "cuda"), not(feature = "rocm")))]
         {
             #[cfg(target_os = "macos")]
             {
