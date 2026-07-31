@@ -1534,27 +1534,15 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             },
-            // https://onnx.ai/onnx/operators/onnx__ReduceMean.html#reducemean-13
-            // TODO: This version is only compatible with ReduceMean V13 and below.
+            // https://onnx.ai/onnx/operators/onnx__ReduceMean.html
+            // Crane Added 20260731: implementation lives in ops/reduce_mean.rs.
             "ReduceMean" => {
                 let input = get(&node.input[0])?;
-                let axes = get_attr_opt::<[i64]>(node, "axes")?;
-                let keepdims = get_attr_opt::<i64>(node, "keepdims")?.copied().unwrap_or(1);
-
-                let n_dims = input.dims().len();
-
-                let axes: Vec<usize> = if let Some(axes) = axes {
-                    axes.iter()
-                        .map(|e| (if e < &0 { (n_dims as i64) + *e } else { *e }) as usize)
-                        .collect()
-                } else {
-                    (0..n_dims).collect()
+                let axes = match get_opt(1) {
+                    Some(Ok(axes)) => Some(axes),
+                    Some(Err(_)) | None => None,
                 };
-                let output = if keepdims == 1 {
-                    input.mean_keepdim(axes)?
-                } else {
-                    input.mean(axes)?
-                };
+                let output = ops::reduce_mean::reduce_mean(node, input, axes)?;
                 values.insert(node.output[0].clone(), output);
             },
             // https://onnx.ai/onnx/operators/onnx__ReduceMin.html#reducemin
