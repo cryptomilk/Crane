@@ -3,6 +3,7 @@
 pub(crate) mod activation;
 pub(crate) mod atan;
 pub(crate) mod conv_transpose;
+pub(crate) mod cumsum;
 pub(crate) mod layer_norm;
 pub(crate) mod lstm;
 pub(crate) mod modulo;
