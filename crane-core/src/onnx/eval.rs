@@ -1737,35 +1737,14 @@ fn simple_eval_(
             },
             //https://github.com/onnx/onnx/blob/main/docs/Operators.md#ReduceSum
             // Version 13 impl
+            // Crane Added 20260731: implementation lives in ops/reduce_sum.rs.
             "ReduceSum" => {
                 let input = get(&node.input[0])?;
-                let axes = get_opt(1);
-                let keepdims = get_attr_opt::<i64>(node, "keepdims")?.copied().unwrap_or(1);
-                let noop_with_empty_axes = get_attr_opt::<i64>(node, "noop_with_empty_axes")?
-                    .copied()
-                    .unwrap_or(0);
-
-                let axes = match axes {
-                    Some(Ok(axes)) => axes
-                        .to_vec1::<i64>()?
-                        .into_iter()
-                        .map(|x| x as usize)
-                        .collect::<Vec<_>>(),
-                    Some(Err(_)) | None => {
-                        if noop_with_empty_axes == 1 {
-                            vec![]
-                        } else {
-                            (0..input.rank()).collect()
-                        }
-                    },
+                let axes = match get_opt(1) {
+                    Some(Ok(axes)) => Some(axes),
+                    Some(Err(_)) | None => None,
                 };
-
-                let output = if keepdims == 1 {
-                    input.sum_keepdim(axes)?
-                } else {
-                    input.sum(axes)?
-                };
-
+                let output = ops::reduce_sum::reduce_sum(node, input, axes)?;
                 values.insert(node.output[0].clone(), output);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#ReduceL2
