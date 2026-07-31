@@ -2504,6 +2504,9 @@ fn simple_eval_(
 
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260731: use where_cond instead of multiplication
+            // to avoid 0 * inf = NaN when the input contains +/-inf (the
+            // standard causal-attention-mask pattern).
             "Trilu" => {
                 let input = get(&node.input[0])?;
 
@@ -2528,23 +2531,24 @@ fn simple_eval_(
                 let m = dims[dims.len() - 1];
                 let max_dim = std::cmp::max(n, m);
 
-                // Handle the diagonal offset k
+                // Build a U8 0/1 mask used as a where_cond condition (not
+                // multiplied against input, so it doesn't need input's dtype).
                 let mask = if k != 0 {
-                    let mut data = vec![0u32; n * m];
+                    let mut data = vec![0u8; n * m];
                     for i in 0..n {
                         for j in 0..m {
                             if (upper != 0 && (j as i64) >= (i as i64) + k)
                                 || (upper == 0 && (j as i64) <= (i as i64) + k)
                             {
-                                data[i * m + j] = 1u32;
+                                data[i * m + j] = 1u8;
                             }
                         }
                     }
-                    Tensor::from_vec(data, (n, m), input.device())?.to_dtype(input.dtype())?
+                    Tensor::from_vec(data, (n, m), input.device())?
                 } else if upper == 0 {
-                    Tensor::tril2(max_dim, input.dtype(), input.device())?
+                    Tensor::tril2(max_dim, DType::U8, input.device())?
                 } else {
-                    Tensor::triu2(max_dim, input.dtype(), input.device())?
+                    Tensor::triu2(max_dim, DType::U8, input.device())?
                 };
 
                 let final_mask = if n != m {
@@ -2553,7 +2557,8 @@ fn simple_eval_(
                     mask
                 };
 
-                let output = (input * &final_mask)?;
+                let zeros = Tensor::zeros(input.dims(), input.dtype(), input.device())?;
+                let output = final_mask.broadcast_as(input.dims())?.where_cond(input, &zeros)?;
 
                 values.insert(node.output[0].clone(), output);
             },
@@ -2808,10 +2813,12 @@ fn to_vec0_flexible<T: candle::WithDType>(t: &Tensor) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use candle_core::{Device, Result};
+    use candle_core::{Device, Result, Tensor};
 
     use super::{Value, simple_eval};
-    use crate::onnx::proto::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
+    use crate::onnx::proto::attribute_proto::AttributeType;
+    use crate::onnx::proto::{AttributeProto, GraphProto, ModelProto, NodeProto, ValueInfoProto};
+    use std::collections::HashMap;
 
     #[test]
     fn round_rounds_half_away_from_zero() -> Result<()> {
@@ -2848,5 +2855,95 @@ mod tests {
             vec![1.0, 3.0, -1.0, -3.0, 1.0, 2.0]
         );
         Ok(())
+    }
+
+    fn int_attr(name: &str, value: i64) -> AttributeProto {
+        AttributeProto {
+            name: name.to_string(),
+            r#type: AttributeType::Int as i32,
+            i: value,
+            ..Default::default()
+        }
+    }
+
+    fn trilu_node(inputs: Vec<&str>, upper: i64) -> NodeProto {
+        NodeProto {
+            op_type: "Trilu".to_string(),
+            input: inputs.into_iter().map(str::to_string).collect(),
+            output: vec!["y".to_string()],
+            attribute: vec![int_attr("upper", upper)],
+            ..Default::default()
+        }
+    }
+
+    fn eval_trilu(mut graph: GraphProto, inputs: HashMap<String, Value>) -> Vec<Vec<f32>> {
+        graph.output = vec![ValueInfoProto {
+            name: "y".to_string(),
+            ..Default::default()
+        }];
+        let model = ModelProto {
+            graph: Some(graph),
+            ..Default::default()
+        };
+        let outputs = simple_eval(&model, inputs).unwrap();
+        outputs.get("y").unwrap().to_vec2::<f32>().unwrap()
+    }
+
+    // Verifies upper Trilu zeroes out the lower triangle without producing
+    // NaN when the input is -inf (the standard causal-attention-mask case).
+    #[test]
+    fn trilu_upper_avoids_nan_with_infinite_input() {
+        let neg_inf = f32::NEG_INFINITY;
+        let x = Tensor::new(&[[neg_inf; 3], [neg_inf; 3], [neg_inf; 3]], &Device::Cpu).unwrap();
+        let graph = GraphProto {
+            node: vec![trilu_node(vec!["x"], 1)],
+            ..Default::default()
+        };
+        let inputs = HashMap::from([("x".to_string(), x)]);
+
+        let y = eval_trilu(graph, inputs);
+
+        assert_eq!(y[0], vec![neg_inf, neg_inf, neg_inf]);
+        assert_eq!(y[1], vec![0.0, neg_inf, neg_inf]);
+        assert_eq!(y[2], vec![0.0, 0.0, neg_inf]);
+    }
+
+    // Verifies lower Trilu zeroes out the upper triangle without producing
+    // NaN when the input is -inf.
+    #[test]
+    fn trilu_lower_avoids_nan_with_infinite_input() {
+        let neg_inf = f32::NEG_INFINITY;
+        let x = Tensor::new(&[[neg_inf; 3], [neg_inf; 3], [neg_inf; 3]], &Device::Cpu).unwrap();
+        let graph = GraphProto {
+            node: vec![trilu_node(vec!["x"], 0)],
+            ..Default::default()
+        };
+        let inputs = HashMap::from([("x".to_string(), x)]);
+
+        let y = eval_trilu(graph, inputs);
+
+        assert_eq!(y[0], vec![neg_inf, 0.0, 0.0]);
+        assert_eq!(y[1], vec![neg_inf, neg_inf, 0.0]);
+        assert_eq!(y[2], vec![neg_inf, neg_inf, neg_inf]);
+    }
+
+    // Verifies a k=1 diagonal offset (keep strictly above the diagonal) with
+    // -inf input still avoids NaN.
+    #[test]
+    fn trilu_upper_with_diagonal_offset_avoids_nan() {
+        let neg_inf = f32::NEG_INFINITY;
+        let x = Tensor::new(&[[neg_inf; 3], [neg_inf; 3], [neg_inf; 3]], &Device::Cpu).unwrap();
+        let k = Tensor::new(&[1i64], &Device::Cpu).unwrap();
+        let graph = GraphProto {
+            node: vec![trilu_node(vec!["x", "k"], 1)],
+            ..Default::default()
+        };
+        let inputs = HashMap::from([("x".to_string(), x), ("k".to_string(), k)]);
+
+        let y = eval_trilu(graph, inputs);
+
+        assert_eq!(y[0], vec![0.0, neg_inf, neg_inf]);
+        assert_eq!(y[1], vec![0.0, 0.0, neg_inf]);
+        assert_eq!(y[2], vec![0.0, 0.0, 0.0]);
     }
 }
