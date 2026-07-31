@@ -12,6 +12,7 @@ pub(crate) mod pooling;
 pub(crate) mod reduce_mean;
 pub(crate) mod reduce_sum;
 pub(crate) mod reshape;
+pub(crate) mod resize;
 pub(crate) mod squeeze;
 pub(crate) mod stft;
 pub(crate) mod trilu;

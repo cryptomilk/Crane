@@ -2195,12 +2195,9 @@ fn simple_eval_(
                 let output = input * hard_sigmoid;
                 values.insert(node.output[0].clone(), output?);
             },
+            // Crane Added 20260731: implementation lives in ops/resize.rs.
             "Resize" => {
                 let input = get(&node.input[0])?;
-
-                if input.rank() != 4 {
-                    bail!("Unsupported rank for nearest resize: {}", input.rank());
-                }
 
                 let scales = if node.input.len() > 2 && !node.input[2].is_empty() {
                     Some(get(&node.input[2])?)
@@ -2214,55 +2211,7 @@ fn simple_eval_(
                     None
                 };
 
-                let output_dims = match (scales, sizes) {
-                    (Some(_), Some(_)) => {
-                        bail!("Scales and sizes cannot both be set for Resize operation")
-                    },
-                    (Some(scales_tensor), None) => {
-                        let scale_values = scales_tensor.to_vec1::<f32>()?;
-                        input
-                            .dims()
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &d)| (d as f32 * scale_values[i]) as usize)
-                            .collect::<Vec<_>>()
-                    },
-                    (None, Some(sizes_tensor)) => sizes_tensor
-                        .to_vec1::<i64>()?
-                        .iter()
-                        .map(|&d| d as usize)
-                        .collect::<Vec<_>>(),
-                    (None, None) => bail!("Either scales or sizes should be present"),
-                };
-
-                let coordinate_transformation_mode =
-                    get_attr_opt::<str>(node, "coordinate_transformation_mode")?
-                        .unwrap_or("half_pixel");
-                // Interpolation mode: nearest, linear, or cubic.
-                let mode = get_attr_opt::<str>(node, "mode")?.unwrap_or("nearest");
-                // How to determine the "nearest" pixel in nearest interpolation mode.
-                let nearest_mode =
-                    get_attr_opt::<str>(node, "nearest_mode")?.unwrap_or("round_prefer_floor");
-
-                if mode != "nearest" {
-                    bail!("Unsupported resize mode: {}", mode);
-                }
-
-                if nearest_mode != "floor" {
-                    bail!("Unsupported nearest_mode for resize: {}", nearest_mode);
-                }
-
-                if coordinate_transformation_mode != "asymmetric" {
-                    bail!(
-                        "Unsupported coordinate_transformation_mode for resize: {}",
-                        coordinate_transformation_mode
-                    );
-                }
-
-                let h = output_dims[2];
-                let w = output_dims[3];
-                let output = input.upsample_nearest2d(h, w)?;
-
+                let output = ops::resize::resize(node, input, scales, sizes)?;
                 values.insert(node.output[0].clone(), output);
             },
             // Crane Added 20260731: implementation lives in ops/trilu.rs.
