@@ -271,7 +271,7 @@ fn resolve_dtype(
             other => anyhow::bail!("unsupported --dtype '{other}' (expected f16, bf16 or f32)"),
         };
     }
-    if device.is_cuda() {
+    if device.is_cuda() || device.is_rocm() {
         return Ok(DType::BF16);
     }
     if device.is_metal() && model_type == ModelType::Qwen3_5 {
@@ -290,7 +290,14 @@ pub async fn run(args: Args) -> Result<()> {
         {
             crane_core::models::Device::cuda_if_available(0)?
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        {
+            // No `rocm_if_available` convenience constructor exists (unlike
+            // `cuda_if_available`), so fall back to CPU by hand on error —
+            // matches how the metal branch below already behaves.
+            crane_core::models::Device::new_rocm(0).unwrap_or(crane_core::models::Device::Cpu)
+        }
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         {
             #[cfg(target_os = "macos")]
             {
