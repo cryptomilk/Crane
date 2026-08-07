@@ -77,6 +77,12 @@ cuda = [
     "dep:bindgen_cuda",
 ]
 cudnn = ["candle-core/cudnn"]
+rocm = [
+    "candle-core/rocm",
+    "candle-nn/rocm",
+    "candle-transformers/rocm",
+]
+miopen = ["candle-core/miopen"]
 mkl = [
     "dep:intel-mkl-src",
     "candle-core/mkl",

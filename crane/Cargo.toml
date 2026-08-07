@@ -38,6 +38,8 @@ accelerate = ["crane-core/accelerate", "candle-core/accelerate"]
 cuda = ["crane-core/cuda", "dep:nvml-wrapper"]
 cudnn = ["crane-core/cudnn"]
 mkl = ["crane-core/mkl"]
+rocm = ["crane-core/rocm"]
+miopen = ["crane-core/miopen"]
 
 [dev-dependencies]
 tempfile = "3"

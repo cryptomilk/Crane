@@ -53,6 +53,8 @@ onnx = ["crane-core/onnx", "crane/onnx"]
 cuda = ["crane-core/cuda", "crane/cuda"]
 cudnn = ["crane-core/cudnn", "crane/cudnn"]
 mkl = ["crane-core/mkl", "crane/mkl"]
+rocm = ["crane-core/rocm", "crane/rocm"]
+miopen = ["crane-core/miopen", "crane/miopen"]
 
 [dev-dependencies]
 tempfile = "3"
