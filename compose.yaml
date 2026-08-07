@@ -1,0 +1,45 @@
+# Podman/Compose Specification file for the ROCm crane-serve image (see
+# Containerfile and CONTAINER.md). Usage:
+#
+#   podman compose up -d --build     # or: podman-compose up -d --build
+#   podman compose logs -f
+#   podman compose down
+#
+# `--build-arg`-equivalent overrides (e.g. a different quant) go through
+# environment variables read by the `args:` block below, e.g.:
+#
+#   QUANT=Q6_K podman compose up -d --build
+
+services:
+  crane-serve:
+    build:
+      context: .
+      dockerfile: Containerfile
+      args:
+        QUANT: ${QUANT:-Q5_K_M}
+        HF_TOKEN: ${HF_TOKEN:-}
+    image: crane-serve-rocm
+    ports:
+      - "8080:8080"
+    # ROCm device nodes, passed through from the host. On rootless Podman
+    # these also need render/video group access -- `group_add: keep-groups`
+    # (verified against podman-compose's source: it forwards each
+    # group_add entry straight through as `--group-add <item>` with no
+    # transformation) tells podman to keep the invoking user's
+    # supplementary groups, which is usually enough. If it isn't on your
+    # host, replace it with the actual gid of the `render`/`video` group
+    # instead.
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - keep-groups
+    # Kernels JIT-compile on first use and are cached on disk (see
+    # CONTAINER.md); a named volume here means a container recreate
+    # doesn't pay the compile cost again.
+    volumes:
+      - crane-rocm-kernel-cache:/cache/candle-rocm
+    restart: unless-stopped
+
+volumes:
+  crane-rocm-kernel-cache:
