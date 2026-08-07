@@ -9,6 +9,10 @@ repository = "https://github.com/lucasjinreal/Crane"
 authors = ["Nicholas Jela<nicholasjela@gmail.com>"]
 
 [workspace.dependencies]
+# Pinned to a commit on the unmerged "Feat/rocm backend" branch (see
+# https://github.com/huggingface/candle/pull/3801) to get ROCm/HIP support
+# ahead of upstream merging it. Pinned to a commit, not the branch name,
+# since the branch is actively force-pushed. See CONTAINER.md for context.
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
@@ -23,7 +27,6 @@ fst = "0.4"
 # Paths are relative to this file, assuming Crane and candle checkouts are siblings
 # under the same parent directory.
 [patch.crates-io]
-candle-core = { path = "../candle/candle-core" }
-candle-nn = { path = "../candle/candle-nn" }
-candle-transformers = { path = "../candle/candle-transformers" }
-candle-onnx = { path = "../candle/candle-onnx" }
+candle-core = { git = "https://github.com/xmiksay/candle", rev = "8a17ca0a4c66b43d933b7e192db6860ee68f9c71" }
+candle-nn = { git = "https://github.com/xmiksay/candle", rev = "8a17ca0a4c66b43d933b7e192db6860ee68f9c71" }
+candle-transformers = { git = "https://github.com/xmiksay/candle", rev = "8a17ca0a4c66b43d933b7e192db6860ee68f9c71" }
