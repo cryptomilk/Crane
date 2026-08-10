@@ -489,6 +489,7 @@ impl AudioEncoderAttention {
             return Self::forward_attn_cpu_varlen(&q_bshd, &k_bshd, &v_bshd, cu_seqlens, scale);
         }
 
+        let dtype = q_bshd.dtype();
         let mut outputs = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
             let start = cu_seqlens[i];
@@ -498,13 +499,13 @@ impl AudioEncoderAttention {
             let v_block = v_bshd.narrow(1, start, len)?;
             // Each block attends only within itself (no cross-block mixing),
             // so an unmasked kernel is correct here.
-            outputs.push(dispatch_flash_attn(
-                &q_block,
-                &k_block,
-                &v_block,
-                scale,
-                AttnMask::None,
-            )?);
+            // candle's (non-varlen) CPU flash-attn kernel always accumulates
+            // and returns F32, regardless of the input dtype — cast back so
+            // the caller's `out_proj` (in the model's working dtype) matches.
+            outputs.push(
+                dispatch_flash_attn(&q_block, &k_block, &v_block, scale, AttnMask::None)?
+                    .to_dtype(dtype)?,
+            );
         }
 
         if n_blocks == 1 {

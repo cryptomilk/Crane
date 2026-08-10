@@ -413,6 +413,10 @@ impl Attention {
             };
 
             let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+            // candle's CPU flash-attn kernel always accumulates and returns
+            // F32, regardless of the input dtype — cast back before
+            // `o_proj`, whose weight is in the model's working dtype.
+            let attn_output = attn_output.to_dtype(q.dtype())?;
 
             // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D]
             let attn_output = attn_output
@@ -445,6 +449,10 @@ impl Attention {
             let mask = AttnMask::Causal { kv_offset };
 
             let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+            // candle's CPU flash-attn kernel always accumulates and returns
+            // F32, regardless of the input dtype — cast back before
+            // `o_proj`, whose weight is in the model's working dtype.
+            let attn_output = attn_output.to_dtype(q.dtype())?;
 
             // flash_attn output is BHSD [B, H, S, D] → [B, S, H*D]
             let attn_output = attn_output

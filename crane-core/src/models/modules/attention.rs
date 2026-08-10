@@ -279,8 +279,7 @@ impl GqaAttention {
         #[allow(clippy::cast_possible_truncation)]
         let scale_f32 = scale as f32;
 
-        eprintln!("DEBUG branch-select: q_seq_len={q_seq_len} b_sz={b_sz} is_cpu={} force_gqa_env={:?} n_rep={n_rep}", q.device().is_cpu(), std::env::var("CRANE_FORCE_GQA_DEBUG"));
-        if q_seq_len == 1 && b_sz == 1 && q.device().is_cpu() && std::env::var("CRANE_FORCE_GQA_DEBUG").is_err() {
+        if q_seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
             // ── Fused flash attention for decode (seq_len=1), CPU only ──
             // candle's cpu_flash kernel streams K/V with online softmax
             // (O(head_dim) working set instead of materializing an O(S)
@@ -303,20 +302,15 @@ impl GqaAttention {
             // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
             // Reshape Q to group queries with their KV head instead of
             // repeating K/V n_rep times.
-            eprintln!("DEBUG q dtype: {:?}, k dtype: {:?}, v dtype: {:?}", q.dtype(), k.dtype(), v.dtype());
             let q_g = (q.reshape((b_sz, self.cfg.n_kv_heads, n_rep, self.cfg.head_dim))?
                 * scale)?;
-            eprintln!("DEBUG q_g dtype: {:?}", q_g.dtype());
             let k_t = k.transpose(2, 3)?;
-            eprintln!("DEBUG k_t dtype: {:?}", k_t.dtype());
             let attn_weights = q_g.matmul(&k_t)?;
             let attn_weights = match attention_mask {
                 Some(mask) => attn_weights.broadcast_add(mask)?,
                 None => attn_weights,
             };
-            eprintln!("DEBUG attn_weights (pre-softmax) dtype: {:?}", attn_weights.dtype());
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            eprintln!("DEBUG attn_weights (post-softmax) dtype: {:?}, v dtype: {:?}", attn_weights.dtype(), v.dtype());
             let attn_output = attn_weights.matmul(&v)?;
 
             // [B, n_kv_heads, n_rep, D] → [B, 1, H*D]; flattening (n_kv_heads,
@@ -406,6 +400,11 @@ impl GqaAttention {
         };
 
         let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
+        // candle's CPU flash-attn kernel always accumulates and returns F32,
+        // regardless of the input dtype (see `dispatch_flash_attn`'s F16/BF16
+        // dispatch tests) — cast back before `o_proj`, whose weight is in the
+        // model's working dtype.
+        let attn_output = attn_output.to_dtype(q.dtype())?;
 
         // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D].
         let attn_output = attn_output
@@ -423,9 +422,18 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
     use candle_nn::VarBuilder;
 
+    // Regression test for the missing dtype cast after the CPU flash-attn
+    // decode path: candle's CPU flash-attn kernel always accumulates and
+    // returns F32 regardless of input dtype (see `flash_attn.rs`'s
+    // `dispatch_f16_produces_correct_shape`), so an F16 model whose decode
+    // step hits `flash_attn_decode` (single sequence, CPU, GQA) must cast
+    // back to F16 before `o_proj`, or its weight (F16) mismatches the F32
+    // attention output in `Linear::forward`'s matmul.
     #[test]
-    fn temp_repro_full_prefill_then_decode_via_gqa_attention() {
-        // Real Voxtral-shaped config: dim=3072, 32 heads, 8 kv heads, head_dim=128.
+    fn decode_after_prefill_stays_f16_through_cpu_flash_attn_path() {
+        // GQA config (n_heads != n_kv_heads) matching a real F16 GPU model
+        // shape, run on CPU so `q_seq_len == 1 && b_sz == 1 && is_cpu()`
+        // takes the flash-attn decode fast path this test guards.
         let cfg = AttentionConfig {
             dim: 3072,
             n_heads: 32,
@@ -452,14 +460,9 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        eprintln!("prefill input dtype: {:?}", x.dtype());
         let prefill_out = attn.forward(&x, Some((&cos_p, &sin_p)), None).unwrap();
-        eprintln!("prefill_out dtype: {:?}", prefill_out.dtype());
+        assert_eq!(prefill_out.dtype(), DType::F16);
 
-        // Force the exact "GQA-grouped SDPA for decode" branch manually,
-        // bypassing the is_cpu() flash-attn gate, to check dtype end to end
-        // through the *real* update_kv_cache + reshape + matmul + softmax
-        // pipeline (not a synthetic replica).
         let cos_d = Tensor::rand(0f32, 1f32, (1, half_dim), &device)
             .unwrap()
             .to_dtype(DType::F16)
@@ -469,9 +472,8 @@ mod tests {
             .unwrap()
             .to_dtype(DType::F16)
             .unwrap();
-        eprintln!("decode input dtype: {:?}", step.dtype());
         let decode_out = attn.forward(&step, Some((&cos_d, &sin_d)), None).unwrap();
-        eprintln!("decode_out dtype: {:?}", decode_out.dtype());
+        assert_eq!(decode_out.dtype(), DType::F16);
     }
 
     // Base config used by most tests: dim=16, 4 heads, head_dim=4, no bias/rope/norm.
@@ -576,8 +578,8 @@ mod tests {
         VarBuilder::from_tensors(t, DType::F32, device)
     }
 
-    /// Like `nonzero_vb`, but weights are stored (and the VarBuilder configured)
-    /// at F16, matching a real F16-inference deployment.
+    /// Like `nonzero_vb`, but weights are stored (and the `VarBuilder`
+    /// configured) at F16, matching a real F16-inference deployment.
     fn nonzero_vb_f16(cfg: &AttentionConfig, scale: f32) -> VarBuilder<'static> {
         let device = &Device::Cpu;
         let mut t: HashMap<String, Tensor> = HashMap::new();
