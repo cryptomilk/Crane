@@ -842,6 +842,15 @@ pub async fn run(args: Args) -> Result<()> {
         // the sole long-lived consumer of candle's process-wide rayon pool.
         let mut backend = engine::model_factory::create_backend(model_type, &args.model_path, &device, &dtype, format, args.quant.as_deref())?;
         info!("Model loaded successfully (type: {:?}, format: {:?})", resolved_type, format);
+        if matches!(resolved_type, ModelType::Qwen3_5 | ModelType::Qwen3_5VL) {
+            let chunk = crane_core::models::qwen3_5::prefill_chunk_size();
+            let chunk_desc = if chunk == 0 {
+                "disabled (CRANE_PREFILL_CHUNK=0)".to_string()
+            } else {
+                format!("{chunk} tokens")
+            };
+            info!("Qwen 3.5 prefill chunking: {chunk_desc}");
+        }
         // Install candle's affinity-pinned rayon pool so warmup's forward passes run on warm threads.
         device.with_context(|| backend.warmup());
         info!("Model warmed up");

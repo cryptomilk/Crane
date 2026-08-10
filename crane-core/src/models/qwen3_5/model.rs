@@ -453,11 +453,17 @@ impl Qwen3_5TextModel {
         rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if debug_enabled() {
+            debug_last_position_stats("embed", &xs)?;
+        }
         for i in 0..self.layers.len() {
             let layer = &self.layers[i];
             let gdn_slot = self.gdn_caches[i].as_mut();
             let attn_slot = self.attn_caches[i].as_mut();
             xs = layer.forward(&xs, rope, attention_mask, gdn_slot, attn_slot)?;
+            if debug_enabled() {
+                debug_last_position_stats(&format!("layer[{i}]"), &xs)?;
+            }
         }
         Ok(xs)
     }
@@ -472,9 +478,72 @@ impl Qwen3_5TextModel {
         crate::ops::prof::timed(crate::ops::prof::Span::Head, || {
             let (b, _s, _h) = hidden.dims3()?;
             let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
-            Ok(self.lm_head.forward(&xs)?)
+            if debug_enabled() {
+                debug_last_position_stats("final_norm", &xs.unsqueeze(1)?)?;
+            }
+            let logits = self.lm_head.forward(&xs)?;
+            if debug_enabled() {
+                debug_logits_stats(&logits)?;
+            }
+            Ok(logits)
         })
     }
+}
+
+/// `CRANE_QWEN35_DEBUG=1` gates the per-layer/per-call diagnostics below —
+/// added to chase a ROCm-only incoherent-output bug (see git history around
+/// this line); cheap to leave compiled in since it's a no-op check on the
+/// hot path when unset.
+fn debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRANE_QWEN35_DEBUG").is_ok())
+}
+
+/// Print min/max/mean/nan-or-inf-count of the last sequence position of
+/// `xs` (`[B, S, H]`), tagged with `label`. Forces a device sync (`to_vec1`)
+/// so this must stay behind [`debug_enabled`].
+fn debug_last_position_stats(label: &str, xs: &Tensor) -> Result<()> {
+    let (_b, s, _h) = xs.dims3()?;
+    let last = xs.narrow(1, s - 1, 1)?.flatten_all()?.to_dtype(DType::F32)?;
+    let vals = last.to_vec1::<f32>()?;
+    let n_bad = vals.iter().filter(|v| !v.is_finite()).count();
+    let (mut min, mut max, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0f64);
+    for &v in &vals {
+        if v.is_finite() {
+            min = min.min(v);
+            max = max.max(v);
+            sum += f64::from(v);
+        }
+    }
+    // `vals.len()` is a hidden-size-sized count (thousands, not billions), so
+    // the f64 cast is exact in practice.
+    #[allow(clippy::cast_precision_loss)]
+    let mean = sum / vals.len() as f64;
+    eprintln!(
+        "[qwen3_5:debug] {label}: min={min:.4} max={max:.4} mean={mean:.4} non_finite={n_bad}/{}",
+        vals.len()
+    );
+    Ok(())
+}
+
+/// Print logits stats plus the top-5 tokens by value (`logits` is `[B, V]`).
+fn debug_logits_stats(logits: &Tensor) -> Result<()> {
+    let flat = logits.flatten_all()?.to_dtype(DType::F32)?;
+    let vals = flat.to_vec1::<f32>()?;
+    let n_bad = vals.iter().filter(|v| !v.is_finite()).count();
+    let mut indexed: Vec<(usize, f32)> = vals.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let top5: Vec<String> = indexed
+        .iter()
+        .take(5)
+        .map(|(i, v)| format!("{i}:{v:.3}"))
+        .collect();
+    eprintln!(
+        "[qwen3_5:debug] logits: non_finite={n_bad}/{} top5=[{}]",
+        vals.len(),
+        top5.join(", ")
+    );
+    Ok(())
 }
 
 /// Pre-allocate per-layer caches: GDN recurrent state for linear blocks,
