@@ -64,6 +64,7 @@ pub(crate) fn update_kv_cache(
     let new_total = cache_seq_len + new_seq_len;
 
     if new_total <= buf_len {
+        eprintln!("DEBUG update_kv_cache in-place: buf_k dtype {:?}, k dtype {:?}", buf_k.dtype(), k.dtype());
         // In-place write — O(new_seq_len).
         buf_k.slice_set(&k, 2, cache_seq_len)?;
         buf_v.slice_set(&v, 2, cache_seq_len)?;
