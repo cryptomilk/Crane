@@ -64,6 +64,7 @@ pub async fn chat_completions(
         .to_vec();
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+    capture_prompt(&request_id, &req, &formatted);
     let include_usage = req
         .stream_options
         .as_ref()
@@ -119,6 +120,51 @@ pub async fn chat_completions(
             },
         };
         Ok(Json(response).into_response())
+    }
+}
+
+/// Directory from `CRANE_LOG_PROMPTS`, read once. `None` when unset (the
+/// default) — capture is opt-in since prompts may contain sensitive data.
+fn log_prompts_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("CRANE_LOG_PROMPTS").ok().map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+/// Write the raw messages, sampling params, and rendered chat-template
+/// prompt for `req` to `<CRANE_LOG_PROMPTS>/<request_id>.json`, if that env
+/// var is set. Added so a future incoherent-output report can be replayed
+/// byte-for-byte instead of reconstructed from memory — the actual RNG seed
+/// used (client-supplied or generated) is logged separately by the engine's
+/// "New request accepted" line, correlated by `request_id`. Never fails the
+/// request; write errors are only logged.
+fn capture_prompt(request_id: &str, req: &ChatCompletionRequest, formatted: &str) {
+    let Some(dir) = log_prompts_dir() else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("CRANE_LOG_PROMPTS: failed to create {}: {e}", dir.display());
+        return;
+    }
+    let record = serde_json::json!({
+        "id": request_id,
+        "messages": req.messages,
+        "max_tokens": req.max_tokens,
+        "temperature": req.temperature,
+        "top_p": req.top_p,
+        "top_k": req.top_k,
+        "repetition_penalty": req.repetition_penalty,
+        "seed": req.seed,
+        "formatted_prompt": formatted,
+    });
+    let path = dir.join(format!("{request_id}.json"));
+    match serde_json::to_vec_pretty(&record) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                tracing::warn!("CRANE_LOG_PROMPTS: failed to write {}: {e}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("CRANE_LOG_PROMPTS: failed to serialize request: {e}"),
     }
 }
 
