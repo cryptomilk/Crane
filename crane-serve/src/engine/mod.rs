@@ -538,6 +538,8 @@ impl InferenceEngine {
             top_p = ?req.top_p,
             top_k = ?req.top_k,
             rep_penalty = req.repetition_penalty,
+            freq_penalty = req.frequency_penalty,
+            pres_penalty = req.presence_penalty,
             "New request accepted (queue: waiting={} running={})",
             self.scheduler.waiting.len() + 1,
             self.scheduler.running.len(),
@@ -565,6 +567,8 @@ impl InferenceEngine {
             max_tokens: effective_max_tokens,
             eos_token_id: req.eos_token_id,
             repetition_penalty: req.repetition_penalty,
+            frequency_penalty: req.frequency_penalty,
+            presence_penalty: req.presence_penalty,
             repeat_last_n: 64,
             response_tx: req.response_tx,
         };

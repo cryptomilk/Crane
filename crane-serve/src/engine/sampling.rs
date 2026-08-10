@@ -10,7 +10,7 @@
 //! the sampled index itself. Set `CRANE_SAMPLE_TRACE=1` to log the path taken
 //! and its latency at `debug` level.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -195,7 +195,12 @@ pub fn sample(
         // `repetition_penalty` is compared against the exact "disabled" sentinel
         // (1.0), not a computed float, so strict equality is correct.
         #[allow(clippy::float_cmp)]
-        if greedy && seq.repetition_penalty == 1.0 && has_gpu_sampling(logits.device()) {
+        if greedy
+            && seq.repetition_penalty == 1.0
+            && seq.frequency_penalty == 0.0
+            && seq.presence_penalty == 0.0
+            && has_gpu_sampling(logits.device())
+        {
             let flat = logits.squeeze(0)?.squeeze(0)?;
             let token = crane_core::ops::gpu_argmax(&flat)?;
             if trace {
@@ -215,14 +220,17 @@ pub fn sample(
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
     let t_preprocessed = Instant::now();
 
-    // `repetition_penalty` is compared against the exact "disabled" sentinel
-    // (1.0), not a computed float, so strict equality is correct.
-    #[allow(clippy::float_cmp)]
-    if seq.repetition_penalty != 1.0 {
-        let start_at = seq.tokens.len().saturating_sub(seq.repeat_last_n);
-        apply_repeat_penalty_inplace(&logits, seq.repetition_penalty, &seq.tokens[start_at..])
-            .map_err(anyhow::Error::from)?;
-    }
+    // Shared trailing-context window for both penalty types below.
+    let start_at = seq.tokens.len().saturating_sub(seq.repeat_last_n);
+
+    apply_penalties_inplace(
+        &logits,
+        seq.repetition_penalty,
+        seq.frequency_penalty,
+        seq.presence_penalty,
+        &seq.tokens[start_at..],
+    )
+    .map_err(anyhow::Error::from)?;
     let t_penalty_applied = Instant::now();
 
     if greedy {
@@ -395,36 +403,89 @@ pub fn sample_gumbel_max_idx(logits: &Tensor, temperature: f64) -> candle_core::
     }
 }
 
-/// Apply repetition penalty in-place (GPU-friendly scatter/gather).
+/// Apply repetition, frequency, and presence penalties to `logits` in-place
+/// (GPU-friendly scatter/gather).
+///
+/// `repetition_penalty` (1.0 = disabled) is a flat multiplicative penalty:
+/// the same factor is applied whether a token appeared once or a hundred
+/// times. `frequency_penalty` (0.0 = disabled) is subtracted once per
+/// occurrence of a token in `context`, so it grows with repeat count and can
+/// break short repetition loops (period a few tokens) that a flat penalty
+/// cannot — such loops keep every token in the loop at the same "seen"
+/// penalty forever, never changing their relative ranking.
+/// `presence_penalty` (0.0 = disabled) is subtracted once for any token that
+/// appears at all, regardless of count. Negative `frequency_penalty`/
+/// `presence_penalty` values are permitted (per the `OpenAI` API) and boost
+/// rather than penalize a token's logit.
+///
+/// `context` is normally the caller's trailing `repeat_last_n`-token window,
+/// not the full generated output, so occurrences older than that window are
+/// not counted for any of the three penalties.
+///
+/// All three penalties are computed from a single token-occurrence count
+/// and applied via one gather + scatter round-trip, rather than one
+/// round-trip per penalty type, since this runs once per decode step.
+/// Repetition penalty (multiplicative) is applied first, then
+/// frequency/presence penalty (additive) is subtracted from the result.
 ///
 /// # Errors
 ///
 /// Returns an error if a tensor operation fails.
-pub fn apply_repeat_penalty_inplace(
+pub fn apply_penalties_inplace(
     logits: &Tensor,
-    penalty: f32,
+    repetition_penalty: f32,
+    frequency_penalty: f32,
+    presence_penalty: f32,
     context: &[u32],
 ) -> candle_core::Result<()> {
-    if context.is_empty() {
+    // `repetition_penalty`/`frequency_penalty`/`presence_penalty` are each
+    // compared against their exact "disabled" sentinel, not a computed
+    // float, so strict equality is correct.
+    #[allow(clippy::float_cmp)]
+    let repetition_active = repetition_penalty != 1.0;
+    #[allow(clippy::float_cmp)]
+    let freq_presence_active = frequency_penalty != 0.0 || presence_penalty != 0.0;
+    if context.is_empty() || (!repetition_active && !freq_presence_active) {
         return Ok(());
     }
 
-    let mut unique: HashSet<u32> = HashSet::with_capacity(context.len());
+    let mut counts: HashMap<u32, u32> = HashMap::with_capacity(context.len());
     for &t in context {
-        unique.insert(t);
+        *counts.entry(t).or_insert(0) += 1;
     }
-    if unique.is_empty() {
-        return Ok(());
-    }
-    let mut token_ids: Vec<u32> = unique.into_iter().collect();
+
+    let mut token_ids: Vec<u32> = counts.keys().copied().collect();
     token_ids.sort_unstable();
 
     let idx = Tensor::new(token_ids.as_slice(), logits.device())?;
     let selected = logits.gather(&idx, candle_core::D::Minus1)?;
-    let mask = selected.ge(0f64)?;
-    let on_true = (&selected / f64::from(penalty))?;
-    let on_false = (&selected * f64::from(penalty))?;
-    let updated = mask.where_cond(&on_true, &on_false)?;
+
+    let selected = if repetition_active {
+        let mask = selected.ge(0f64)?;
+        let on_true = (&selected / f64::from(repetition_penalty))?;
+        let on_false = (&selected * f64::from(repetition_penalty))?;
+        mask.where_cond(&on_true, &on_false)?
+    } else {
+        selected
+    };
+
+    let updated = if freq_presence_active {
+        let penalties: Vec<f32> = token_ids
+            .iter()
+            .map(|id| {
+                // Counts are bounded by `context.len()`, which is always far
+                // smaller than f32's 2^24 exact-integer limit.
+                #[allow(clippy::cast_precision_loss)]
+                let count = counts[id] as f32;
+                count * frequency_penalty + presence_penalty
+            })
+            .collect();
+        let penalty_tensor = Tensor::new(penalties.as_slice(), logits.device())?;
+        (&selected - &penalty_tensor)?
+    } else {
+        selected
+    };
+
     logits.scatter_set(&idx, &updated, candle_core::D::Minus1)
 }
 
@@ -439,4 +500,131 @@ pub fn rand_seed() -> u64 {
     #[allow(clippy::cast_possible_truncation)]
     let seed = nanos as u64;
     seed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn logits(values: &[f32]) -> Tensor {
+        Tensor::new(values, &Device::Cpu).unwrap()
+    }
+
+    #[test]
+    // All three penalties disabled (sentinel values) must leave logits untouched.
+    fn all_penalties_noop_when_disabled() {
+        let t = logits(&[1.0, 2.0, 3.0]);
+        apply_penalties_inplace(&t, 1.0, 0.0, 0.0, &[0, 1, 2]).unwrap();
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    // Empty context must leave logits untouched even with penalties set.
+    fn all_penalties_noop_when_context_empty() {
+        let t = logits(&[1.0, 2.0, 3.0]);
+        apply_penalties_inplace(&t, 1.1, 0.5, 0.5, &[]).unwrap();
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    // repetition_penalty alone: positive logits are divided by the penalty,
+    // negative logits are multiplied by it, mirroring the pre-merge
+    // `apply_repeat_penalty_inplace` behavior for a single-token context.
+    fn repetition_penalty_alone_scales_by_sign() {
+        let t = logits(&[10.0, -10.0, 3.0]);
+        apply_penalties_inplace(&t, 2.0, 0.0, 0.0, &[0, 1]).unwrap();
+        let out = t.to_vec1::<f32>().unwrap();
+        assert!((out[0] - 5.0).abs() < 1e-6, "positive logit should be divided");
+        assert!((out[1] - -20.0).abs() < 1e-6, "negative logit should be multiplied");
+        assert!((out[2] - 3.0).abs() < 1e-6, "unseen token must be untouched");
+    }
+
+    #[test]
+    // Combining repetition_penalty with frequency_penalty in one call must
+    // apply repetition's multiplicative scaling first, then subtract the
+    // frequency penalty from the *scaled* result, not compute them
+    // independently from the original logit.
+    fn repetition_and_frequency_penalty_combine_in_order() {
+        let t = logits(&[10.0, 10.0]);
+        apply_penalties_inplace(&t, 2.0, 1.0, 0.0, &[0, 0, 1]).unwrap();
+        let out = t.to_vec1::<f32>().unwrap();
+        // token 0: (10.0 / 2.0) - (2 occurrences * 1.0) = 3.0
+        assert!((out[0] - 3.0).abs() < 1e-6);
+        // token 1: (10.0 / 2.0) - (1 occurrence * 1.0) = 4.0
+        assert!((out[1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    // frequency_penalty must scale with occurrence count: token 0 appears
+    // three times and should be penalized 3x more than token 1, which
+    // appears once. Token 2 never appears and is untouched.
+    fn frequency_penalty_scales_with_occurrence_count() {
+        let t = logits(&[10.0, 10.0, 10.0]);
+        apply_penalties_inplace(&t, 1.0, 0.5, 0.0, &[0, 0, 0, 1]).unwrap();
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![10.0 - 1.5, 10.0 - 0.5, 10.0]);
+    }
+
+    #[test]
+    // presence_penalty is flat: token 0 (3 occurrences) and token 1 (1
+    // occurrence) must be penalized by the exact same amount.
+    fn presence_penalty_is_flat_regardless_of_count() {
+        let t = logits(&[10.0, 10.0, 10.0]);
+        apply_penalties_inplace(&t, 1.0, 0.0, 0.5, &[0, 0, 0, 1]).unwrap();
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![10.0 - 0.5, 10.0 - 0.5, 10.0]);
+    }
+
+    #[test]
+    // Simulates a stuck decode loop: token 0 has a slightly higher logit
+    // than token 1 and has therefore been picked repeatedly (5 times) while
+    // token 1 was picked once. A flat penalty (like repetition_penalty)
+    // treats both as equally "seen" and can never flip the argmax, so the
+    // loop never breaks. frequency_penalty grows with occurrence count and
+    // must flip the ranking here, breaking the loop.
+    fn frequency_penalty_breaks_short_repeat_cycle() {
+        let t = logits(&[5.0, 4.9]);
+        let context = [0, 1, 0, 0, 0, 0];
+        apply_penalties_inplace(&t, 1.0, 0.1, 0.0, &context).unwrap();
+        let out = t.to_vec1::<f32>().unwrap();
+        assert!((out[0] - 4.5).abs() < 1e-6);
+        assert!((out[1] - 4.8).abs() < 1e-6);
+        assert!(out[1] > out[0], "frequency penalty should flip the ranking");
+    }
+
+    #[test]
+    // Both penalties active at once must combine additively: token 0's
+    // total penalty is `count * frequency_penalty + presence_penalty`, not
+    // just one or the other.
+    fn frequency_and_presence_penalty_combine_additively() {
+        let t = logits(&[10.0, 10.0, 10.0]);
+        apply_penalties_inplace(&t, 1.0, 0.5, 0.2, &[0, 0, 0, 1]).unwrap();
+        assert_eq!(
+            t.to_vec1::<f32>().unwrap(),
+            vec![10.0 - (3.0 * 0.5 + 0.2), 10.0 - (1.0 * 0.5 + 0.2), 10.0]
+        );
+    }
+
+    #[test]
+    // OpenAI's API permits negative frequency_penalty values, which must
+    // boost (not penalize) a repeated token's logit.
+    fn negative_frequency_penalty_boosts_logit() {
+        let t = logits(&[10.0, 10.0]);
+        apply_penalties_inplace(&t, 1.0, -0.5, 0.0, &[0, 0, 1]).unwrap();
+        let out = t.to_vec1::<f32>().unwrap();
+        assert!(out[0] > 10.0, "negative frequency_penalty should boost the logit");
+        assert!((out[0] - 11.0).abs() < 1e-6);
+        assert!((out[1] - 10.5).abs() < 1e-6);
+    }
+
+    #[test]
+    // OpenAI's API permits negative presence_penalty values, which must
+    // boost (not penalize) the logit of any token that appeared at all.
+    fn negative_presence_penalty_boosts_logit() {
+        let t = logits(&[10.0, 10.0, 10.0]);
+        apply_penalties_inplace(&t, 1.0, 0.0, -0.5, &[0, 1]).unwrap();
+        let out = t.to_vec1::<f32>().unwrap();
+        assert!(out[0] > 10.0, "negative presence_penalty should boost the logit");
+        assert!((out[0] - 10.5).abs() < 1e-6);
+        assert!((out[1] - 10.5).abs() < 1e-6);
+        assert!((out[2] - 10.0).abs() < 1e-6, "unseen token must be untouched");
+    }
 }

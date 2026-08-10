@@ -84,6 +84,8 @@ pub async fn chat_completions(
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
                 repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+                presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
             },
         )
@@ -206,6 +208,8 @@ pub async fn completions(
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
                 repetition_penalty: req.repetition_penalty.unwrap_or(1.05),
+                frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+                presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
             },
         )

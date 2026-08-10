@@ -81,6 +81,8 @@ pub async fn generate(
                 top_p: sp.top_p.or(Some(0.95)),
                 top_k: sp.top_k.or(Some(20)),
                 repetition_penalty: sp.repetition_penalty,
+                frequency_penalty: sp.frequency_penalty.unwrap_or(0.0),
+                presence_penalty: sp.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
             },
         )
@@ -199,6 +201,8 @@ pub async fn health_generate(
                 top_p: None,
                 top_k: None,
                 repetition_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
                 eos_token_id: state.eos_token_id.clone(),
             },
         )

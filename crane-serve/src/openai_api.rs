@@ -203,6 +203,8 @@ pub struct CompletionRequest {
     pub stop: Option<Vec<String>>,
     pub suffix: Option<String>,
     pub echo: Option<bool>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub n: Option<usize>,
 }

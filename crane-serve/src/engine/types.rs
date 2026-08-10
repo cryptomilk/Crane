@@ -16,6 +16,10 @@ pub struct EngineRequest {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub repetition_penalty: f32,
+    /// See [`GenerationParams::frequency_penalty`].
+    pub frequency_penalty: f32,
+    /// See [`GenerationParams::presence_penalty`].
+    pub presence_penalty: f32,
     pub eos_token_id: Vec<u32>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
@@ -32,6 +36,14 @@ pub struct GenerationParams {
     pub top_k: Option<usize>,
     /// Penalty applied to previously generated tokens (1.0 = no penalty).
     pub repetition_penalty: f32,
+    /// Subtractive penalty scaled by each token's occurrence count so far
+    /// (0.0 = no penalty). Unlike `repetition_penalty`'s flat multiplicative
+    /// scaling, this grows with repeat count, so it can break short
+    /// repetition loops that a flat penalty cannot.
+    pub frequency_penalty: f32,
+    /// Flat subtractive penalty applied once to any token that has appeared
+    /// at all so far (0.0 = no penalty).
+    pub presence_penalty: f32,
     /// Token IDs that terminate generation when produced.
     pub eos_token_id: Vec<u32>,
 }
@@ -81,6 +93,8 @@ impl EngineHandle {
                 top_p: params.top_p,
                 top_k: params.top_k,
                 repetition_penalty: params.repetition_penalty,
+                frequency_penalty: params.frequency_penalty,
+                presence_penalty: params.presence_penalty,
                 eos_token_id: params.eos_token_id,
                 response_tx,
             })
@@ -124,6 +138,8 @@ mod tests {
                 top_p: Some(0.95),
                 top_k: Some(40),
                 repetition_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
                 eos_token_id: vec![0],
             },
         );
@@ -147,6 +163,8 @@ mod tests {
                 top_p: None,
                 top_k: None,
                 repetition_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
                 eos_token_id: vec![0],
             },
         );
@@ -225,6 +243,8 @@ mod tests {
                     top_p: Some(0.9),
                     top_k: None,
                     repetition_penalty: 1.1,
+                    frequency_penalty: 0.3,
+                    presence_penalty: 0.2,
                     eos_token_id: vec![2],
                 },
             )
@@ -238,6 +258,8 @@ mod tests {
         assert_eq!(req.top_p, Some(0.9));
         assert_eq!(req.top_k, None);
         assert!((req.repetition_penalty - 1.1).abs() < 0.001);
+        assert!((req.frequency_penalty - 0.3).abs() < 0.001);
+        assert!((req.presence_penalty - 0.2).abs() < 0.001);
         assert_eq!(req.eos_token_id, vec![2]);
     }
 }
