@@ -59,7 +59,8 @@ pub struct Args {
     #[arg(long)]
     pub quant: Option<String>,
     /// Compute dtype: f16, bf16 or f32. Defaults per device: BF16 on CUDA,
-    /// F16 on ROCm and Metal, and F32 on CPU.
+    /// F16 on ROCm (except `Qwen3-ASR`, which defaults to F32 there) and
+    /// Metal, and F32 on CPU.
     #[arg(long)]
     pub dtype: Option<String>,
     #[arg(long, default_value_t = 0)]
@@ -503,11 +504,19 @@ pub(crate) fn is_gpu_device(device: &crane_core::models::Device) -> bool {
 
 /// Resolve the compute dtype. An explicit `--dtype` always wins; otherwise
 /// BF16 on CUDA, F16 on ROCm and Metal, and F32 on CPU. Metal's F16 path
-/// substantially reduces model and KV-cache memory use, including for
-/// Qwen3-ASR; pass `--dtype f32` to explicitly prefer full precision.
+/// substantially reduces model and KV-cache memory use; pass `--dtype f32`
+/// to explicitly prefer full precision.
+///
+/// ROCm excludes Qwen3-ASR from its F16 default: the audio encoder's
+/// intermediate activations overflow F16's smaller range (vs. the BF16 the
+/// checkpoint was trained in), producing NaN/garbage logits that never
+/// sample EOS and run decode out to `max_new_tokens` every time. Metal has
+/// not been verified against this same failure mode and still defaults
+/// Qwen3-ASR to F16.
 fn resolve_dtype(
     flag: Option<&str>,
     device: &crane_core::models::Device,
+    model_type: ModelType,
 ) -> Result<crane_core::models::DType> {
     use crane_core::models::DType;
     if let Some(name) = flag {
@@ -523,9 +532,18 @@ fn resolve_dtype(
     }
     // ROCm backend is experimental: F16 has the broadest kernel coverage on candle's
     // rocm path today, whereas BF16 support is still incomplete. Default there.
-    if device.is_rocm() {
+    //
+    // Qwen3-ASR is excluded: its audio encoder's intermediate activations
+    // overflow F16's much smaller range (vs. the BF16 the checkpoint was
+    // trained in), producing NaN/garbage logits that never sample EOS and
+    // run decode out to `max_new_tokens` every time. F32 is the verified-safe
+    // default for this family until it's been checked against F16 output
+    // quality on this backend.
+    if device.is_rocm() && model_type != ModelType::Qwen3ASR {
         return Ok(DType::F16);
     }
+    // TODO: Qwen3-ASR hasn't been verified on Metal; it may hit the same
+    // F16 overflow as on ROCm and need the same exclusion here.
     if device.is_metal() {
         return Ok(DType::F16);
     }
@@ -598,7 +616,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (model_type, resolved_type) =
         apply_text_only_override(args.text_only, model_type, resolved_type);
 
-    let mut dtype = resolve_dtype(args.dtype.as_deref(), &device)?;
+    let mut dtype = resolve_dtype(args.dtype.as_deref(), &device, resolved_type)?;
 
     let is_vlm = resolved_type.is_vlm();
     let is_tts = resolved_type.is_tts();
@@ -1384,16 +1402,28 @@ mod dtype_tests {
     #[test]
     fn explicit_flag_wins() {
         let d = Device::Cpu;
-        assert_eq!(resolve_dtype(Some("f16"), &d).unwrap(), DType::F16);
-        assert_eq!(resolve_dtype(Some("BF16"), &d).unwrap(), DType::BF16);
-        assert_eq!(resolve_dtype(Some("fp32"), &d).unwrap(), DType::F32);
-        assert!(resolve_dtype(Some("int8"), &d).is_err());
+        assert_eq!(
+            resolve_dtype(Some("f16"), &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            resolve_dtype(Some("BF16"), &d, ModelType::Qwen3).unwrap(),
+            DType::BF16
+        );
+        assert_eq!(
+            resolve_dtype(Some("fp32"), &d, ModelType::Qwen3).unwrap(),
+            DType::F32
+        );
+        assert!(resolve_dtype(Some("int8"), &d, ModelType::Qwen3).is_err());
     }
 
     #[test]
     fn cpu_defaults_to_f32() {
         let d = Device::Cpu;
-        assert_eq!(resolve_dtype(None, &d).unwrap(), DType::F32);
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F32
+        );
     }
 
     #[test]
@@ -1401,7 +1431,38 @@ mod dtype_tests {
         let Ok(Ok(d)) = std::panic::catch_unwind(|| Device::new_metal(0)) else {
             return; // no usable Metal device in this process/CI
         };
-        assert_eq!(resolve_dtype(None, &d).unwrap(), DType::F16);
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "rocm")]
+    fn rocm_defaults_f32_for_qwen3_asr_only() {
+        // Qwen3-ASR's audio encoder overflows F16's range (the checkpoint is
+        // trained in BF16), so it must be excluded from ROCm's blanket F16
+        // default while every other family keeps defaulting to F16 there.
+        let Ok(d) = Device::new_rocm(0) else {
+            return; // no ROCm device on this machine/CI
+        };
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3ASR).unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            resolve_dtype(None, &d, ModelType::Qwen3_5).unwrap(),
+            DType::F16
+        );
+        // An explicit --dtype flag must still override the exclusion.
+        assert_eq!(
+            resolve_dtype(Some("f16"), &d, ModelType::Qwen3ASR).unwrap(),
+            DType::F16
+        );
     }
 
     // ── --text-only override ──
