@@ -27,7 +27,7 @@ use super::sequence::Sequence;
 /// excluded here because the fused ops were CUDA-only; they are not any more.
 #[must_use]
 fn has_gpu_sampling(device: &Device) -> bool {
-    device.is_cuda() || device.is_rocm()
+    crate::is_gpu_device(device)
 }
 
 /// Emit one `CRANE_SAMPLE_TRACE=1` line naming the path [`sample`] took.
