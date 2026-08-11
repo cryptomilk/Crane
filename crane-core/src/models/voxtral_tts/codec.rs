@@ -454,6 +454,12 @@ pub struct CodecDecoder {
     stages: Vec<CodecStage>,
     output_conv: CausalConv1d,
     alibi_slopes: Vec<f32>,
+    /// Working dtype of the decoder's weights (e.g. F16 on GPU). The
+    /// codebook lookup and FSQ dequantization in [`Self::embed_codes`] are
+    /// computed in F32 for precision, then cast to this dtype before
+    /// entering the F16 (or whatever `vb` was built with) conv/transformer
+    /// stack.
+    dtype: DType,
     semantic_dim: usize,
     acoustic_dim: usize,
     fsq_levels: usize,
@@ -476,6 +482,7 @@ impl CodecDecoder {
     /// shape.
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(cfg: &AudioTokenizerArgs, vb: VarBuilder) -> Result<Self> {
+        let dtype = vb.dtype();
         let semantic_codebook = Self::load_semantic_codebook(cfg, vb.clone())?;
         let alibi_slopes = compute_alibi_slopes(cfg.n_heads);
 
@@ -558,6 +565,7 @@ impl CodecDecoder {
             stages,
             output_conv,
             alibi_slopes,
+            dtype,
             semantic_dim: cfg.semantic_dim,
             acoustic_dim: cfg.acoustic_dim,
             fsq_levels: cfg.acoustic_codebook_size,
@@ -607,7 +615,11 @@ impl CodecDecoder {
             (ac_codes - SPECIAL_TOKEN_OFFSET)?.clamp(0.0, (self.fsq_levels - 1) as f64)?;
         let ac_vals = ((ac_codes * (2.0 / (self.fsq_levels - 1) as f64))? - 1.0)?;
 
-        let embedded = Tensor::cat(&[sem_emb, ac_vals], 2)?;
+        // sem_emb (from the F32 semantic codebook) and ac_vals (FSQ
+        // dequantized in F32 for precision) must be cast to the decoder's
+        // working dtype before entering `input_conv`, whose weight was
+        // loaded at `self.dtype`.
+        let embedded = Tensor::cat(&[sem_emb, ac_vals], 2)?.to_dtype(self.dtype)?;
         embedded.transpose(1, 2)
     }
 
@@ -912,6 +924,7 @@ mod tests {
             stages: vec![],
             output_conv: dummy_causal_conv1d(1024, 240, 7, 1, dev)?,
             alibi_slopes: compute_alibi_slopes(8),
+            dtype: DType::F32,
             semantic_dim,
             acoustic_dim,
             fsq_levels: 21,
@@ -936,6 +949,46 @@ mod tests {
             (emb_vals[semantic_dim * n_frames] - ac_val).abs() < 1e-5,
             "FSQ decode mismatch"
         );
+        Ok(())
+    }
+
+    // Regression test: the semantic codebook is loaded (and the FSQ
+    // dequantization computed) in F32 for precision regardless of the
+    // decoder's working dtype, so `embed_codes` must cast its output to
+    // `self.dtype` — otherwise the F32 result mismatches `input_conv`'s F16
+    // weight in `decode`'s first conv1d ("dtype mismatch in conv1d, lhs:
+    // F32, rhs: F16").
+    #[test]
+    fn test_embed_codes_matches_decoder_dtype() -> Result<()> {
+        let dev = &Device::Cpu;
+        let semantic_dim = 256;
+        let acoustic_dim = 36;
+        let n_frames = 3;
+        let codebook_size = 64;
+
+        // The codebook itself stays F32 (as `load_semantic_codebook` always
+        // produces), but the decoder's working dtype is F16 — matching a
+        // real GPU F16 deployment.
+        let codebook = Tensor::randn(0f32, 1.0, (codebook_size, semantic_dim), dev)?;
+
+        let decoder = CodecDecoder {
+            semantic_codebook: codebook,
+            input_conv: dummy_causal_conv1d(292, 1024, 3, 1, dev)?,
+            stages: vec![],
+            output_conv: dummy_causal_conv1d(1024, 240, 7, 1, dev)?,
+            alibi_slopes: compute_alibi_slopes(8),
+            dtype: DType::F16,
+            semantic_dim,
+            acoustic_dim,
+            fsq_levels: 21,
+            samples_per_frame: 1920,
+        };
+
+        let code_data = vec![12.0f32; n_frames * 37];
+        let codes = Tensor::new(code_data.as_slice(), dev)?.reshape((1, n_frames, 37))?;
+
+        let emb = decoder.embed_codes(&codes)?;
+        assert_eq!(emb.dtype(), DType::F16);
         Ok(())
     }
 
@@ -1084,6 +1137,7 @@ mod tests {
             stages: vec![stage0, stage1],
             output_conv,
             alibi_slopes,
+            dtype: DType::F32,
             semantic_dim,
             acoustic_dim,
             fsq_levels,
