@@ -18,6 +18,11 @@ pub fn dtype(dt: DataType) -> Option<DType> {
         DataType::Uint32 => Some(DType::U32),
         DataType::Int64 => Some(DType::I64),
         DataType::Float16 => Some(DType::F16),
+        // Crane Added 20260827: candle's `from_raw_buffer` already decodes
+        // `DType::BF16` via `half::bf16`, matching ONNX's raw byte layout
+        // exactly; only the dtype mapping itself was missing. Audio8-TTS's
+        // fast/slow AR graphs have bf16 `Constant` nodes.
+        DataType::Bfloat16 => Some(DType::BF16),
         DataType::Float => Some(DType::F32),
         DataType::Double => Some(DType::F64),
         DataType::Bool => Some(DType::U8),
