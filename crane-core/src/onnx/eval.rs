@@ -1469,14 +1469,15 @@ pub(crate) fn simple_eval_(
                 let mode = get_attr_opt(node, "mode")?.unwrap_or("constant");
                 let data = get(&node.input[0])?;
                 let pads = get(&node.input[1])?;
-                if node.input.len() > 2 {
-                    bail!(
-                        "unsupported number of inputs {} for Pad node {:?}, expected 2",
-                        node.input.len(),
-                        node.name
-                    );
-                }
-                let output = ops::pad::pad(node, data, pads, mode)?;
+                // Crane Changed 20260827: this arm used to bail on a 3rd
+                // input at all. `constant_value` (input 2) is optional per
+                // the ONNX spec and only meaningful for `mode="constant"`;
+                // `get_opt` already treats an empty input name (the standard
+                // "omitted" marker) as absent, so a 3-input node with an
+                // omitted `constant_value` (as Audio8-TTS's codec decoder
+                // emits) no longer needs to be rejected.
+                let constant_value = get_opt(2).transpose()?;
+                let output = ops::pad::pad(node, data, pads, mode, constant_value)?;
                 values.insert(node.output[0].clone(), output);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#slice
