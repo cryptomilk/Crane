@@ -16,6 +16,7 @@ pub(crate) mod reciprocal;
 pub(crate) mod reduce_prod;
 pub(crate) mod reshape;
 pub(crate) mod scatter_elements;
+pub(crate) mod softplus;
 pub(crate) mod squeeze;
 pub(crate) mod stft;
 pub(crate) mod topk;

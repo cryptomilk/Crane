@@ -1255,6 +1255,12 @@ pub(crate) fn simple_eval_(
                 let output = input.gelu_erf()?;
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260827: implementation lives in ops/softplus.rs.
+            "Softplus" => {
+                let input = get(&node.input[0])?;
+                let output = ops::softplus::softplus(input)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "Relu" => {
                 let input = get(&node.input[0])?;
                 let output = input.relu()?;
