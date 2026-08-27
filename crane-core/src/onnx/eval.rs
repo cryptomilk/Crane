@@ -898,7 +898,15 @@ pub(crate) fn simple_eval_(
                 for idx in start..=end {
                     dims.push(xs.dim(idx)? as i64)
                 }
-                let dims = Tensor::from_vec(dims, xs.rank(), xs.device())?;
+                // Crane Changed 20260827: the output tensor's length is
+                // `dims.len()` (the number of dims actually collected by the
+                // `start..=end` loop above), not `xs.rank()` — those only
+                // coincide when `start`/`end` default to the full range.
+                // With explicit `start`/`end` attributes selecting a shorter
+                // slice, the old code passed `xs.rank()` as the shape,
+                // mismatching `dims`'s actual element count.
+                let dims_len = dims.len();
+                let dims = Tensor::from_vec(dims, dims_len, xs.device())?;
                 values.insert(node.output[0].clone(), dims);
             },
             // https://github.com/onnx/onnx/blob/main/docs/Operators.md#Size
