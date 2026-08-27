@@ -2829,12 +2829,18 @@ pub(crate) fn simple_eval_(
                         flat_idx += (norm_idx as usize) * strides[dim];
                     }
 
-                    // Extract current update
-                    let update_slice = if update_element_shape.is_empty() {
-                        flat_updates.narrow(0, i, 1)?.squeeze(0)?
-                    } else {
-                        flat_updates.narrow(0, i, 1)?
-                    };
+                    // Extract current update. `flat_updates` is `(num_updates,)`
+                    // when each update is a scalar, or `(num_updates, product)`
+                    // when each update is itself a `product`-sized slice; either
+                    // way, squeezing dim 0 drops the narrowed size-1 leading
+                    // dim so `update_slice`'s rank matches `flat_output`'s
+                    // (rank 0 for a scalar update, rank 1 for a slice update).
+                    // Crane Changed 20260827: this squeeze was missing for the
+                    // slice-update case, leaving `update_slice` at rank 2
+                    // (`(1, product)`) and making every `slice_scatter` below
+                    // fail with a rank mismatch against the rank-1
+                    // `flat_output`.
+                    let update_slice = flat_updates.narrow(0, i, 1)?.squeeze(0)?;
 
                     match reduction {
                         "add" => {
