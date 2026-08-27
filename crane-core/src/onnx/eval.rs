@@ -500,6 +500,14 @@ pub(crate) fn simple_eval_(
                 let output = input0.broadcast_matmul(input1)?;
                 values.insert(node.output[0].clone(), output);
             },
+            // Crane Added 20260827: implementation lives in ops/einsum.rs.
+            "Einsum" => {
+                let equation = get_attr::<str>(node, "equation")?;
+                let input0 = get(&node.input[0])?;
+                let input1 = get(&node.input[1])?;
+                let output = ops::einsum::einsum(equation, input0, input1)?;
+                values.insert(node.output[0].clone(), output);
+            },
             "Reshape" => {
                 let input0 = get(&node.input[0])?;
                 let input1 = get(&node.input[1])?.to_vec1::<i64>()?;
