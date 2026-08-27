@@ -240,6 +240,24 @@ fn same_upper_conv_pads(
 pub fn get_tensor(t: &onnx::TensorProto, name: &str) -> Result<Tensor> {
     let dims: Vec<usize> = t.dims.iter().map(|&x| x as usize).collect();
     match DataType::try_from(t.data_type) {
+        // Crane Added 20260827: candle has no `I8` dtype, so decode ONNX
+        // `Int8` (used by Audio8-TTS's `MatMulInteger` weight operands) into
+        // the narrowest signed dtype candle does have, widening losslessly.
+        Ok(DataType::Int8) => {
+            if t.int32_data.is_empty() {
+                let data = t
+                    .raw_data
+                    .iter()
+                    .map(|&b| i16::from(b.cast_signed()))
+                    .collect::<Vec<_>>();
+                Tensor::from_vec(data, dims.as_slice(), &Device::Cpu)
+            } else {
+                // Values are ONNX int8, packed one per `int32_data` entry.
+                #[allow(clippy::cast_possible_truncation)]
+                let data = t.int32_data.iter().map(|&v| v as i16).collect::<Vec<_>>();
+                Tensor::from_vec(data, dims.as_slice(), &Device::Cpu)
+            }
+        },
         Ok(DataType::Int32) => {
             if t.int32_data.is_empty() {
                 let len = t.raw_data.len() / 4;
