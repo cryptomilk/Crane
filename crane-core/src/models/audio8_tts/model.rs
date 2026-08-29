@@ -27,6 +27,15 @@ use crate::onnx::proto::{self as onnx_proto, GraphProto};
 const DEFAULT_TOP_K: usize = 50;
 /// Default nucleus sampling top-p when `SpeechOptions::top_p` is `None`.
 const DEFAULT_TOP_P: f64 = 0.95;
+/// Default sampling temperature when `SpeechOptions::temperature` is `None`.
+/// This 0.1B Preview model is prone to sampling a bad token at
+/// mid-utterance pauses (e.g. a comma) and needing Repetition-Avoidance
+/// Sampling to recover; empirically, that recovery is far noisier at high
+/// temperature (measured high-frequency burst energy dropped roughly 18x
+/// going from 0.9 to 0.3 on the same input/seed). `0.3` is also this
+/// model family's own reference service's default, unlike `0.9`, which
+/// has no source in this package's `config.json`.
+const DEFAULT_TEMPERATURE: f64 = 0.3;
 /// PRNG seed, matching the reference implementation's default.
 const DEFAULT_SEED: u64 = 42;
 /// Number of recent semantic tokens considered for repetition avoidance.
@@ -312,7 +321,7 @@ impl Model {
 
         let mut rng = SplitMix64::new(DEFAULT_SEED);
         let sampling_params = SamplingParams {
-            temperature: opts.temperature,
+            temperature: opts.temperature.unwrap_or(DEFAULT_TEMPERATURE),
             top_p: opts.top_p.unwrap_or(DEFAULT_TOP_P),
             top_k: DEFAULT_TOP_K,
         };
