@@ -113,6 +113,7 @@ MODELS = {
         "dirname": "Qwen3-Coder-30B-A3B-Instruct-GGUF",
         "kind": "llm",
         "quant_template": "Qwen3-Coder-30B-A3B-Instruct-{quant}.gguf",
+        "default_quant": "UD-Q4_K_XL",
         "description": "Qwen3-Coder 30B-A3B (MoE, 3.3B active), agentic coding, fits 8-24GB GPU, GGUF quant (Apache-2.0)",
     },
     "g2p-lexicons": {
@@ -264,14 +265,16 @@ _KIND_SECTIONS = {
 }
 
 _QUANT_EXPLAINER = """\
-Quantization (--quant) trades file size/VRAM for output quality -- lower
-bit-width is smaller and faster to load, but lossier:
-  Q2-Q8 (e.g. Q4_K_M, Q5_K_S, Q8_0)  k-quants; the number is roughly bits/weight
-  IQ*   (e.g. IQ3_XS, IQ4_NL)        "importance" quants, smaller than Q* at the same bit-width
-  UD-*  (e.g. UD-Q4_K_XL)            Unsloth Dynamic: keeps sensitive tensors at higher
-                                      precision even in aggressive quants
-Models marked [--quant] below support this flag. Run --list-quants <model> to see
-exactly which quants that model ships (not every model has every suffix).
+--quant picks a compressed version of the model: smaller file, less
+VRAM/RAM, faster loading -- but somewhat lower output quality. Rule of
+thumb, based on how much VRAM/RAM you have to spare for the model:
+  Q8_0             barely distinguishable from the original, biggest file
+  Q5_K_M / Q4_K_M  good default (Q4_K_M is used if --quant is omitted)
+  Q3_K_S / Q2_K    noticeably lower quality, smallest "regular" files
+  IQ* / UD-*       squeeze into very little VRAM (down to ~2 bits/weight);
+                   use these only if nothing else fits
+Not every model offers every option above -- run --list-quants <model> to
+see exactly which ones are available for that model.
 """
 
 
@@ -529,9 +532,10 @@ def main():
     )
     parser.add_argument(
         "--quant",
-        default="Q4_K_M",
+        default=None,
         help="Quantization suffix to download, for GGUF models only "
-        "(e.g. Q4_K_M, Q5_K_M, Q8_0, UD-Q4_K_XL). Default: Q4_K_M",
+        "(e.g. Q4_K_M, Q5_K_M, Q8_0, UD-Q4_K_XL). "
+        "Default: model-specific if set, otherwise Q4_K_M",
     )
     args = parser.parse_args()
 
@@ -546,7 +550,11 @@ def main():
     if not args.path:
         parser.error("--path is required when using --model")
 
-    download_model(args.model, args.path, args.token, args.quant)
+    quant = args.quant
+    if quant is None:
+        quant = MODELS[args.model].get("default_quant", "Q4_K_M")
+
+    download_model(args.model, args.path, args.token, quant)
 
 
 if __name__ == "__main__":
