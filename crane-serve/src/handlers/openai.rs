@@ -108,6 +108,7 @@ pub async fn chat_completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
+                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -211,6 +212,7 @@ pub async fn completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
+                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
