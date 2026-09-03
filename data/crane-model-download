@@ -263,6 +263,17 @@ _KIND_SECTIONS = {
     "amt": "Audio-to-MIDI",
 }
 
+_QUANT_EXPLAINER = """\
+Quantization (--quant) trades file size/VRAM for output quality -- lower
+bit-width is smaller and faster to load, but lossier:
+  Q2-Q8 (e.g. Q4_K_M, Q5_K_S, Q8_0)  k-quants; the number is roughly bits/weight
+  IQ*   (e.g. IQ3_XS, IQ4_NL)        "importance" quants, smaller than Q* at the same bit-width
+  UD-*  (e.g. UD-Q4_K_XL)            Unsloth Dynamic: keeps sensitive tensors at higher
+                                      precision even in aggressive quants
+Models marked [--quant] below support this flag. Run --list-quants <model> to see
+exactly which quants that model ships (not every model has every suffix).
+"""
+
 
 def list_models():
     by_kind = {}
@@ -276,8 +287,73 @@ def list_models():
             continue
         print(f"{title}:")
         for key in keys:
-            print(f"  {key:<{width}}  {MODELS[key]['description']}")
+            info = MODELS[key]
+            line = f"  {key:<{width}}  {info['description']}"
+            if info.get("quant_template"):
+                line += "  [--quant]"
+            print(line)
         print()
+
+    print(_QUANT_EXPLAINER)
+
+
+def list_quants(model_key, token):
+    info = MODELS[model_key]
+    quant_template = info.get("quant_template")
+    if not quant_template:
+        print(
+            f"error: {model_key!r} is not a quantized model, it has no --quant options",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.utils import HfHubHTTPError
+    except ImportError:
+        print(
+            "error: huggingface_hub is not installed. Install it with:\n\n"
+            "    pip install huggingface_hub\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    prefix, _, suffix = quant_template.partition("{quant}")
+    repo_type = info.get("repo_type", "model")
+    try:
+        files = HfApi(token=token).list_repo_files(info["repo_id"], repo_type=repo_type)
+    except HfHubHTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        print(f"error: could not list files for {info['repo_id']}: {e}", file=sys.stderr)
+        if status in (401, 403):
+            print(
+                "\nThis model may be gated. Make sure you've accepted its "
+                "license on the Hugging Face model page, then pass a valid "
+                "--token (or set HF_TOKEN).",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
+    # Only top-level files matching the exact quant_template shape -- skips
+    # subfolder variants (e.g. an unquantized BF16/ dir) that don't fit the
+    # single-file --quant download path anyway.
+    quants = sorted(
+        f[len(prefix):-len(suffix)]
+        for f in files
+        if f.startswith(prefix)
+        and f.endswith(suffix)
+        and "/" not in f[len(prefix):-len(suffix)]
+    )
+    if not quants:
+        print(
+            f"error: no files matching {quant_template!r} found in {info['repo_id']}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Available --quant values for {model_key} ({info['repo_id']}):\n")
+    for q in quants:
+        print(f"  {q}")
 
 
 def download_url_files(info, local_dir):
@@ -424,6 +500,7 @@ def main():
         "  crane-model-download --model qwen3-asr-0.6b --path ~/models\n"
         "  crane-model-download --model silero-vad --path ~/models\n"
         "  crane-model-download --model qwen3.5-9b-gguf --path ~/models --quant Q8_0\n"
+        "  crane-model-download --list-quants qwen3-coder-30b-a3b-gguf\n"
         "  crane-model-download --model g2p-lexicons --path ~/models\n"
         "  crane-model-download --model g2p-oov-en-us --path ~/models\n"
         "  crane-model-download --model kokoro --path ~/models\n",
@@ -435,6 +512,12 @@ def main():
     )
     group.add_argument(
         "--model", choices=list(MODELS.keys()), help="Model to download"
+    )
+    group.add_argument(
+        "--list-quants",
+        metavar="MODEL",
+        choices=list(MODELS.keys()),
+        help="Query Hugging Face for available --quant values for MODEL and exit",
     )
     parser.add_argument(
         "--path", help="Parent directory to download the model into"
@@ -454,6 +537,10 @@ def main():
 
     if args.list:
         list_models()
+        return
+
+    if args.list_quants:
+        list_quants(args.list_quants, args.token)
         return
 
     if not args.path:
