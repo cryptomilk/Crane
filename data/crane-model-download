@@ -252,12 +252,32 @@ for _key, _info in MODELS.items():
         )
 
 
+_KIND_SECTIONS = {
+    "llm": "LLM",
+    "vlm": "Vision-language",
+    "omni": "Omni (vision + audio)",
+    "tts": "TTS",
+    "asr": "ASR",
+    "vad": "VAD",
+    "g2p": "G2P",
+    "amt": "Audio-to-MIDI",
+}
+
+
 def list_models():
-    print("Available models:\n")
-    width = max(len(key) for key in MODELS)
+    by_kind = {}
     for key, info in MODELS.items():
-        kind = info["kind"].upper()
-        print(f"  {key:<{width}}  [{kind}]  {info['description']}")
+        by_kind.setdefault(info["kind"], []).append(key)
+
+    width = max(len(key) for key in MODELS)
+    for kind, title in _KIND_SECTIONS.items():
+        keys = by_kind.get(kind)
+        if not keys:
+            continue
+        print(f"{title}:")
+        for key in keys:
+            print(f"  {key:<{width}}  {MODELS[key]['description']}")
+        print()
 
 
 def download_url_files(info, local_dir):
