@@ -108,6 +108,13 @@ MODELS = {
         "quant_template": "Qwen3.8-27B-{quant}.gguf",
         "description": "Qwen 3.8 27B, same arch as Qwen 3.5 scaled up, GGUF quant (Apache-2.0)",
     },
+    "qwen3-coder-30b-a3b-gguf": {
+        "repo_id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "dirname": "Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "kind": "llm",
+        "quant_template": "Qwen3-Coder-30B-A3B-Instruct-{quant}.gguf",
+        "description": "Qwen3-Coder 30B-A3B (MoE, 3.3B active), agentic coding, fits 8-24GB GPU, GGUF quant (Apache-2.0)",
+    },
     "g2p-lexicons": {
         "repo_id": "crane-local-ai/g2p-lexicons",
         "dirname": "g2p-lexicons",
