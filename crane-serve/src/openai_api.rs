@@ -34,6 +34,8 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// OpenAI's newer alias for `max_tokens`; takes precedence when present.
+    pub max_completion_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
@@ -371,6 +373,8 @@ pub struct CompletionRequest {
     pub prompt: StringOrArray,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: usize,
+    /// OpenAI's newer alias for `max_tokens`; takes precedence when present.
+    pub max_completion_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,

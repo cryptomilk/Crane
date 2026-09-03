@@ -100,7 +100,7 @@ pub async fn chat_completions(
             request_id.clone(),
             input_ids,
             GenerationParams {
-                max_tokens: req.max_tokens,
+                max_tokens: req.max_completion_tokens.unwrap_or(req.max_tokens),
                 temperature: req.temperature.or(Some(0.8)),
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
@@ -204,7 +204,7 @@ pub async fn completions(
             request_id.clone(),
             input_ids,
             GenerationParams {
-                max_tokens: req.max_tokens,
+                max_tokens: req.max_completion_tokens.unwrap_or(req.max_tokens),
                 temperature: req.temperature.or(Some(0.8)),
                 top_p: req.top_p.or(Some(0.95)),
                 top_k: req.top_k.or(Some(40)),
