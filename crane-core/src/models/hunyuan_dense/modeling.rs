@@ -42,7 +42,22 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn linear(&mut self, name: &str) -> Result<LinearLayer> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let device = self.device.clone();
+        self.linear_on(name, &device)
+    }
+
+    /// Load a quantized tensor onto `device` and wrap as a `LinearLayer` (`QMatMul`).
+    ///
+    /// Identical to [`Self::linear`] but places the weight on a caller-chosen
+    /// device instead of `self.device` — used for `MoE` expert offloading where
+    /// experts may live on a different device (e.g. CPU) than the rest of the
+    /// model.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is missing from the GGUF file, the
+    /// quantization type is unsupported, or the `QMatMul` construction fails.
+    pub fn linear_on(&mut self, name: &str, device: &Device) -> Result<LinearLayer> {
+        let ws = self.ct.tensor(&mut self.reader, name, device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(LinearLayer::Quantized(qmm))
     }
