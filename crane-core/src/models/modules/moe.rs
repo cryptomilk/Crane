@@ -361,6 +361,28 @@ impl Module for SparseMoeBlock {
     }
 }
 
+/// Dense MLP or Mixture-of-Experts feed-forward layer.
+///
+/// Generic over the model's own dense MLP type `M`, so each model plugs in
+/// its existing MLP struct unchanged (e.g. Qwen3's `Mlp`, Qwen3.5's `Mlp`).
+/// `DecoderLayer` holds `MlpOrMoe<Mlp>` and calls `.forward()` without
+/// branching on the layer type.
+pub enum MlpOrMoe<M: Module> {
+    /// Standard dense MLP (non-MoE layer).
+    Dense(M),
+    /// Mixture-of-Experts routing + dispatch block.
+    Moe(SparseMoeBlock),
+}
+
+impl<M: Module> Module for MlpOrMoe<M> {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(xs),
+            Self::Moe(moe) => moe.forward(xs),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -856,5 +878,28 @@ mod tests {
         let y = moe.forward(&x).expect("forward");
         assert_eq!(y.dtype(), DType::F16);
         assert_eq!(y.dims(), &[3, hidden]);
+    }
+
+    #[test]
+    fn test_mlp_or_moe_dense_passthrough() {
+        let expert = zeros_expert(8, 16);
+        let x = Tensor::ones((3, 8), DType::F32, &Device::Cpu).expect("ones");
+        let direct = expert.forward(&x).expect("direct forward");
+
+        let wrapped: MlpOrMoe<MoeExpert> = MlpOrMoe::Dense(zeros_expert(8, 16));
+        let via_enum = wrapped.forward(&x).expect("enum forward");
+
+        let diff: f32 = (&direct - &via_enum)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar()
+            .expect("scalar");
+        assert!(
+            diff < 1e-8,
+            "MlpOrMoe::Dense output should match direct expert forward, diff={diff}"
+        );
     }
 }
