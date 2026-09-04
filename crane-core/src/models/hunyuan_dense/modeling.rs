@@ -121,8 +121,24 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn dequant_tensor(&mut self, name: &str) -> Result<Tensor> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
-        ws.dequantize(&self.device)?.to_dtype(self.dtype)
+        let device = self.device.clone();
+        self.dequant_tensor_on(name, &device)
+    }
+
+    /// Load a tensor onto `device`, dequantize, and cast to the target compute
+    /// dtype.
+    ///
+    /// Identical to [`Self::dequant_tensor`] but places the result on a
+    /// caller-chosen device instead of `self.device` — used for `MoE` packed
+    /// expert tensors, which must be dequantized directly onto
+    /// `expert_device` rather than the main model device.
+    ///
+    /// # Errors
+    /// Returns an error if the tensor is missing from the GGUF file, the
+    /// quantization type is unsupported, or dequantization fails.
+    pub fn dequant_tensor_on(&mut self, name: &str, device: &Device) -> Result<Tensor> {
+        let ws = self.ct.tensor(&mut self.reader, name, device)?;
+        ws.dequantize(device)?.to_dtype(self.dtype)
     }
 
     /// Whether the file contains a tensor with this exact name.
