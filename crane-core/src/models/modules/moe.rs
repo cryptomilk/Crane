@@ -733,7 +733,7 @@ mod tests {
     // expert_e(x) = c_e * x * silu(x) elementwise. Experts 1 and 3 (not
     // selected) use a huge c=100 so any routing bug that includes them is
     // trivially detectable.
-    fn routing_test_setup(norm_topk_prob: bool) -> (SparseMoeBlock, f32, f32) {
+    fn routing_test_setup(norm_topk_prob: bool, top_k: usize) -> (SparseMoeBlock, f32, f32) {
         let identity = vec![1.0f32, 0.0, 0.0, 1.0];
         let scaled = |c: f32| vec![c, 0.0, 0.0, c];
         let expert_data = vec![
@@ -748,7 +748,7 @@ mod tests {
             1.5, 0.0, //
             -1.5, 0.0,
         ];
-        let moe = make_sparse_moe(2, 2, 4, 2, norm_topk_prob, gate_data, &expert_data);
+        let moe = make_sparse_moe(2, 2, 4, top_k, norm_topk_prob, gate_data, &expert_data);
 
         let logits = [2.0f32, -2.0, 1.5, -1.5];
         let exps: Vec<f32> = logits.iter().map(|l| l.exp()).collect();
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_routing_selects_top_k_experts() {
-        let (moe, weight0, weight2) = routing_test_setup(false);
+        let (moe, weight0, weight2) = routing_test_setup(false, 2);
         let x = Tensor::new(&[1.0f32, 0.0], &Device::Cpu)
             .expect("tensor")
             .reshape((1, 2))
@@ -783,9 +783,67 @@ mod tests {
         );
     }
 
+    // Degenerate case: top-1 routing, so only expert 0 (the highest router
+    // logit) has a non-zero routing weight. Reuses routing_test_setup's
+    // poison-weighted experts 1 and 3 so any bug that leaks them into the
+    // output is trivially detectable.
+    #[test]
+    fn test_single_expert_routing() {
+        let (moe, weight0, _) = routing_test_setup(false, 1);
+        let x = Tensor::new(&[1.0f32, 0.0], &Device::Cpu)
+            .expect("tensor")
+            .reshape((1, 2))
+            .expect("reshape");
+        let y = moe.forward(&x).expect("forward");
+        let got = y
+            .squeeze(0)
+            .expect("squeeze")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+
+        let silu_1 = 1.0f32 / (1.0 + (-1.0f32).exp());
+        let expected0 = weight0 * 1.0 * silu_1;
+        assert!(
+            (got[0] - expected0).abs() < 1e-4,
+            "got {got:?}, expected [{expected0}, 0.0] (only expert 0 should contribute)"
+        );
+        assert!(
+            got[1].abs() < 1e-5,
+            "got {got:?}, expected second element 0"
+        );
+    }
+
+    // Degenerate case: top-1 with norm_topk_prob=true divides the single
+    // selected expert's raw softmax weight by itself, so the applied routing
+    // weight must always be exactly 1.0 regardless of the raw router logits.
+    #[test]
+    fn test_single_expert_routing_norm_topk_prob_forces_weight_one() {
+        let (moe, _, _) = routing_test_setup(true, 1);
+        let x = Tensor::new(&[1.0f32, 0.0], &Device::Cpu)
+            .expect("tensor")
+            .reshape((1, 2))
+            .expect("reshape");
+        let y = moe.forward(&x).expect("forward");
+        let got = y
+            .squeeze(0)
+            .expect("squeeze")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+
+        let silu_1 = 1.0f32 / (1.0 + (-1.0f32).exp());
+        assert!(
+            (got[0] - silu_1).abs() < 1e-4,
+            "got {got:?}, expected [{silu_1}, 0.0] (normalized top-1 weight must be 1.0)"
+        );
+        assert!(
+            got[1].abs() < 1e-5,
+            "got {got:?}, expected second element 0"
+        );
+    }
+
     #[test]
     fn test_norm_topk_prob_normalizes_weights() {
-        let (moe, weight0, weight2) = routing_test_setup(true);
+        let (moe, weight0, weight2) = routing_test_setup(true, 2);
         let x = Tensor::new(&[1.0f32, 0.0], &Device::Cpu)
             .expect("tensor")
             .reshape((1, 2))
