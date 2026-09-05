@@ -46,6 +46,7 @@ use std::io::{Read, Seek};
 
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
+use crate::models::modules::moe::MoeConfig;
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
 
@@ -119,6 +120,21 @@ pub struct Config {
     pub use_sliding_window: bool,
     #[serde(default)]
     pub eos_token_id: Option<u32>,
+    /// Total number of experts per `MoE` layer. `None` for dense checkpoints.
+    #[serde(default)]
+    pub num_experts: Option<usize>,
+    /// Number of experts activated per token (top-K). `None` for dense checkpoints.
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    /// Hidden dimension of each expert's feed-forward network.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    /// Whether to renormalize the top-K routing weights to sum to 1.
+    #[serde(default)]
+    pub norm_topk_prob: Option<bool>,
+    /// Every Nth layer is `MoE`; the rest stay dense MLP.
+    #[serde(default)]
+    pub decoder_sparse_step: Option<usize>,
 }
 
 impl Config {
@@ -126,6 +142,19 @@ impl Config {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Builds the `MoE` configuration for this model, or `None` if this is a
+    /// dense (non-`MoE`) checkpoint.
+    #[must_use]
+    pub fn moe_config(&self) -> Option<MoeConfig> {
+        Some(MoeConfig {
+            num_experts: self.num_experts?,
+            num_experts_per_tok: self.num_experts_per_tok?,
+            moe_intermediate_size: self.moe_intermediate_size?,
+            norm_topk_prob: self.norm_topk_prob.unwrap_or(true),
+            decoder_sparse_step: self.decoder_sparse_step,
+        })
     }
 }
 
@@ -735,6 +764,52 @@ pub struct Qwen3Model {
     last_hidden_states: Option<Tensor>,
 }
 
+/// `MoE` expert metadata read from GGUF, all `None` for dense
+/// (non-`MoE`) checkpoints.
+struct GgufMoeMetadata {
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    norm_topk_prob: Option<bool>,
+}
+
+/// Reads `MoE` expert metadata from GGUF, if present.
+fn read_moe_metadata<R: Read + Seek>(gg: &Gguf<R>, arch: &str) -> GgufMoeMetadata {
+    let num_experts = gg
+        .metadata()
+        .get(&format!("{arch}.expert_count"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize)
+        // Some dense GGUF exports write an explicit `expert_count = 0`
+        // rather than omitting the key; treat that the same as absent.
+        .filter(|&n| n > 0);
+    let num_experts_per_tok = gg
+        .metadata()
+        .get(&format!("{arch}.expert_used_count"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    let moe_intermediate_size = gg
+        .metadata()
+        .get(&format!("{arch}.expert_feed_forward_length"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    let expert_shared_ffn_length = gg
+        .metadata()
+        .get(&format!("{arch}.expert_shared_feed_forward_length"))
+        .and_then(|v| v.to_u32().ok())
+        .map(|v| v as usize);
+    // Qwen3 MoE has no shared experts, so an absent or zero shared-FFN
+    // length means the top-K routing weights should be renormalized.
+    let norm_topk_prob = num_experts
+        .map(|_| expert_shared_ffn_length.is_none() || expert_shared_ffn_length == Some(0));
+    GgufMoeMetadata {
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        norm_topk_prob,
+    }
+}
+
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint.
     ///
@@ -818,6 +893,11 @@ impl Qwen3Model {
     ///
     /// Returns an error if a required tensor or metadata entry is missing
     /// or has an unexpected shape.
+    // This function's length comes from reading many independent GGUF
+    // metadata keys (attention, RoPE, MoE) into `Config` one field at a
+    // time; splitting it up would scatter that flat read-and-assign
+    // sequence across several small functions without simplifying it.
+    #[allow(clippy::too_many_lines)]
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -872,6 +952,8 @@ impl Qwen3Model {
                 .unwrap_or(1_000_000.0),
         );
 
+        let moe_meta = read_moe_metadata(&gg, &arch);
+
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
         let tie_word_embeddings = !gg.ct.tensor_infos.contains_key("output.weight");
 
@@ -893,6 +975,13 @@ impl Qwen3Model {
             max_window_layers: 0,
             use_sliding_window: false,
             eos_token_id: None,
+            num_experts: moe_meta.num_experts,
+            num_experts_per_tok: moe_meta.num_experts_per_tok,
+            moe_intermediate_size: moe_meta.moe_intermediate_size,
+            norm_topk_prob: moe_meta.norm_topk_prob,
+            // Not a standard GGUF metadata key; the GGUF layer-construction
+            // path detects MoE-vs-dense per layer by tensor presence instead.
+            decoder_sparse_step: None,
         };
 
         let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
@@ -1400,6 +1489,55 @@ mod tests {
             "tie_word_embeddings": true
         }"#;
         serde_json::from_str(json).expect("tiny_config parse")
+    }
+
+    // Dense checkpoints carry no MoE fields, so `moe_config()` must return `None`.
+    #[test]
+    fn test_moe_config_none_for_dense_checkpoint() {
+        assert!(tiny_config().moe_config().is_none());
+    }
+
+    // A checkpoint with all five MoE fields set builds a matching `MoeConfig`.
+    #[test]
+    fn test_moe_config_some_for_full_moe_checkpoint() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            moe_intermediate_size: Some(64),
+            norm_topk_prob: Some(false),
+            decoder_sparse_step: Some(2),
+            ..tiny_config()
+        };
+        let moe_config = config.moe_config().expect("moe_config");
+        assert_eq!(moe_config.num_experts, 8);
+        assert_eq!(moe_config.num_experts_per_tok, 2);
+        assert_eq!(moe_config.moe_intermediate_size, 64);
+        assert!(!moe_config.norm_topk_prob);
+        assert_eq!(moe_config.decoder_sparse_step, Some(2));
+    }
+
+    // A missing required sizing field (here `moe_intermediate_size`) means
+    // `moe_config()` must return `None`, even if other MoE fields are set.
+    #[test]
+    fn test_moe_config_none_when_required_field_missing() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            ..tiny_config()
+        };
+        assert!(config.moe_config().is_none());
+    }
+
+    // An absent `norm_topk_prob` defaults to `true`.
+    #[test]
+    fn test_moe_config_norm_topk_prob_defaults_to_true() {
+        let config = Config {
+            num_experts: Some(8),
+            num_experts_per_tok: Some(2),
+            moe_intermediate_size: Some(64),
+            ..tiny_config()
+        };
+        assert!(config.moe_config().expect("moe_config").norm_topk_prob);
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
