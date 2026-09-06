@@ -15,6 +15,7 @@
 //! | [`chat`] | Chat-template rendering and message formatting |
 //! | [`bins`] | Model loading helpers used by CLI entry-points |
 //! | [`utils`] | Misc tensor / device utilities |
+//! | [`device`] | `DeviceAssignment`, bundling a model's main and MoE-expert devices |
 //!
 //! ## Feature flags
 //!
@@ -25,6 +26,7 @@
 //! | `accelerate` | Link against Apple Accelerate for CPU BLAS |
 //! | `mkl` | Link against Intel MKL for CPU BLAS |
 
+pub mod device;
 pub mod generation;
 pub mod models;
 pub mod ops;

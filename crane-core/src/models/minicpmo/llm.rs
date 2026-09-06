@@ -15,6 +15,7 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::config::{MiniCpmOConfig, load_config};
+use crate::device::DeviceAssignment;
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::qwen3::modeling::Qwen3Model;
@@ -50,7 +51,7 @@ impl MiniCpmOLlm {
         // `llm.lm_head.weight` as a sibling (not the `model.*` /
         // `lm_head.weight` layout `Qwen3Model::new` assumes).
         let llm_vb = vb.pp("llm");
-        let inner = Qwen3Model::new_from_model_vb(&config.llm, llm_vb.pp("model"), llm_vb)?;
+        let inner = Qwen3Model::new_from_model_vb(&config.llm, llm_vb.pp("model"), llm_vb, device)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -97,7 +98,7 @@ impl MiniCpmOLlm {
             .map_err(|e| anyhow::anyhow!("failed to open GGUF file {gguf_path}: {e}"))?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow::anyhow!("failed to parse GGUF file {gguf_path}: {e}"))?;
-        let inner = Qwen3Model::from_gguf(ct, &mut file, device)?;
+        let inner = Qwen3Model::from_gguf(ct, &mut file, &DeviceAssignment::uniform(device))?;
         let dtype = inner.model_dtype();
 
         Ok(Self {

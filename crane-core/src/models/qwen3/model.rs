@@ -15,6 +15,7 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
+use crate::device::DeviceAssignment;
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -42,16 +43,20 @@ impl Model {
     /// # Errors
     ///
     /// Returns an error if the model files cannot be found or loaded.
-    pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
-        Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
+    pub fn new(model_path: &str, devices: &DeviceAssignment, dtype: &DType) -> Result<Self> {
+        Self::new_with_format(model_path, devices, dtype, ModelFormat::Auto)
     }
 
+    /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
+    /// holds `MoE` expert weights, if the checkpoint is `MoE`. Applies to
+    /// both GGUF and safetensors checkpoints.
+    ///
     /// # Errors
     ///
     /// Returns an error if the model files cannot be found or loaded.
     pub fn new_with_format(
         model_path: &str,
-        device: &Device,
+        devices: &DeviceAssignment,
         dtype: &DType,
         format: ModelFormat,
     ) -> Result<Self> {
@@ -68,8 +73,8 @@ impl Model {
         };
 
         match format {
-            ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
+            ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, devices),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, devices, *dtype),
         }
     }
 
@@ -81,7 +86,11 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
+    fn from_pretrained(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: DType,
+    ) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -89,24 +98,24 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &devices.main) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = Qwen3Model::new(&config, vb)?;
+        let inner = Qwen3Model::new(&config, vb, &devices.expert)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
-            device: device.clone(),
+            device: devices.main.clone(),
             dtype,
             inner,
         })
     }
 
     /// Load a GGUF quantized model file.
-    fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
+    fn from_gguf(model_path: &str, devices: &DeviceAssignment) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
 
         let tokenizer_path = {
@@ -144,12 +153,12 @@ impl Model {
             ct.metadata.len(),
         );
 
-        let inner = Qwen3Model::from_gguf(ct, &mut file, device)?;
+        let inner = Qwen3Model::from_gguf(ct, &mut file, devices)?;
         let dtype = inner.model_dtype();
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
-            device: device.clone(),
+            device: devices.main.clone(),
             dtype,
             inner,
         })

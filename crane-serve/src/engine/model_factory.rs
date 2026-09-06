@@ -7,6 +7,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use candle_core::{DType, Device};
+use crane_core::device::DeviceAssignment;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -520,7 +521,11 @@ pub fn create_backend(
             )?))
         },
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
-        ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(model_path, device, dtype)?)),
+        ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(
+            model_path,
+            &DeviceAssignment::uniform(device),
+            dtype,
+        )?)),
         ModelType::Qwen3_5 => {
             let quant = quant
                 .map(crane_core::ops::linear::parse_ggml_dtype)

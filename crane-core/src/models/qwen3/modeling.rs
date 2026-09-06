@@ -44,6 +44,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::device::DeviceAssignment;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
@@ -689,7 +690,12 @@ struct DecoderLayer {
 impl DecoderLayer {
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(config: &Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        config: &Config,
+        layer_idx: usize,
+        vb: VarBuilder,
+        expert_device: &Device,
+    ) -> Result<Self> {
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
         let moe_config = config.moe_config();
         // HF's `mlp_only_layers` override (per-layer dense exceptions) isn't
@@ -703,7 +709,7 @@ impl DecoderLayer {
                 &mc,
                 config.hidden_size,
                 vb.pp("mlp"),
-                vb.device(),
+                expert_device,
             )?),
             _ => MlpOrMoe::Dense(Mlp::new(config, vb.pp("mlp"))?),
         };
@@ -855,8 +861,8 @@ impl Qwen3Model {
     ///
     /// Returns an error if a required weight tensor is missing or has an
     /// unexpected shape.
-    pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        Self::new_inner(config, vb.pp("model"), vb)
+    pub fn new(config: &Config, vb: VarBuilder, expert_device: &Device) -> Result<Self> {
+        Self::new_inner(config, vb.pp("model"), vb, expert_device)
     }
 
     /// Construct from a checkpoint where the decoder is nested under a
@@ -873,13 +879,19 @@ impl Qwen3Model {
         config: &Config,
         model_vb: VarBuilder,
         root_vb: VarBuilder,
+        expert_device: &Device,
     ) -> Result<Self> {
-        Self::new_inner(config, model_vb, root_vb)
+        Self::new_inner(config, model_vb, root_vb, expert_device)
     }
 
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
+    fn new_inner(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+        expert_device: &Device,
+    ) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
@@ -890,7 +902,12 @@ impl Qwen3Model {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(config, i, layers_vb.pp(i))?);
+            layers.push(DecoderLayer::new(
+                config,
+                i,
+                layers_vb.pp(i),
+                expert_device,
+            )?);
         }
 
         let norm =
@@ -927,6 +944,9 @@ impl Qwen3Model {
 
     /// Construct from a GGUF file.
     ///
+    /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
+    /// holds `MoE` expert weights, if the checkpoint is `MoE`.
+    ///
     /// # Errors
     ///
     /// Returns an error if a required tensor or metadata entry is missing
@@ -939,8 +959,9 @@ impl Qwen3Model {
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
-        device: &Device,
+        devices: &DeviceAssignment,
     ) -> Result<Self> {
+        let device = &devices.main;
         let dtype = if device.is_cuda() {
             DType::BF16
         } else if device.is_metal() || device.is_rocm() {
@@ -1031,7 +1052,12 @@ impl Qwen3Model {
 
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
-            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i, device)?);
+            layers.push(DecoderLayer::new_from_gguf(
+                &config,
+                &mut gg,
+                i,
+                &devices.expert,
+            )?);
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
@@ -1597,7 +1623,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = Qwen3Model::new(&cfg, vb).expect("new");
+        let model = Qwen3Model::new(&cfg, vb, &device).expect("new");
 
         let is_moe: Vec<bool> = model
             .layers
@@ -1615,7 +1641,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = Qwen3Model::new(&cfg, vb).expect("new");
+        let model = Qwen3Model::new(&cfg, vb, &device).expect("new");
 
         assert!(
             model
@@ -1646,9 +1672,9 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let mut model_a = Qwen3Model::new(&cfg, vb.clone()).expect("new");
-        let mut model_b =
-            Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb).expect("new_from_model_vb");
+        let mut model_a = Qwen3Model::new(&cfg, vb.clone(), &device).expect("new");
+        let mut model_b = Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb, &device)
+            .expect("new_from_model_vb");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_a = model_a.forward(&input_ids, 0).expect("forward a");
@@ -1666,7 +1692,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_forward = model.forward(&input_ids, 0).expect("forward");
@@ -1830,7 +1856,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("prefill_ids");
         let decode_ids = Tensor::new(&[[4u32]], &device).expect("decode_ids");
@@ -1966,7 +1992,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
 
@@ -1994,12 +2020,18 @@ mod tests {
         // once-per-construction merged `qkv_proj`, which is a fresh
         // concatenation `Var::set` can't retroactively update).
         let varmap = VarMap::new();
-        let mut model_single =
-            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
-                .expect("new single");
-        let mut model_chunked =
-            Qwen3Model::new(&cfg, VarBuilder::from_varmap(&varmap, DType::F32, &device))
-                .expect("new chunked");
+        let mut model_single = Qwen3Model::new(
+            &cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            &device,
+        )
+        .expect("new single");
+        let mut model_chunked = Qwen3Model::new(
+            &cfg,
+            VarBuilder::from_varmap(&varmap, DType::F32, &device),
+            &device,
+        )
+        .expect("new chunked");
 
         let decode_id = Tensor::new(&[[6u32]], &device).expect("decode_id");
 

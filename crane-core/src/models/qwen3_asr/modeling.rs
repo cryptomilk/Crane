@@ -102,7 +102,8 @@ impl Qwen3AsrModel {
 
         let lang_vb = model_vb.pp("language_model");
         let qwen3_config = config.text_config.to_qwen3_config();
-        let decoder = Qwen3Model::new_from_model_vb(&qwen3_config, lang_vb, vb)?;
+        let expert_device = vb.device().clone();
+        let decoder = Qwen3Model::new_from_model_vb(&qwen3_config, lang_vb, vb, &expert_device)?;
 
         Ok(Self {
             encoder,
