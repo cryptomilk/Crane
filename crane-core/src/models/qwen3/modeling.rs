@@ -671,6 +671,12 @@ impl Mlp {
     }
 }
 
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        Self::forward(self, xs)
+    }
+}
+
 // ── Decoder Layer ───────────────────────────────────────────────────────
 
 struct DecoderLayer {
