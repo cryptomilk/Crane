@@ -46,7 +46,7 @@ use std::io::{Read, Seek};
 
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
-use crate::models::modules::moe::MoeConfig;
+use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
 
@@ -681,7 +681,7 @@ impl Module for Mlp {
 
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: Mlp,
+    mlp: MlpOrMoe<Mlp>,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -689,9 +689,24 @@ struct DecoderLayer {
 impl DecoderLayer {
     // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &Config, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(config, vb.pp("mlp"))?;
+        let moe_config = config.moe_config();
+        // HF's `mlp_only_layers` override (per-layer dense exceptions) isn't
+        // modeled here; only the uniform `decoder_sparse_step` stride is.
+        let is_moe_layer = moe_config.as_ref().is_some_and(|mc| {
+            mc.decoder_sparse_step
+                .is_none_or(|step| (layer_idx + 1).is_multiple_of(step))
+        });
+        let mlp = match moe_config {
+            Some(mc) if is_moe_layer => MlpOrMoe::Moe(SparseMoeBlock::new(
+                &mc,
+                config.hidden_size,
+                vb.pp("mlp"),
+                vb.device(),
+            )?),
+            _ => MlpOrMoe::Dense(Mlp::new(config, vb.pp("mlp"))?),
+        };
         let input_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -714,9 +729,26 @@ impl DecoderLayer {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        expert_device: &Device,
     ) -> Result<Self> {
         let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
-        let mlp = Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?;
+        let is_moe = gg.contains_tensor(&format!("blk.{layer_idx}.ffn_gate_inp.weight"));
+        let mlp = if is_moe {
+            let moe_config = config.moe_config().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "layer {layer_idx} has MoE tensors but Config lacks MoE fields"
+                ))
+                .bt()
+            })?;
+            MlpOrMoe::Moe(SparseMoeBlock::new_from_gguf(
+                &moe_config,
+                gg,
+                layer_idx,
+                expert_device,
+            )?)
+        } else {
+            MlpOrMoe::Dense(Mlp::new_from_gguf(gg, layer_idx, config.intermediate_size)?)
+        };
         let prefix = format!("blk.{layer_idx}");
         let input_layernorm =
             gg.rms_norm(&format!("{prefix}.attn_norm.weight"), config.rms_norm_eps)?;
@@ -858,7 +890,7 @@ impl Qwen3Model {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
+            layers.push(DecoderLayer::new(config, i, layers_vb.pp(i))?);
         }
 
         let norm =
@@ -999,7 +1031,7 @@ impl Qwen3Model {
 
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
-            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i)?);
+            layers.push(DecoderLayer::new_from_gguf(&config, &mut gg, i, device)?);
         }
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
@@ -1544,6 +1576,53 @@ mod tests {
             ..tiny_config()
         };
         assert!(config.moe_config().expect("moe_config").norm_topk_prob);
+    }
+
+    fn moe_layer_config(num_hidden_layers: usize, decoder_sparse_step: Option<usize>) -> Config {
+        Config {
+            num_hidden_layers,
+            num_experts: Some(2),
+            num_experts_per_tok: Some(1),
+            moe_intermediate_size: Some(32),
+            decoder_sparse_step,
+            ..tiny_config()
+        }
+    }
+
+    // `decoder_sparse_step: Some(2)` makes every 2nd layer (1-indexed) MoE;
+    // the rest stay dense.
+    #[test]
+    fn test_moe_layer_selection_respects_decoder_sparse_step() {
+        let cfg = moe_layer_config(4, Some(2));
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        let is_moe: Vec<bool> = model
+            .layers
+            .iter()
+            .map(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+            .collect();
+        assert_eq!(is_moe, vec![false, true, false, true]);
+    }
+
+    // An absent `decoder_sparse_step` on a MoE checkpoint means every layer
+    // is MoE, matching HF's default of `1`.
+    #[test]
+    fn test_moe_all_layers_when_decoder_sparse_step_none() {
+        let cfg = moe_layer_config(2, None);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let model = Qwen3Model::new(&cfg, vb).expect("new");
+
+        assert!(
+            model
+                .layers
+                .iter()
+                .all(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+        );
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

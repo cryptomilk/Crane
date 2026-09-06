@@ -19,7 +19,7 @@ pub struct MoeConfig {
     /// Whether to renormalize the top-K routing weights to sum to 1.
     pub norm_topk_prob: bool,
     /// Every Nth layer is `MoE`; the rest stay dense MLP.
-    /// `None` means dense-only (non-MoE checkpoints).
+    /// `None` means every layer is `MoE` (matches HF's default of `1`).
     /// Only used by the safetensors path; the GGUF path detects
     /// MoE-vs-dense per layer by tensor presence.
     pub decoder_sparse_step: Option<usize>,
