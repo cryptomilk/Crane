@@ -59,7 +59,10 @@ impl MemoryConfig {
         ("M", 20),
     ];
 
-    fn parse_memory_limit(s: &str, device: &Device) -> u64 {
+    /// Parse a single size string as accepted by [`Self::parse`]. Returns 0
+    /// (unlimited) for empty, `"0"`, or unparseable input.
+    #[must_use]
+    pub(crate) fn parse_memory_limit(s: &str, device: &Device) -> u64 {
         let s = s.trim();
         if s.is_empty() || s == "0" {
             return 0;
@@ -111,7 +114,8 @@ impl MemoryConfig {
     }
 
     /// Query total GPU memory (bytes). Returns 0 if unavailable.
-    fn query_total_gpu_memory(_device: &Device) -> u64 {
+    #[must_use]
+    pub(crate) fn query_total_gpu_memory(_device: &Device) -> u64 {
         #[cfg(feature = "cuda")]
         {
             if let Device::Cuda(_) = _device {
