@@ -19,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
+use crane_core::device::{GpuBudget, WeightBudget};
 use crane_core::utils::DeviceExt;
 use tracing::info;
 
@@ -71,6 +72,11 @@ pub struct Args {
     /// engine mode (not TTS/ASR/VLM/duplex).
     #[arg(long)]
     pub gpu_memory_limit: Option<String>,
+    /// MoE models only: force all expert weights to CPU, keeping only
+    /// attention, norms, and router gates on GPU. Useful on GPUs too small
+    /// to fit any expert layers.
+    #[arg(long)]
+    pub offload_experts: bool,
     /// MiniCPM-o duplex only: load the LLM tower from a standalone
     /// quantized GGUF file (e.g. a llama.cpp-style Qwen3 conversion like
     /// `MiniCPM-o-4_5-Q8_0.gguf`) instead of the checkpoint's own bf16
@@ -562,6 +568,38 @@ fn apply_text_only_override(
     }
 }
 
+/// Resolve the raw VRAM budget for MoE expert placement (Qwen3-Coder).
+///
+/// This is a *pre-reservation* budget: runtime needs (KV cache,
+/// activations) are subtracted later, once the model's own config is known
+/// (see `Qwen3Model::from_gguf()`). An explicit `--gpu-memory-limit 0` is
+/// therefore treated the same as an absent flag, both falling back to the
+/// full VRAM total, unlike `MemoryConfig::parse` where `"0"` means
+/// unlimited.
+fn resolve_gpu_budget(
+    gpu_memory_limit: Option<&str>,
+    offload_experts: bool,
+    device: &crane_core::models::Device,
+) -> GpuBudget {
+    if !is_gpu_device(device) {
+        return GpuBudget::cpu();
+    }
+    let raw_limit = gpu_memory_limit.map_or(0, |s| MemoryConfig::parse_memory_limit(s, device));
+    let vram_limit = if raw_limit > 0 {
+        raw_limit
+    } else {
+        MemoryConfig::query_total_gpu_memory(device)
+    };
+    GpuBudget {
+        weight_budget: if vram_limit > 0 {
+            WeightBudget::Limited(vram_limit)
+        } else {
+            WeightBudget::Unlimited
+        },
+        offload_all_experts: offload_experts,
+    }
+}
+
 pub async fn run(args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
 
@@ -591,6 +629,13 @@ pub async fn run(args: Args) -> Result<()> {
             }
         }
     };
+
+    let gpu_budget = resolve_gpu_budget(
+        args.gpu_memory_limit.as_deref(),
+        args.offload_experts,
+        &device,
+    );
+    info!("GPU budget: {gpu_budget:?}");
 
     let model_type = ModelType::from_str(&args.model_type);
     let format = ModelFormat::from_str(&args.format);
@@ -1395,7 +1440,7 @@ pub fn build_router_with_ui(state: Arc<AppState>, ui_enabled: bool) -> Router {
 }
 
 #[cfg(test)]
-mod dtype_tests {
+mod config_tests {
     use super::*;
     use crane_core::models::{DType, Device};
 
@@ -1497,5 +1542,35 @@ mod dtype_tests {
         let (mt, rt) = apply_text_only_override(true, ModelType::MinicpmV46, ModelType::MinicpmV46);
         assert_eq!(mt, ModelType::MinicpmV46);
         assert_eq!(rt, ModelType::MinicpmV46);
+    }
+
+    // ── resolve_gpu_budget ──
+
+    #[test]
+    fn gpu_budget_on_cpu_device_is_no_gpu() {
+        let budget = resolve_gpu_budget(None, false, &Device::Cpu);
+        assert_eq!(
+            budget.weight_budget,
+            crane_core::device::WeightBudget::NoGpu
+        );
+        assert!(!budget.offload_all_experts);
+    }
+
+    #[test]
+    fn gpu_budget_on_cpu_device_ignores_offload_flag() {
+        // --offload-experts is meaningless once everything is already on
+        // CPU; GpuBudget::cpu() always reports false.
+        let budget = resolve_gpu_budget(None, true, &Device::Cpu);
+        assert!(!budget.offload_all_experts);
+    }
+
+    #[test]
+    fn gpu_budget_without_gpu_device_ignores_configured_limit() {
+        // No GPU device short-circuits before the limit is even parsed.
+        let budget = resolve_gpu_budget(Some("8G"), false, &Device::Cpu);
+        assert_eq!(
+            budget.weight_budget,
+            crane_core::device::WeightBudget::NoGpu
+        );
     }
 }
