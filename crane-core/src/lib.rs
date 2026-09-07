@@ -15,7 +15,7 @@
 //! | [`chat`] | Chat-template rendering and message formatting |
 //! | [`bins`] | Model loading helpers used by CLI entry-points |
 //! | [`utils`] | Misc tensor / device utilities |
-//! | [`device`] | `DeviceAssignment`, bundling a model's main and MoE-expert devices |
+//! | [`device`] | `DeviceAssignment` (main/MoE-expert devices) and `GpuBudget` (VRAM budget for expert placement) |
 //!
 //! ## Feature flags
 //!
