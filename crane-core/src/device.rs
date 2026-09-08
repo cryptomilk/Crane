@@ -33,11 +33,10 @@ impl DeviceAssignment {
 /// VRAM budget available for model weights, used to decide per-layer
 /// expert placement during model loading.
 ///
-/// Will be constructed from `--gpu-memory-limit` and a future
-/// `--offload-experts` CLI flag in `crane-serve`, and consumed during
-/// Qwen3's GGUF loading path to decide which `MoE` layers load expert
-/// weights to GPU vs CPU. Neither is wired up yet: this is scaffolding
-/// for a follow-up commit.
+/// Constructed from `--gpu-memory-limit` and `--offload-experts` in
+/// `crane-serve` and threaded through to `Qwen3Backend`. Not yet consumed:
+/// that lands when `Qwen3Model::from_gguf()`'s loading path uses it to
+/// decide which `MoE` layers load expert weights to GPU vs CPU.
 #[derive(Debug, Clone, Default)]
 pub struct GpuBudget {
     /// VRAM ceiling for model weights.

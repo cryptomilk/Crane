@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use crane_core::device::DeviceAssignment;
+use crane_core::device::{DeviceAssignment, GpuBudget};
 
 /// Per-layer KV cache for one sequence: `(K, V)` per layer, or `None` for
 /// layers with no cached state yet.
@@ -617,7 +617,12 @@ impl Qwen3Backend {
     /// # Errors
     ///
     /// Returns an error if the model fails to load from `model_path`.
-    pub fn new(model_path: &str, devices: &DeviceAssignment, dtype: &DType) -> Result<Self> {
+    pub fn new(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        _gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
         let model = crane_core::models::qwen3::Model::new(model_path, devices, dtype)?;
         Ok(Self {
             model,
