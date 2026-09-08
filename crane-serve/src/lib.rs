@@ -1246,6 +1246,7 @@ pub async fn run(args: Args) -> Result<()> {
             &dtype,
             format,
             args.quant.as_deref(),
+            &gpu_budget,
         )?;
         info!(
             "Model loaded successfully (type: {:?}, format: {:?})",
