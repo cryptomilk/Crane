@@ -56,6 +56,18 @@ impl GpuBudget {
             offload_all_experts: false,
         }
     }
+
+    /// Derives a budget from a device for callers with no CLI-configured
+    /// VRAM ceiling: [`Self::cpu()`] when `device` is a CPU device,
+    /// otherwise an unlimited GPU budget.
+    #[must_use]
+    pub fn for_device(device: &Device) -> Self {
+        if device.is_cpu() {
+            Self::cpu()
+        } else {
+            Self::default()
+        }
+    }
 }
 
 /// VRAM ceiling for model weights.
@@ -110,6 +122,17 @@ mod tests {
         assert_ne!(
             GpuBudget::cpu().weight_budget,
             GpuBudget::default().weight_budget
+        );
+    }
+
+    // Verifies `for_device` picks `NoGpu` for a CPU device and `Unlimited`
+    // otherwise, so a caller with no CLI budget doesn't silently claim GPU
+    // headroom while actually running on CPU.
+    #[test]
+    fn gpu_budget_for_device_matches_device_kind() {
+        assert_eq!(
+            GpuBudget::for_device(&Device::Cpu).weight_budget,
+            WeightBudget::NoGpu
         );
     }
 }

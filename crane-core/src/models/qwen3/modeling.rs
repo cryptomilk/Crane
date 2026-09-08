@@ -44,7 +44,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
-use crate::device::DeviceAssignment;
+use crate::device::{DeviceAssignment, GpuBudget};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
@@ -859,12 +859,20 @@ fn read_moe_metadata<R: Read + Seek>(gg: &Gguf<R>, arch: &str) -> GgufMoeMetadat
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint.
     ///
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an
     /// unexpected shape.
-    pub fn new(config: &Config, vb: VarBuilder, expert_device: &Device) -> Result<Self> {
-        Self::new_inner(config, vb.pp("model"), vb, expert_device)
+    pub fn new(
+        config: &Config,
+        vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_inner(config, vb.pp("model"), vb, expert_device, gpu_budget)
     }
 
     /// Construct from a checkpoint where the decoder is nested under a
@@ -872,6 +880,8 @@ impl Qwen3Model {
     /// `model.language_model.*`). `model_vb` must already be scoped to the
     /// decoder's root (what would otherwise be `vb.pp("model")`); `root_vb`
     /// is the checkpoint root, used to resolve an untied `lm_head` sibling.
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -882,8 +892,9 @@ impl Qwen3Model {
         model_vb: VarBuilder,
         root_vb: VarBuilder,
         expert_device: &Device,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
-        Self::new_inner(config, model_vb, root_vb, expert_device)
+        Self::new_inner(config, model_vb, root_vb, expert_device, gpu_budget)
     }
 
     // See `Attention::new`'s comment on `VarBuilder` by-value.
@@ -893,6 +904,7 @@ impl Qwen3Model {
         model_vb: VarBuilder,
         root_vb: VarBuilder,
         expert_device: &Device,
+        _gpu_budget: &GpuBudget,
     ) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = EmbeddingLayer::Dense(candle_nn::embedding(
@@ -950,7 +962,9 @@ impl Qwen3Model {
     /// Construct from a GGUF file.
     ///
     /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
-    /// holds `MoE` expert weights, if the checkpoint is `MoE`.
+    /// holds `MoE` expert weights, if the checkpoint is `MoE`. `gpu_budget`
+    /// constrains `MoE` expert placement; only consumed once the checkpoint
+    /// is `MoE` (see [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -965,6 +979,7 @@ impl Qwen3Model {
         ct: gguf_file::Content,
         reader: &mut R,
         devices: &DeviceAssignment,
+        _gpu_budget: &GpuBudget,
     ) -> Result<Self> {
         let device = &devices.main;
         let dtype = if device.is_cuda() {
@@ -1629,7 +1644,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+        let model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let is_moe: Vec<bool> = model
             .layers
@@ -1647,7 +1662,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+        let model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         assert!(
             model
@@ -1678,9 +1693,11 @@ mod tests {
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
-        let mut model_a = Qwen3Model::new(&cfg, vb.clone(), &device).expect("new");
-        let mut model_b = Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb, &device)
-            .expect("new_from_model_vb");
+        let mut model_a =
+            Qwen3Model::new(&cfg, vb.clone(), &device, &GpuBudget::default()).expect("new");
+        let mut model_b =
+            Qwen3Model::new_from_model_vb(&cfg, vb.pp("model"), vb, &device, &GpuBudget::default())
+                .expect("new_from_model_vb");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_a = model_a.forward(&input_ids, 0).expect("forward a");
@@ -1698,7 +1715,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let input_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("input_ids");
         let out_forward = model.forward(&input_ids, 0).expect("forward");
@@ -1862,7 +1879,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("prefill_ids");
         let decode_ids = Tensor::new(&[[4u32]], &device).expect("decode_ids");
@@ -1998,7 +2015,7 @@ mod tests {
         let device = Device::Cpu;
         let varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
-        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
 
         let prefill_ids = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prefill_ids");
 
@@ -2030,12 +2047,14 @@ mod tests {
             &cfg,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
             &device,
+            &GpuBudget::default(),
         )
         .expect("new single");
         let mut model_chunked = Qwen3Model::new(
             &cfg,
             VarBuilder::from_varmap(&varmap, DType::F32, &device),
             &device,
+            &GpuBudget::default(),
         )
         .expect("new chunked");
 
