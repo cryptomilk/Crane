@@ -7,7 +7,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use candle_core::{DType, Device};
-use crane_core::device::DeviceAssignment;
+use crane_core::device::{DeviceAssignment, GpuBudget};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -473,7 +473,14 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 /// Create a model backend.
 ///
 /// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
-/// `q4k`, `q8_0`); only backends that support it accept the flag.
+/// `q4k`, `q8_0`); only backends that support it accept the flag. `gpu_budget`
+/// constrains MoE expert placement; only backends with MoE experts consume it.
+///
+/// # Errors
+///
+/// Returns an error if `quant` is requested for an unsupported model type, the
+/// model type/format combination is unsupported, or the underlying backend
+/// fails to load.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
@@ -481,6 +488,7 @@ pub fn create_backend(
     dtype: &DType,
     format: ModelFormat,
     quant: Option<&str>,
+    gpu_budget: &GpuBudget,
 ) -> Result<Box<dyn ModelBackend>> {
     let model_type = resolve(model_type, model_path);
     tracing::info!("Creating backend: {:?}", model_type);
@@ -530,6 +538,7 @@ pub fn create_backend(
             model_path,
             &DeviceAssignment::uniform(device),
             dtype,
+            gpu_budget,
         )?)),
         ModelType::Qwen3_5 => {
             let quant = quant
