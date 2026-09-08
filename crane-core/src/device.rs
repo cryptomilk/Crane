@@ -34,9 +34,9 @@ impl DeviceAssignment {
 /// expert placement during model loading.
 ///
 /// Constructed from `--gpu-memory-limit` and `--offload-experts` in
-/// `crane-serve` and threaded through to `Qwen3Backend`. Not yet consumed:
-/// that lands when `Qwen3Model::from_gguf()`'s loading path uses it to
-/// decide which `MoE` layers load expert weights to GPU vs CPU.
+/// `crane-serve` and threaded through to `Qwen3Backend`. Consumed by
+/// `Qwen3Model::from_gguf()`'s loading path to decide which `MoE` layers
+/// load expert weights to GPU vs CPU.
 #[derive(Debug, Clone, Default)]
 pub struct GpuBudget {
     /// VRAM ceiling for model weights.
@@ -44,6 +44,16 @@ pub struct GpuBudget {
     /// When `true`, force all `MoE` expert weights to CPU regardless of
     /// `weight_budget` (`--offload-experts`).
     pub offload_all_experts: bool,
+    /// Maximum concurrent sequences the engine will serve, used to estimate
+    /// KV cache VRAM at model-load time. `None` when the caller has no
+    /// CLI-configured value; [`Self::runtime_reservation_bytes`] then falls
+    /// back to a conservative default.
+    pub max_concurrent: Option<usize>,
+    /// Maximum tokens (prompt + completion) per sequence, used to estimate
+    /// KV cache VRAM at model-load time. `None` or `Some(0)` means
+    /// unlimited; [`Self::runtime_reservation_bytes`] then falls back to a
+    /// conservative default.
+    pub max_seq_len: Option<usize>,
 }
 
 impl GpuBudget {
@@ -54,6 +64,7 @@ impl GpuBudget {
         Self {
             weight_budget: WeightBudget::NoGpu,
             offload_all_experts: false,
+            ..Self::default()
         }
     }
 
@@ -67,6 +78,71 @@ impl GpuBudget {
         } else {
             Self::default()
         }
+    }
+
+    /// Estimated VRAM bytes consumed at runtime by `MoE` model KV caches and
+    /// a safety margin, given model geometry. Used to subtract runtime needs
+    /// from [`WeightBudget::Limited`] before deciding per-layer expert
+    /// placement. Returns `0` for [`WeightBudget::NoGpu`] or
+    /// [`WeightBudget::Unlimited`], since there is no weight budget to
+    /// subtract from.
+    ///
+    /// `num_layers`, `num_kv_heads`, and `head_dim` come from the model's
+    /// own config; `dtype_bytes` is the compute dtype's `size_in_bytes()`.
+    /// [`Self::max_concurrent`] defaults to `1` and [`Self::max_seq_len`]
+    /// defaults to `4096` when unset, since the real values may not be
+    /// known yet at the point this is called.
+    #[must_use]
+    pub fn runtime_reservation_bytes(
+        &self,
+        num_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dtype_bytes: usize,
+    ) -> u64 {
+        if matches!(
+            self.weight_budget,
+            WeightBudget::NoGpu | WeightBudget::Unlimited
+        ) {
+            return 0;
+        }
+        // Fixed 256 MiB margin for allocator fragmentation and small
+        // runtime allocations; it does not scale with batch size or hidden
+        // dim, so it does not cover prefill/decode activation memory.
+        const SAFETY_MARGIN_BYTES: u64 = 256 * (1 << 20);
+        const DEFAULT_SEQ_LEN: usize = 4096;
+
+        let max_concurrent = self.max_concurrent.unwrap_or(1) as u64;
+        let effective_seq_len = self
+            .max_seq_len
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_SEQ_LEN) as u64;
+
+        let kv_bytes = max_concurrent
+            * effective_seq_len
+            * 2
+            * num_layers as u64
+            * num_kv_heads as u64
+            * head_dim as u64
+            * dtype_bytes as u64;
+
+        kv_bytes + SAFETY_MARGIN_BYTES
+    }
+}
+
+/// Formats a byte count for log messages (e.g. `"8.5G"`, `"512M"`, `"1024B"`).
+pub(crate) fn format_budget(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        // Byte counts are far below f64's 52-bit mantissa limit.
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / (1u64 << 30) as f64;
+        format!("{gb:.1}G")
+    } else if bytes >= 1 << 20 {
+        #[allow(clippy::cast_precision_loss)]
+        let mb = bytes as f64 / (1u64 << 20) as f64;
+        format!("{mb:.0}M")
+    } else {
+        format!("{bytes}B")
     }
 }
 
@@ -134,5 +210,73 @@ mod tests {
             GpuBudget::for_device(&Device::Cpu).weight_budget,
             WeightBudget::NoGpu
         );
+    }
+
+    // Verifies the KV-cache + safety-margin formula with explicit
+    // max_concurrent/max_seq_len values.
+    #[test]
+    fn runtime_reservation_bytes_with_explicit_values() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(16 << 30),
+            offload_all_experts: false,
+            max_concurrent: Some(8),
+            max_seq_len: Some(2048),
+        };
+        // kv_bytes = 8 * 2048 * 2 * 48 * 4 * 128 * 2 = 1_610_612_736
+        let expected_kv_bytes: u64 = 8 * 2048 * 2 * 48 * 4 * 128 * 2;
+        let expected = expected_kv_bytes + (256 << 20);
+        assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
+    }
+
+    // Verifies unset max_concurrent/max_seq_len fall back to conservative
+    // defaults (1 concurrent sequence, 4096-token horizon) rather than
+    // underestimating the reservation as zero.
+    #[test]
+    fn runtime_reservation_bytes_defaults_when_unset() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(16 << 30),
+            offload_all_experts: false,
+            max_concurrent: None,
+            max_seq_len: None,
+        };
+        let expected_kv_bytes: u64 = 1 * 4096 * 2 * 48 * 4 * 128 * 2;
+        let expected = expected_kv_bytes + (256 << 20);
+        assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
+    }
+
+    // Verifies no runtime reservation is computed when there is no weight
+    // budget to subtract it from.
+    #[test]
+    fn runtime_reservation_bytes_zero_for_no_gpu_and_unlimited() {
+        assert_eq!(GpuBudget::cpu().runtime_reservation_bytes(48, 4, 128, 2), 0);
+        assert_eq!(
+            GpuBudget::default().runtime_reservation_bytes(48, 4, 128, 2),
+            0
+        );
+    }
+
+    // Verifies a large explicit max_seq_len (e.g. a long-context deployment)
+    // is not silently capped at the 4096 unset-fallback default, which
+    // would under-reserve KV-cache VRAM and risk a runtime GPU OOM.
+    #[test]
+    fn runtime_reservation_bytes_respects_large_seq_len() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(16 << 30),
+            offload_all_experts: false,
+            max_concurrent: Some(1),
+            max_seq_len: Some(32768),
+        };
+        let expected_kv_bytes: u64 = 1 * 32768 * 2 * 48 * 4 * 128 * 2;
+        let expected = expected_kv_bytes + (256 << 20);
+        assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
+    }
+
+    // Verifies the human-readable size formatting used in placement logs.
+    #[test]
+    fn test_format_budget() {
+        assert_eq!(format_budget(1 << 30), "1.0G");
+        assert_eq!(format_budget(3 * (1 << 30) / 2), "1.5G");
+        assert_eq!(format_budget(1 << 20), "1M");
+        assert_eq!(format_budget(512), "512B");
     }
 }

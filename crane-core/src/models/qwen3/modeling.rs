@@ -44,7 +44,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
-use crate::device::{DeviceAssignment, GpuBudget};
+use crate::device::{DeviceAssignment, GpuBudget, WeightBudget, format_budget};
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
@@ -854,6 +854,74 @@ fn read_moe_metadata<R: Read + Seek>(gg: &Gguf<R>, arch: &str) -> GgufMoeMetadat
     }
 }
 
+/// Quantized on-disk byte size of a GGUF tensor, computed from header
+/// metadata alone (no tensor data read).
+fn gguf_tensor_bytes(info: &gguf_file::TensorInfo) -> u64 {
+    let elem_count = info.shape.elem_count() as u64;
+    let block_size = info.ggml_dtype.block_size() as u64;
+    let type_size = info.ggml_dtype.type_size() as u64;
+    elem_count / block_size * type_size
+}
+
+/// Whether a GGUF tensor name is an `MoE` expert weight (packed or
+/// per-expert layout) — see [`SparseMoeBlock::new_from_gguf`] for the two
+/// layouts. Excludes the router (`ffn_gate_inp`), which always stays on the
+/// main device.
+fn is_expert_tensor(name: &str) -> bool {
+    if name.contains("ffn_gate_exps")
+        || name.contains("ffn_up_exps")
+        || name.contains("ffn_down_exps")
+    {
+        return true;
+    }
+    ["ffn_gate.", "ffn_up.", "ffn_down."].iter().any(|prefix| {
+        name.split(prefix)
+            .nth(1)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// Extracts the decoder layer index from a `blk.{i}.*` tensor name.
+fn expert_tensor_layer(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("blk.")?;
+    let dot = rest.find('.')?;
+    rest[..dot].parse().ok()
+}
+
+/// Estimated GPU VRAM cost of loading one `MoE` layer's expert weights.
+///
+/// Packed experts are dequantized to `compute_dtype_bytes` up front (see
+/// [`SparseMoeBlock::new_from_gguf`]'s doc comment on `load_packed_experts`),
+/// so their cost is the dequantized size, not the on-disk quantized size.
+/// Per-expert tensors stay quantized, so their cost is the on-disk size.
+fn estimate_expert_layer_vram(
+    tensor_infos: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+    layer_idx: usize,
+    is_packed: bool,
+    compute_dtype_bytes: usize,
+) -> u64 {
+    if is_packed {
+        ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+            .iter()
+            .map(|suffix| {
+                let name = format!("blk.{layer_idx}.{suffix}.weight");
+                tensor_infos.get(&name).map_or(0, |info| {
+                    info.shape.elem_count() as u64 * compute_dtype_bytes as u64
+                })
+            })
+            .sum()
+    } else {
+        tensor_infos
+            .iter()
+            .filter(|(name, _)| {
+                is_expert_tensor(name) && expert_tensor_layer(name) == Some(layer_idx)
+            })
+            .map(|(_, info)| gguf_tensor_bytes(info))
+            .sum()
+    }
+}
+
 impl Qwen3Model {
     /// Construct from safetensors / `HuggingFace` checkpoint.
     ///
@@ -956,10 +1024,11 @@ impl Qwen3Model {
 
     /// Construct from a GGUF file.
     ///
-    /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
-    /// holds `MoE` expert weights, if the checkpoint is `MoE`. `gpu_budget`
-    /// constrains `MoE` expert placement; only consumed once the checkpoint
-    /// is `MoE` (see [`crate::device::GpuBudget`]).
+    /// `devices.main` holds every weight, including `MoE` experts that fit
+    /// in `gpu_budget`; `devices.expert` is not used by this loading path.
+    /// `gpu_budget` decides, per `MoE` layer, whether that layer's experts
+    /// load to `devices.main` or `Device::Cpu`; only consumed once the
+    /// checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -974,7 +1043,7 @@ impl Qwen3Model {
         ct: gguf_file::Content,
         reader: &mut R,
         devices: &DeviceAssignment,
-        _gpu_budget: &GpuBudget,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
         let device = &devices.main;
         let dtype = if device.is_cuda() {
@@ -1065,13 +1134,124 @@ impl Qwen3Model {
             ..config
         };
 
+        // ── Per-layer expert placement ───────────────────────────────────
+        //
+        // Non-expert weights (attention, norms, embeddings, router) always
+        // load to `devices.main`; only MoE expert weights are considered
+        // for offloading to `Device::Cpu`, based on `gpu_budget`.
+        let expert_devices: Vec<Device> = {
+            let is_moe = config.num_experts.is_some_and(|n| n > 0);
+            if !is_moe {
+                vec![devices.main.clone(); num_hidden_layers]
+            } else if gpu_budget.offload_all_experts {
+                eprintln!("--offload-experts: all MoE expert layers -> CPU");
+                vec![Device::Cpu; num_hidden_layers]
+            } else {
+                match gpu_budget.weight_budget {
+                    WeightBudget::NoGpu | WeightBudget::Unlimited => {
+                        vec![devices.main.clone(); num_hidden_layers]
+                    },
+                    WeightBudget::Limited(total_vram) => {
+                        let runtime_reserved = gpu_budget.runtime_reservation_bytes(
+                            num_hidden_layers,
+                            num_kv_heads,
+                            head_dim,
+                            dtype.size_in_bytes(),
+                        );
+                        // `token_embd.weight` is dequantized by
+                        // `gg.embedding()` above, so its VRAM cost is its
+                        // dequantized size, not its on-disk quantized size
+                        // like every other non-expert tensor.
+                        let non_expert_bytes: u64 = gg
+                            .ct
+                            .tensor_infos
+                            .iter()
+                            .filter(|(name, _)| {
+                                name.as_str() != "token_embd.weight" && !is_expert_tensor(name)
+                            })
+                            .map(|(_, info)| gguf_tensor_bytes(info))
+                            .sum::<u64>()
+                            + gg.ct
+                                .tensor_infos
+                                .get("token_embd.weight")
+                                .map_or(0, |info| {
+                                    info.shape.elem_count() as u64 * dtype.size_in_bytes() as u64
+                                });
+
+                        let weight_budget = total_vram.saturating_sub(runtime_reserved);
+                        let expert_budget = weight_budget.saturating_sub(non_expert_bytes);
+
+                        eprintln!(
+                            "VRAM budget: total={}, runtime_reserved={}, non_expert_weights={}, expert_budget={}",
+                            format_budget(total_vram),
+                            format_budget(runtime_reserved),
+                            format_budget(non_expert_bytes),
+                            format_budget(expert_budget),
+                        );
+
+                        // All MoE layers in a checkpoint share the same
+                        // expert tensor layout; detect it from the first
+                        // MoE layer found.
+                        let is_packed = (0..num_hidden_layers)
+                            .find(|&i| gg.contains_tensor(&format!("blk.{i}.ffn_gate_inp.weight")))
+                            .is_some_and(|i| {
+                                gg.contains_tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
+                            });
+
+                        // Greedy first-fit in layer-index order. Every MoE
+                        // layer in a Qwen3 checkpoint has identical
+                        // expert-tensor shapes, so `layer_cost` is uniform
+                        // and index-order assignment already yields the
+                        // budget-maximizing selection; this stops being
+                        // optimal if a future checkpoint has heterogeneous
+                        // per-layer expert costs.
+                        let mut remaining = expert_budget;
+                        let mut gpu_layers = 0usize;
+                        let mut total_moe_layers = 0usize;
+                        let mut placements = Vec::with_capacity(num_hidden_layers);
+                        for i in 0..num_hidden_layers {
+                            let is_moe_layer =
+                                gg.contains_tensor(&format!("blk.{i}.ffn_gate_inp.weight"));
+                            if !is_moe_layer {
+                                placements.push(devices.main.clone());
+                                continue;
+                            }
+                            total_moe_layers += 1;
+                            let layer_cost = estimate_expert_layer_vram(
+                                &gg.ct.tensor_infos,
+                                i,
+                                is_packed,
+                                dtype.size_in_bytes(),
+                            );
+                            if remaining >= layer_cost {
+                                remaining -= layer_cost;
+                                gpu_layers += 1;
+                                placements.push(devices.main.clone());
+                            } else {
+                                placements.push(Device::Cpu);
+                            }
+                        }
+
+                        eprintln!(
+                            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on GPU, \
+                             {} on CPU (remaining budget: {})",
+                            total_moe_layers - gpu_layers,
+                            format_budget(remaining),
+                        );
+
+                        placements
+                    },
+                }
+            }
+        };
+
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
             layers.push(DecoderLayer::new_from_gguf(
                 &config,
                 &mut gg,
                 i,
-                &devices.expert,
+                &expert_devices[i],
             )?);
         }
 
@@ -1593,6 +1773,49 @@ mod tests {
         assert_eq!(moe_config.moe_intermediate_size, 64);
         assert!(!moe_config.norm_topk_prob);
         assert_eq!(moe_config.decoder_sparse_step, Some(2));
+    }
+
+    // Packed and per-expert tensor names are recognized; router and
+    // attention tensor names are not mistaken for expert weights.
+    #[test]
+    fn test_is_expert_tensor() {
+        assert!(is_expert_tensor("blk.0.ffn_gate_exps.weight"));
+        assert!(is_expert_tensor("blk.0.ffn_up_exps.weight"));
+        assert!(is_expert_tensor("blk.0.ffn_down_exps.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_gate.3.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_up.3.weight"));
+        assert!(is_expert_tensor("blk.5.ffn_down.3.weight"));
+        assert!(!is_expert_tensor("blk.0.ffn_gate_inp.weight"));
+        assert!(!is_expert_tensor("blk.0.attn_q.weight"));
+        assert!(!is_expert_tensor("token_embd.weight"));
+        // Dense MLP tensors (no trailing expert index) from a mixed
+        // dense+MoE checkpoint must not be mistaken for expert weights.
+        assert!(!is_expert_tensor("blk.5.ffn_gate.weight"));
+        assert!(!is_expert_tensor("blk.5.ffn_up.weight"));
+        assert!(!is_expert_tensor("blk.5.ffn_down.weight"));
+    }
+
+    // Layer index is parsed out of the `blk.{i}.` prefix for both expert
+    // tensor layouts; non-`blk`-prefixed tensors have no layer.
+    #[test]
+    fn test_expert_tensor_layer() {
+        assert_eq!(expert_tensor_layer("blk.5.ffn_gate_exps.weight"), Some(5));
+        assert_eq!(expert_tensor_layer("blk.12.ffn_gate.3.weight"), Some(12));
+        assert_eq!(expert_tensor_layer("token_embd.weight"), None);
+    }
+
+    // Byte size matches candle's own quantized allocation formula:
+    // elem_count / block_size * type_size.
+    #[test]
+    fn test_gguf_tensor_bytes() {
+        use candle_core::quantized::GgmlDType;
+        let info = gguf_file::TensorInfo {
+            ggml_dtype: GgmlDType::Q4K,
+            shape: candle_core::Shape::from(256usize),
+            offset: 0,
+        };
+        let expected = GgmlDType::Q4K.type_size() as u64;
+        assert_eq!(gguf_tensor_bytes(&info), expected);
     }
 
     // A missing required sizing field (here `moe_intermediate_size`) means

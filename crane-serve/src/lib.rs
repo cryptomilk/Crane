@@ -580,6 +580,8 @@ fn resolve_gpu_budget(
     gpu_memory_limit: Option<&str>,
     offload_experts: bool,
     device: &crane_core::models::Device,
+    max_concurrent: usize,
+    max_seq_len: usize,
 ) -> GpuBudget {
     if !is_gpu_device(device) {
         return GpuBudget::cpu();
@@ -597,6 +599,8 @@ fn resolve_gpu_budget(
             WeightBudget::Unlimited
         },
         offload_all_experts: offload_experts,
+        max_concurrent: Some(max_concurrent),
+        max_seq_len: Some(max_seq_len),
     }
 }
 
@@ -634,6 +638,8 @@ pub async fn run(args: Args) -> Result<()> {
         args.gpu_memory_limit.as_deref(),
         args.offload_experts,
         &device,
+        args.max_concurrent,
+        args.max_seq_len,
     );
     info!("GPU budget: {gpu_budget:?}");
 
@@ -1549,7 +1555,7 @@ mod config_tests {
 
     #[test]
     fn gpu_budget_on_cpu_device_is_no_gpu() {
-        let budget = resolve_gpu_budget(None, false, &Device::Cpu);
+        let budget = resolve_gpu_budget(None, false, &Device::Cpu, 16, 0);
         assert_eq!(
             budget.weight_budget,
             crane_core::device::WeightBudget::NoGpu
@@ -1561,14 +1567,14 @@ mod config_tests {
     fn gpu_budget_on_cpu_device_ignores_offload_flag() {
         // --offload-experts is meaningless once everything is already on
         // CPU; GpuBudget::cpu() always reports false.
-        let budget = resolve_gpu_budget(None, true, &Device::Cpu);
+        let budget = resolve_gpu_budget(None, true, &Device::Cpu, 16, 0);
         assert!(!budget.offload_all_experts);
     }
 
     #[test]
     fn gpu_budget_without_gpu_device_ignores_configured_limit() {
         // No GPU device short-circuits before the limit is even parsed.
-        let budget = resolve_gpu_budget(Some("8G"), false, &Device::Cpu);
+        let budget = resolve_gpu_budget(Some("8G"), false, &Device::Cpu, 16, 0);
         assert_eq!(
             budget.weight_budget,
             crane_core::device::WeightBudget::NoGpu
