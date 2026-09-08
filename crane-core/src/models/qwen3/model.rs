@@ -15,7 +15,7 @@ use candle_transformers::generation::LogitsProcessor;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
-use crate::device::DeviceAssignment;
+use crate::device::{DeviceAssignment, GpuBudget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -40,16 +40,26 @@ pub struct Model {
 }
 
 impl Model {
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crate::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if the model files cannot be found or loaded.
-    pub fn new(model_path: &str, devices: &DeviceAssignment, dtype: &DType) -> Result<Self> {
-        Self::new_with_format(model_path, devices, dtype, ModelFormat::Auto)
+    pub fn new(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_with_format(model_path, devices, dtype, ModelFormat::Auto, gpu_budget)
     }
 
     /// `devices.main` holds every weight but `MoE` experts; `devices.expert`
     /// holds `MoE` expert weights, if the checkpoint is `MoE`. Applies to
-    /// both GGUF and safetensors checkpoints.
+    /// both GGUF and safetensors checkpoints. `gpu_budget` constrains `MoE`
+    /// expert placement; only consumed once the checkpoint is `MoE` (see
+    /// [`crate::device::GpuBudget`]).
     ///
     /// # Errors
     ///
@@ -59,6 +69,7 @@ impl Model {
         devices: &DeviceAssignment,
         dtype: &DType,
         format: ModelFormat,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
         let format = match format {
             ModelFormat::Auto => {
@@ -73,8 +84,12 @@ impl Model {
         };
 
         match format {
-            ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, devices),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, devices, *dtype),
+            ModelFormat::Gguf | ModelFormat::Auto => {
+                Self::from_gguf(model_path, devices, gpu_budget)
+            },
+            ModelFormat::Safetensors => {
+                Self::from_pretrained(model_path, devices, *dtype, gpu_budget)
+            },
         }
     }
 
@@ -90,6 +105,7 @@ impl Model {
         model_path: &str,
         devices: &DeviceAssignment,
         dtype: DType,
+        gpu_budget: &GpuBudget,
     ) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
@@ -104,7 +120,7 @@ impl Model {
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = Qwen3Model::new(&config, vb, &devices.expert)?;
+        let inner = Qwen3Model::new(&config, vb, &devices.expert, gpu_budget)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -115,7 +131,11 @@ impl Model {
     }
 
     /// Load a GGUF quantized model file.
-    fn from_gguf(model_path: &str, devices: &DeviceAssignment) -> Result<Model> {
+    fn from_gguf(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
 
         let tokenizer_path = {
@@ -153,7 +173,7 @@ impl Model {
             ct.metadata.len(),
         );
 
-        let inner = Qwen3Model::from_gguf(ct, &mut file, devices)?;
+        let inner = Qwen3Model::from_gguf(ct, &mut file, devices, gpu_budget)?;
         let dtype = inner.model_dtype();
 
         Ok(Self {

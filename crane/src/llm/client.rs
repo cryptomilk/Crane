@@ -3,7 +3,7 @@ use crate::common::{
     config::{CommonConfig, DataType, DeviceConfig},
 };
 use crate::llm::{GenerationConfig, LlmModelType};
-use crane_core::device::DeviceAssignment;
+use crane_core::device::{DeviceAssignment, GpuBudget};
 use crane_core::generation::based::ModelForCausalLM;
 use crane_core::generation::streamer::{AsyncTextStreamer, StreamerMessage};
 
@@ -127,6 +127,7 @@ impl LlmClient {
                     &config.model_path,
                     &DeviceAssignment::uniform(&device),
                     &dtype,
+                    &GpuBudget::for_device(&device),
                 )
                 .map_err(|e| CraneError::ModelError(e.to_string()))?;
                 model.warmup();

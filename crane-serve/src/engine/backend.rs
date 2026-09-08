@@ -614,6 +614,9 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// `gpu_budget` constrains `MoE` expert placement; only consumed once
+    /// the checkpoint is `MoE` (see [`crane_core::device::GpuBudget`]).
+    ///
     /// # Errors
     ///
     /// Returns an error if the model fails to load from `model_path`.
@@ -621,9 +624,9 @@ impl Qwen3Backend {
         model_path: &str,
         devices: &DeviceAssignment,
         dtype: &DType,
-        _gpu_budget: &GpuBudget,
+        gpu_budget: &GpuBudget,
     ) -> Result<Self> {
-        let model = crane_core::models::qwen3::Model::new(model_path, devices, dtype)?;
+        let model = crane_core::models::qwen3::Model::new(model_path, devices, dtype, gpu_budget)?;
         Ok(Self {
             model,
             dtype: *dtype,
