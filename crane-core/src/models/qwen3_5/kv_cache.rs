@@ -32,6 +32,10 @@ const ROOM: usize = 256;
 pub trait KvCacheBackend {
     /// Append this step's `k`/`v` and return the full cached `(k, v)` in the
     /// compute dtype (`[B, num_kv_heads, seq_len + S, head_dim]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)>;
     /// Drop all cached state (between unrelated requests).
     fn reset(&mut self);
@@ -44,10 +48,8 @@ pub trait KvCacheBackend {
     fn byte_size(&self) -> usize;
 }
 
-fn tensor_bytes(t: &Option<Tensor>) -> usize {
-    t.as_ref()
-        .map(|x| x.elem_count() * x.dtype().size_in_bytes())
-        .unwrap_or(0)
+fn tensor_bytes(t: Option<&Tensor>) -> usize {
+    t.map_or(0, |x| x.elem_count() * x.dtype().size_in_bytes())
 }
 
 /// Which cache representation to use. Selected once per model load.
@@ -63,6 +65,7 @@ pub enum KvCacheKind {
 
 impl KvCacheKind {
     /// Read from `CRANE_KV_QUANT` (`int8` → Int8, `int4` → Int4, else Fp).
+    #[must_use]
     pub fn from_env() -> Self {
         match std::env::var("CRANE_KV_QUANT").as_deref() {
             Ok("int8") => Self::Int8,
@@ -81,6 +84,7 @@ pub enum KvCache {
 }
 
 impl KvCache {
+    #[must_use]
     pub fn new(kind: KvCacheKind) -> Self {
         match kind {
             KvCacheKind::Fp => Self::Fp(FpKvCache::new()),
@@ -89,6 +93,9 @@ impl KvCache {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         match self {
             Self::Fp(c) => c.append(k, v),
@@ -103,6 +110,7 @@ impl KvCache {
         }
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Self::Fp(c) => c.len(),
@@ -110,10 +118,12 @@ impl KvCache {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[must_use]
     pub fn byte_size(&self) -> usize {
         match self {
             Self::Fp(c) => c.byte_size(),
@@ -202,7 +212,7 @@ impl KvCacheBackend for FpKvCache {
     }
 
     fn byte_size(&self) -> usize {
-        tensor_bytes(&self.k) + tensor_bytes(&self.v)
+        tensor_bytes(self.k.as_ref()) + tensor_bytes(self.v.as_ref())
     }
 }
 
@@ -251,8 +261,8 @@ impl QuantKvCache {
 /// guarantees `|x/scale| <= qmax`, so no clamp is needed. For 4-bit the codes
 /// are nibble-packed into `[B,H,S,D/2]` (requires even D).
 fn quantize_per_token(x: &Tensor, bits: u32) -> Result<(Tensor, Tensor)> {
-    let qmax = ((1u32 << (bits - 1)) - 1) as f64; // 127 or 7
-    let offset = (1u32 << (bits - 1)) as f64; // 128 or 8
+    let qmax = f64::from((1u32 << (bits - 1)) - 1); // 127 or 7
+    let offset = f64::from(1u32 << (bits - 1)); // 128 or 8
     let x = x.to_dtype(DType::F32)?;
     let amax = x.abs()?.max_keepdim(D::Minus1)?; // [B,H,S,1]
     let scale = amax.affine(1.0 / qmax, 1e-8)?;
@@ -267,7 +277,7 @@ fn quantize_per_token(x: &Tensor, bits: u32) -> Result<(Tensor, Tensor)> {
 
 /// Inverse of [`quantize_per_token`] into `dtype`.
 fn dequantize_per_token(codes: &Tensor, scale: &Tensor, bits: u32, dtype: DType) -> Result<Tensor> {
-    let offset = (1u32 << (bits - 1)) as f64;
+    let offset = f64::from(1u32 << (bits - 1));
     let q = if bits == 8 {
         codes.to_dtype(DType::F32)?
     } else {
@@ -301,6 +311,10 @@ fn unpack_nibbles(codes: &Tensor) -> Result<Tensor> {
 }
 
 impl KvCacheBackend for QuantKvCache {
+    // kc_full/ks_full/vc_full/vs_full/k_full/v_full are the natural names for
+    // the six code/scale/dequantized buffers this function threads through,
+    // not a typo risk.
+    #[allow(clippy::similar_names)]
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let dtype = *self.dtype.get_or_insert(k.dtype());
         let add = k.dim(2)?;
@@ -334,9 +348,9 @@ impl KvCacheBackend for QuantKvCache {
     }
 
     fn byte_size(&self) -> usize {
-        tensor_bytes(&self.k_codes)
-            + tensor_bytes(&self.k_scale)
-            + tensor_bytes(&self.v_codes)
-            + tensor_bytes(&self.v_scale)
+        tensor_bytes(self.k_codes.as_ref())
+            + tensor_bytes(self.k_scale.as_ref())
+            + tensor_bytes(self.v_codes.as_ref())
+            + tensor_bytes(self.v_scale.as_ref())
     }
 }
