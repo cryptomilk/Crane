@@ -8,7 +8,7 @@
 //!
 //! Multimodal checkpoints (`Qwen3_5ForConditionalGeneration`) carry a vision
 //! tower under `model.visual.*` and use the same text weights as the dense
-//! class — the [`vision::Qwen3_5VisionModel`] module loads the ViT, and the
+//! class — the [`vision::Qwen3_5VisionModel`] module loads the `ViT`, and the
 //! text model recognizes the `model.language_model.*` weight prefix.
 
 mod config;
