@@ -69,7 +69,7 @@ impl Model {
 
         match format {
             ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
         }
     }
 
@@ -81,7 +81,7 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
+    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -94,18 +94,18 @@ impl Model {
         // The model weights are stored in BF16, which is unsupported for CPU matmul.
         // We use mmap loading but the VarBuilder's dtype field ensures each tensor
         // is cast to the requested dtype (e.g. F32) when accessed.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = HunYuanDenseV1::new(&config, vb)?;
+        let inner = HunYuanDenseV1::new(&config, &vb)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
-            dtype: *dtype,
+            dtype,
             inner,
         })
     }
