@@ -226,6 +226,11 @@ struct Attention {
 }
 
 impl Attention {
+    // This function's length comes from building four separate q/k/v/o
+    // projections, each with a bias/no-bias branch, plus the merged-QKV
+    // fast path; splitting it up would scatter that construction logic
+    // across several small functions without simplifying it.
+    #[allow(clippy::too_many_lines)]
     fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
@@ -387,6 +392,9 @@ impl Attention {
     /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
     /// Falls back to cat + reallocate when the buffer is full.
     /// Returns (`k_full`, `v_full`) views covering all valid cached data.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
     fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
         let k = k.contiguous()?;
@@ -514,6 +522,10 @@ impl Attention {
     }
 
     /// Shared attention computation used by both normal and CLA paths.
+    // b/h/kv_heads/s/d are standard tensor-shape notation (batch, heads,
+    // seq_len, head_dim), matching the BHSD terminology used elsewhere in
+    // this file.
+    #[allow(clippy::many_single_char_names)]
     fn compute_attention(
         &self,
         q: &Tensor,
@@ -530,6 +542,7 @@ impl Attention {
             // ── GQA-grouped SDPA for decode (seq_len=1) ──
             // Keep 4D tensors throughout; candle matmul handles
             // non-contiguous K internally with a single flatten pass.
+            #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
@@ -579,6 +592,7 @@ impl Attention {
         };
 
         // Scaled dot-product attention
+        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
         let attn_weights = match attention_mask {
@@ -1149,6 +1163,9 @@ impl HunYuanDenseV1 {
     /// # Errors
     ///
     /// Returns an error if padding or stacking the KV caches fails.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -1240,6 +1257,8 @@ impl HunYuanDenseV1 {
         let device = input_ids.device();
         let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
 
+        // Sequence positions are bounded by max_seq_len, always far below u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         // cos/sin: [N, dim/2] after index_select → [N, 1, dim/2] for rope()
@@ -1369,6 +1388,9 @@ pub fn build_batch_decode_mask(
 ///
 /// Returns `Some((K, V))` with shape `[N, kv_heads, max_len, head_dim]`,
 /// or `None` if `max_len == 0`.
+// `padded_ks`/`padded_vs` are natural parallel names (key/value buffers built
+// in lockstep), not a typo risk.
+#[allow(clippy::similar_names)]
 fn pad_and_stack_kv_caches(
     caches: &[&Option<(Tensor, Tensor)>],
     max_len: usize,

@@ -350,11 +350,15 @@ impl ModelForCausalLM for Model {
             let logits = logits.squeeze(0)?.squeeze(0)?;
 
             // Greedy + no repetition penalty: GPU argmax avoids D→H logits copy.
-            let next_token = if config.temperature.is_none() && config.repetition_penalty == 1. {
+            // repetition_penalty is compared against the exact default sentinel 1.0,
+            // not a computed value, so exact float equality is intentional here.
+            #[allow(clippy::float_cmp)]
+            let no_repetition_penalty = config.repetition_penalty == 1.;
+            let next_token = if config.temperature.is_none() && no_repetition_penalty {
                 crate::ops::gpu_argmax(&logits)?
             } else {
                 let logits = logits.to_dtype(DType::F32)?;
-                let logits = if config.repetition_penalty == 1. {
+                let logits = if no_repetition_penalty {
                     logits
                 } else {
                     let start_at = tokens.len().saturating_sub(config.repeat_last_n);
@@ -389,10 +393,11 @@ impl ModelForCausalLM for Model {
         }
 
         if config.report_speed {
-            println!(
-                "\n{generated_tokens} tokens generated ({:.2} token/s)\n",
-                generated_tokens as f64 / dt.as_secs_f64(),
-            );
+            // generated_tokens is a small per-request token count; f64 has ample
+            // precision for it, this is purely a display metric.
+            #[allow(clippy::cast_precision_loss)]
+            let tokens_per_sec = generated_tokens as f64 / dt.as_secs_f64();
+            println!("\n{generated_tokens} tokens generated ({tokens_per_sec:.2} token/s)\n");
         }
 
         Ok(tokens)
