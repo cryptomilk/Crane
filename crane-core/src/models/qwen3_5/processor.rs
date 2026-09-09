@@ -4,8 +4,9 @@
 //! shape that's a multiple of `(patch_size * spatial_merge_size)` and whose
 //! total pixel count sits in `[min_pixels, max_pixels]`, then convert to
 //! float32 CHW and normalize by `image_mean` / `image_std`. The result is
-//! reshaped into `[num_patches, temporal_patch_size * patch_size * patch_size
-//! * in_channels]` row-major, ready to feed into `Qwen3_5VisionModel`.
+//! reshaped into
+//! `[num_patches, temporal_patch_size * patch_size * patch_size * in_channels]`
+//! row-major, ready to feed into `Qwen3_5VisionModel`.
 //!
 //! Video input is intentionally **not** supported in this MVP — that requires
 //! frame extraction (ffmpeg) and temporal batching. The single-image path
@@ -35,13 +36,17 @@ pub struct Size {
 }
 
 /// Result of preprocessing one image: a row-major `[num_patches, in_dim]`
-/// tensor plus the `(t, h, w)` grid for the text-model MRoPE bookkeeping.
+/// tensor plus the `(t, h, w)` grid for the text-model `MRoPE` bookkeeping.
 pub struct ProcessedImage {
     pub pixel_values: Tensor,
     pub grid_thw: (u32, u32, u32),
 }
 
 /// Load `preprocessor_config.json` next to a Qwen 3.5 multimodal checkpoint.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or does not parse as a valid config.
 pub fn load_preprocessor_config(model_dir: &str) -> Result<PreprocessorConfig> {
     let path = std::path::Path::new(model_dir).join("preprocessor_config.json");
     let data = std::fs::read(&path)
@@ -54,7 +59,7 @@ pub fn load_preprocessor_config(model_dir: &str) -> Result<PreprocessorConfig> {
 /// Smart-resize an image so that both dimensions are multiples of `factor`
 /// and the total pixel count sits in `[min_pixels, max_pixels]`.
 ///
-/// Mirrors HF Qwen2VL's `smart_resize` exactly:
+/// Mirrors HF `Qwen2VL`'s `smart_resize` exactly:
 ///   1. Round h, w to the *nearest* multiple of `factor` (HF `round_by_factor`,
 ///      i.e. `round(x / factor) * factor` — NOT a ceil).
 ///   2. If that exceeds `max_pixels`, scale DOWN by
@@ -62,34 +67,60 @@ pub fn load_preprocessor_config(model_dir: &str) -> Result<PreprocessorConfig> {
 ///   3. If it is below `min_pixels`, scale UP by
 ///      `beta = sqrt(min_pixels/(h*w))`, then ceil to a multiple of factor.
 fn smart_resize(h: u32, w: u32, factor: u32, min_pixels: usize, max_pixels: usize) -> (u32, u32) {
-    let h_f = h as f64;
-    let w_f = w as f64;
+    let h_f = f64::from(h);
+    let w_f = f64::from(w);
+    let factor_f = f64::from(factor);
 
-    let round_by_factor = |x: f64| ((x / factor as f64).round() as u32).max(1) * factor;
+    let round_by_factor = |x: f64| {
+        // Pixel dimensions are always non-negative and far below u32::MAX,
+        // so round()-then-cast cannot truncate or lose sign here.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = (x / factor_f).round() as u32;
+        rounded.max(1) * factor
+    };
     let mut h_bar = round_by_factor(h_f);
     let mut w_bar = round_by_factor(w_f);
 
     // u64 so the product can't overflow on large inputs.
-    let area = h_bar as u64 * w_bar as u64;
+    let area = u64::from(h_bar) * u64::from(w_bar);
     if area > max_pixels as u64 {
-        let beta = (h_f * w_f / max_pixels as f64).sqrt();
-        h_bar = (h_f / beta / factor as f64).floor() as u32 * factor;
-        w_bar = (w_f / beta / factor as f64).floor() as u32 * factor;
+        // max_pixels/min_pixels come from preprocessor_config.json and are
+        // always realistic pixel-count bounds (well under 2^52), so this is
+        // lossless in practice.
+        #[allow(clippy::cast_precision_loss)]
+        let max_pixels_f = max_pixels as f64;
+        let beta = (h_f * w_f / max_pixels_f).sqrt();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            h_bar = (h_f / beta / factor_f).floor() as u32 * factor;
+            w_bar = (w_f / beta / factor_f).floor() as u32 * factor;
+        }
     } else if area < min_pixels as u64 {
-        let beta = (min_pixels as f64 / (h_f * w_f)).sqrt();
-        h_bar = (h_f * beta / factor as f64).ceil() as u32 * factor;
-        w_bar = (w_f * beta / factor as f64).ceil() as u32 * factor;
+        #[allow(clippy::cast_precision_loss)]
+        let min_pixels_f = min_pixels as f64;
+        let beta = (min_pixels_f / (h_f * w_f)).sqrt();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            h_bar = (h_f * beta / factor_f).ceil() as u32 * factor;
+            w_bar = (w_f * beta / factor_f).ceil() as u32 * factor;
+        }
     }
 
     (h_bar.max(factor), w_bar.max(factor))
 }
 
 impl PreprocessorConfig {
+    #[must_use]
     pub fn factor(&self) -> u32 {
-        (self.patch_size * self.merge_size) as u32
+        // patch_size * merge_size is a small config constant (e.g. 16*2=32),
+        // far below u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
+        let factor = (self.patch_size * self.merge_size) as u32;
+        factor
     }
 
     /// Resize `image` to multiples of `factor` while keeping pixels in bounds.
+    #[must_use]
     pub fn smart_resize(&self, image: &DynamicImage) -> DynamicImage {
         let (w, h) = image.dimensions();
         let (h_new, w_new) = smart_resize(
@@ -111,6 +142,10 @@ impl PreprocessorConfig {
 
     /// Convert one image into the `[num_patches, in_dim]` tensor the vision
     /// tower expects, plus the `grid_thw` for the text model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the output tensors fails.
     pub fn process(
         &self,
         image: &DynamicImage,
@@ -121,7 +156,10 @@ impl PreprocessorConfig {
         let rgb = image.to_rgb8();
         let resized = self.smart_resize(&DynamicImage::ImageRgb8(rgb));
         let (w, h) = resized.dimensions();
-        let (h_p, w_p) = (h / self.patch_size as u32, w / self.patch_size as u32);
+        // patch_size is a small config constant (e.g. 16), far below u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
+        let patch_size_u32 = self.patch_size as u32;
+        let (h_p, w_p) = (h / patch_size_u32, w / patch_size_u32);
         let n_patches = (h_p * w_p) as usize;
 
         // 2. CHW float, normalized.
@@ -132,7 +170,7 @@ impl PreprocessorConfig {
         let mut chw = vec![0f32; 3 * (w * h) as usize];
         for (x, y, pixel) in rgb.enumerate_pixels() {
             for c in 0..3 {
-                let v = pixel[c] as f32 / 255.0;
+                let v = f32::from(pixel[c]) / 255.0;
                 chw[c * (w * h) as usize + (y * w + x) as usize] = (v - mean[c]) / std[c];
             }
         }
@@ -146,7 +184,7 @@ impl PreprocessorConfig {
         let in_dim = t_patch * 3 * patch * patch;
         let mut patches = vec![0f32; n_patches * in_dim];
 
-        let patch_size_u = patch as usize;
+        let patch_size_u = patch;
         let w_u = w as usize;
         let h_u = h as usize;
         let h_p_u = h_p as usize;
@@ -211,6 +249,16 @@ impl PreprocessorConfig {
 
 /// Batch-concatenate a list of processed images into the flat tensors
 /// `Qwen3_5VisionModel::forward` expects.
+///
+/// # Panics
+///
+/// Panics if a `ProcessedImage`'s `pixel_values` tensor is not 2-D, which
+/// cannot happen because [`PreprocessorConfig::process`] always builds a
+/// `[num_patches, in_dim]` tensor.
+///
+/// # Errors
+///
+/// Returns an error if building the output tensors fails.
 pub fn batch_images(images: &[ProcessedImage]) -> Result<(Tensor, Tensor)> {
     let mut pix = Vec::new();
     let mut grids = Vec::new();
@@ -229,8 +277,7 @@ pub fn batch_images(images: &[ProcessedImage]) -> Result<(Tensor, Tensor)> {
     };
     let device = images
         .first()
-        .map(|i| i.pixel_values.device().clone())
-        .unwrap_or(Device::Cpu);
+        .map_or(Device::Cpu, |i| i.pixel_values.device().clone());
     let pixel_values = Tensor::from_vec(pix, (total_patches, in_dim), &device)?;
     let flat_grids: Vec<u32> = grids.iter().flat_map(|g| [g.0, g.1, g.2]).collect();
     let image_grid_thw = Tensor::from_vec(flat_grids, (grids.len(), 3), &device)?;
