@@ -49,9 +49,14 @@ impl Qwen3_5TextModel {
     /// The HF layout has a top-level `language_model.*` prefix when the model
     /// was saved with `Qwen3_5ForConditionalGeneration`. We probe for that
     /// prefix and fall back to a flat layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: &VarBuilder,
         device: &Device,
         dtype: DType,
         quant: Option<GgmlDType>,
@@ -152,6 +157,15 @@ impl Qwen3_5TextModel {
     /// The model config is reconstructed entirely from GGUF metadata; the
     /// per-layer full/linear attention layout is derived from tensor presence
     /// (`blk.{i}.ssm_a` ⇒ linear) rather than trusting the interval field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
+    // This function's length comes from reconstructing every TextConfig field
+    // one-by-one from GGUF metadata keys; splitting it up would scatter that
+    // field-by-field mapping across several small functions without
+    // simplifying it.
+    #[allow(clippy::too_many_lines)]
     pub fn from_gguf<R: std::io::Read + std::io::Seek>(
         ct: candle_core::quantized::gguf_file::Content,
         reader: &mut R,
@@ -213,7 +227,7 @@ impl Qwen3_5TextModel {
             .and_then(|v| v.to_vec().ok())
             .map(|vals| {
                 vals.iter()
-                    .filter_map(|v| v.to_i32().ok().map(|x| x.max(0) as usize))
+                    .filter_map(|v| v.to_i32().ok().map(|x| usize::try_from(x).unwrap_or(0)))
                     .collect()
             })
             .unwrap_or_default();
@@ -245,7 +259,7 @@ impl Qwen3_5TextModel {
         let attn_output_gate = layer_types
             .iter()
             .position(|t| *t == LayerType::FullAttention)
-            .map(|i| {
+            .is_none_or(|i| {
                 let q_rows = gg
                     .ct
                     .tensor_infos
@@ -253,8 +267,12 @@ impl Qwen3_5TextModel {
                     .map_or(0, |info| info.shape.dims()[0]);
                 let num_heads = md_u32_or(&gg, "attention.head_count", 0);
                 q_rows == 2 * num_heads * head_dim
-            })
-            .unwrap_or(true);
+            });
+
+        // rot_dim and head_dim are small model dimensions (well under 2^52),
+        // so this division cannot lose precision.
+        #[allow(clippy::cast_precision_loss)]
+        let partial_rotary_factor = rot_dim as f64 / head_dim as f64;
 
         let text_cfg = TextConfig {
             head_dim,
@@ -270,7 +288,7 @@ impl Qwen3_5TextModel {
             rope_parameters: RopeParameters {
                 rope_theta,
                 mrope_section,
-                partial_rotary_factor: rot_dim as f64 / head_dim as f64,
+                partial_rotary_factor,
                 mrope_interleaved: true,
             },
             full_attention_interval: md_u32_or(&gg, "full_attention_interval", 4),
@@ -324,34 +342,43 @@ impl Qwen3_5TextModel {
         })
     }
 
+    #[must_use]
     pub fn config(&self) -> &TextConfig {
         &self.cfg
     }
 
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     /// Total bytes held by the full-attention K/V caches across all layers
     /// (incl. headroom + quant scales). The context-scaling memory term.
+    #[must_use]
     pub fn attn_cache_bytes(&self) -> usize {
         self.attn_caches
             .iter()
             .flatten()
-            .map(|c| c.byte_size())
+            .map(KvCache::byte_size)
             .sum()
     }
 
+    #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
     }
 
+    #[must_use]
     pub fn dtype(&self) -> DType {
         self.dtype
     }
 
     /// Reset all per-layer GDN caches. Called between unrelated requests
     /// sharing the same pre-allocated layer set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if resetting a layer's recurrent state fails.
     pub fn reset_gdn_caches(&mut self) -> Result<()> {
         for slot in self.gdn_caches.iter_mut().flatten() {
             slot.reset()?;
@@ -365,6 +392,10 @@ impl Qwen3_5TextModel {
     /// Embed `input_ids` and return the hidden states `[B, S, hidden_size]`.
     /// Used by the multimodal wrapper to compute text embeddings before
     /// splicing image features over the `<|image_pad|>` placeholders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the embedding lookup fails.
     pub fn embed_only(&self, input_ids: &Tensor) -> Result<Tensor> {
         Ok(self.embed_tokens.forward(input_ids)?)
     }
@@ -377,6 +408,10 @@ impl Qwen3_5TextModel {
     /// position is projected through `lm_head`.
     ///
     /// Long prompts are prefilled in chunks; see [`super::prefill`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
@@ -389,7 +424,7 @@ impl Qwen3_5TextModel {
     /// Embed `input_ids` `[B, S]` and run every decoder layer, returning the
     /// pre-final-norm hidden states `[B, S, hidden_size]`.
     ///
-    /// `start_pos` is the absolute position of the first token: RoPE and the
+    /// `start_pos` is the absolute position of the first token: `RoPE` and the
     /// causal mask are indexed from it, so a prefill chunk starting mid-prompt
     /// sees its true positions rather than chunk-relative ones.
     pub(super) fn forward_layers(
@@ -418,7 +453,7 @@ impl Qwen3_5TextModel {
     /// `image_token_id` positions; the caller is responsible for embedding
     /// the text tokens (or a placeholder at image positions) and stitching
     /// them together. `position_ids` of shape `[3, S]` enables per-token
-    /// 3D MRoPE for vision tokens (T/H/W positions).
+    /// 3D `MRoPE` for vision tokens (T/H/W positions).
     ///
     /// `start_pos` is still required for the K/V cache offset. For
     /// prefill with images this is `0`; for decode it advances one per
@@ -427,6 +462,10 @@ impl Qwen3_5TextModel {
     ///
     /// Returns logits of shape `[B, V]` (only the last position is projected,
     /// matching the text-only forward).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_embeds(
         &mut self,
         hidden_states: &Tensor,
@@ -481,10 +520,13 @@ impl Qwen3_5TextModel {
                     .flatten_all()?
                     .to_dtype(DType::F32)?;
                 let v = last.to_vec1::<f32>()?;
+                // v is a single hidden-state vector (hidden_size elements, a small
+                // model dimension), nowhere near f32's 24-bit exact-integer range.
+                #[allow(clippy::cast_precision_loss)]
                 let n = v.len() as f32;
                 let mean = v.iter().sum::<f32>() / n;
-                let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let min = v.iter().copied().fold(f32::INFINITY, f32::min);
+                let max = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let nonfinite = v.iter().filter(|x| !x.is_finite()).count();
                 eprintln!(
                     "[qwen3_5:debug] layer[{i}]: min={min:.4} max={max:.4} mean={mean:.4} non_finite={nonfinite}/{}",
@@ -565,10 +607,14 @@ fn merge_canonical_eos_ids(
 fn read_eos_token_ids(model_path: &str) -> Vec<u32> {
     fn from_value(v: &serde_json::Value) -> Vec<u32> {
         match v {
-            serde_json::Value::Number(n) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .map(|x| vec![x])
+                .unwrap_or_default(),
             serde_json::Value::Array(a) => a
                 .iter()
-                .filter_map(|e| e.as_u64().map(|x| x as u32))
+                .filter_map(|e| e.as_u64().and_then(|x| u32::try_from(x).ok()))
                 .collect(),
             _ => Vec::new(),
         }
@@ -630,10 +676,17 @@ impl Model {
     ///
     /// In-situ quantization is picked up from the `CRANE_ISQ` env var; use
     /// [`Model::new_with_options`] to set it explicitly (e.g. from a CLI flag).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new_with_format(
         model_path: &str,
         device: &Device,
@@ -646,6 +699,10 @@ impl Model {
     /// Load with an explicit in-situ quantization level (`quant`). `None`
     /// keeps the checkpoint dtype. Quantization only applies to the
     /// safetensors path — GGUF weights are already quantized.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new_with_options(
         model_path: &str,
         device: &Device,
@@ -657,8 +714,7 @@ impl Model {
             ModelFormat::Auto => {
                 let is_gguf = std::path::Path::new(model_path)
                     .extension()
-                    .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false);
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
                 if is_gguf {
                     ModelFormat::Gguf
                 } else {
@@ -668,7 +724,7 @@ impl Model {
             other => other,
         };
         match format {
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype, quant),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype, quant),
             ModelFormat::Gguf => {
                 if quant.is_some() {
                     eprintln!(
@@ -754,15 +810,15 @@ impl Model {
     fn from_pretrained(
         model_path: &str,
         device: &Device,
-        dtype: &DType,
+        dtype: DType,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
         // When ISQ is requested, memory is the caller's priority: on Metal,
         // keep the non-quantized side tensors (embedding, norms, conv) in F16
         // instead of the server's F32 default — the 248k-vocab embedding
         // alone is ~1 GB in F32 vs ~0.5 GB in F16.
-        let dtype = if quant.is_some() && device.is_metal() && *dtype == DType::F32 {
-            &DType::F16
+        let dtype = if quant.is_some() && device.is_metal() && dtype == DType::F32 {
+            DType::F16
         } else {
             dtype
         };
@@ -773,7 +829,7 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         let filenames = utils::get_safetensors_files(model_path)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
 
         let config_path = std::path::Path::new(model_path).join("config.json");
         let cfg = load_config(config_path.to_str().context("non-UTF8 model path")?)?;
@@ -783,12 +839,12 @@ impl Model {
         if let Some(dt) = quant {
             eprintln!("[qwen3_5] in-situ quantization enabled: {dt:?}");
         }
-        let inner = Qwen3_5TextModel::new(&cfg, vb, device, *dtype, quant)?;
+        let inner = Qwen3_5TextModel::new(&cfg, &vb, device, dtype, quant)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
-            dtype: *dtype,
+            dtype,
             eos_token_ids,
             inner,
         })
@@ -801,6 +857,10 @@ impl Model {
     }
 
     /// Tokenize a prompt string into input IDs (mirrors `qwen3::Model`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_inputs(&self, inputs: &str) -> Result<Vec<u32>> {
         let input_ids = self
             .tokenizer
@@ -813,12 +873,21 @@ impl Model {
     }
 
     /// Run a single forward step, returning next-token logits `[1, vocab]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_step(&mut self, input_ids: &[u32], start_pos: usize) -> Result<Tensor> {
         let input = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
         self.inner.forward(&input, start_pos, None)
     }
 
     /// Reset all per-layer GDN caches (between unrelated requests).
+    ///
+    /// # Panics
+    ///
+    /// Panics if resetting a layer's recurrent state fails — treated as
+    /// unrecoverable internal state corruption rather than a normal error.
     pub fn clear_kv_cache(&mut self) {
         self.inner
             .reset_gdn_caches()
@@ -900,7 +969,11 @@ impl ModelForCausalLM for Model {
             let logits = self.forward_step(ctxt, start_pos)?;
             let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
 
-            let logits = if config.repetition_penalty == 1. {
+            // repetition_penalty is compared against the exact default sentinel 1.0,
+            // not a computed value, so exact float equality is intentional here.
+            #[allow(clippy::float_cmp)]
+            let no_repetition_penalty = config.repetition_penalty == 1.;
+            let logits = if no_repetition_penalty {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(config.repeat_last_n);
@@ -934,10 +1007,11 @@ impl ModelForCausalLM for Model {
 
         let dt = start_gen.elapsed();
         if config.report_speed {
-            println!(
-                "\n{generated_tokens} tokens generated ({:.2} token/s)\n",
-                generated_tokens as f64 / dt.as_secs_f64(),
-            );
+            // generated_tokens is a small per-request token count; f64 has ample
+            // precision for it, this is purely a display metric.
+            #[allow(clippy::cast_precision_loss)]
+            let tokens_per_sec = generated_tokens as f64 / dt.as_secs_f64();
+            println!("\n{generated_tokens} tokens generated ({tokens_per_sec:.2} token/s)\n");
         }
         Ok(tokens)
     }

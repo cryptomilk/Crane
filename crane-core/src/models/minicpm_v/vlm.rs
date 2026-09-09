@@ -139,7 +139,7 @@ impl MinicpmV46VLModel {
             vision_end_token_id: None,
             tie_word_embeddings: cfg.tie_word_embeddings,
         };
-        let text = Qwen3_5TextModel::new(&qwen35_cfg, vb, device, *dtype, None)
+        let text = Qwen3_5TextModel::new(&qwen35_cfg, &vb, device, *dtype, None)
             .context("build text model")?;
 
         let preprocessor = load_preprocessor_config(model_path)?;

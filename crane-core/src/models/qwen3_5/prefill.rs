@@ -25,6 +25,7 @@ pub const DEFAULT_CHUNK: usize = 512;
 /// Chunk size from `CRANE_PREFILL_CHUNK`, or [`DEFAULT_CHUNK`]. An explicit
 /// `0` (or an unparseable value) disables chunking, restoring the single-pass
 /// behaviour for A/B comparisons.
+#[must_use]
 pub fn chunk_size() -> usize {
     match std::env::var("CRANE_PREFILL_CHUNK") {
         Ok(v) => v.trim().parse().unwrap_or(0),
@@ -242,7 +243,7 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = tiny_config();
         let vb = VarBuilder::from_backend(Box::new(RandWeights), DType::F32, dev.clone());
-        let mut model = Qwen3_5TextModel::new(&cfg, vb, &dev, DType::F32, None).expect("build");
+        let mut model = Qwen3_5TextModel::new(&cfg, &vb, &dev, DType::F32, None).expect("build");
 
         // 23 tokens with chunk 5 gives 4 full chunks and a length-3 remainder;
         // 7 gives a length-2 one. Both are shorter than the conv kernel (4).
