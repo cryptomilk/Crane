@@ -23,6 +23,9 @@ pub struct Gguf<R: Read + Seek> {
     dtype: DType,
 }
 
+/// Per-layer KV caches for a batch of sequences: `caches[seq][layer]`.
+pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
+
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device, dtype: DType) -> Self {
         Self {
@@ -939,7 +942,7 @@ impl HunYuanDenseV1 {
             hidden_size,
             intermediate_size,
             num_hidden_layers,
-            num_attention_heads: num_attention_heads,
+            num_attention_heads,
             num_key_value_heads: num_kv_heads,
             head_dim: Some(head_dim),
             hidden_act: "silu".to_string(),
@@ -1300,10 +1303,10 @@ impl HunYuanDenseV1 {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
-        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+        let mut result: BatchKvCache = (0..n_seqs)
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
 

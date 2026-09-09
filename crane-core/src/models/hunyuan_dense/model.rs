@@ -186,9 +186,8 @@ impl Model {
     pub fn format_chat(&self, user_message: &str) -> String {
         format!(
             "<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>\
-             <\u{ff5c}hy_User\u{ff5c}>{}\
-             <\u{ff5c}hy_Assistant\u{ff5c}>",
-            user_message
+             <\u{ff5c}hy_User\u{ff5c}>{user_message}\
+             <\u{ff5c}hy_Assistant\u{ff5c}>"
         )
     }
 
@@ -281,7 +280,7 @@ impl Model {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<super::modeling::BatchKvCache> {
         self.inner
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
@@ -336,7 +335,7 @@ impl ModelForCausalLM for Model {
 
         let mut generated_tokens = 0usize;
         // Hunyuan uses eos_token_id = 120020
-        let eos_token = config.eos_token_id.unwrap_or(120020);
+        let eos_token = config.eos_token_id.unwrap_or(120_020);
         let mut streamer_finalized = false;
 
         let start_gen = std::time::Instant::now();
