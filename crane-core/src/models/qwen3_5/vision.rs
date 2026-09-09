@@ -20,7 +20,7 @@ struct PatchEmbed {
 }
 
 impl PatchEmbed {
-    fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &VisionConfig, vb: &VarBuilder) -> Result<Self> {
         let proj_vb = vb.pp("proj");
         let proj = Conv3dNoBias::new(
             cfg.in_channels,
@@ -30,7 +30,7 @@ impl PatchEmbed {
                 stride: cfg.patch_size,
                 ..Default::default()
             },
-            proj_vb.clone(),
+            &proj_vb,
         )?;
         let bias = proj_vb.get(cfg.hidden_size, "bias")?;
         Ok(Self {
@@ -65,7 +65,7 @@ struct VisionMlp {
 }
 
 impl VisionMlp {
-    fn new(dim: usize, hidden_dim: usize, act: Activation, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, hidden_dim: usize, act: Activation, vb: &VarBuilder) -> Result<Self> {
         Ok(Self {
             fc1: linear(dim, hidden_dim, vb.pp("linear_fc1"))?,
             fc2: linear(hidden_dim, dim, vb.pp("linear_fc2"))?,
@@ -109,7 +109,7 @@ struct VisionAttention {
 }
 
 impl VisionAttention {
-    fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, num_heads: usize, vb: &VarBuilder) -> Result<Self> {
         Ok(Self {
             qkv: linear(dim, dim * 3, vb.pp("qkv"))?,
             proj: linear(dim, dim, vb.pp("proj"))?,
@@ -158,8 +158,11 @@ impl VisionAttention {
                 let k = k_chunk.unsqueeze(0)?;
                 let v = v_chunk.unsqueeze(0)?;
 
-                let attn_weights =
-                    (q.matmul(&k.transpose(2, 3)?)? / (self.head_dim as f64).sqrt())?;
+                // head_dim is hidden_size / num_heads, a small ViT model dimension
+                // (well under 2^23), so this cast is exact.
+                #[allow(clippy::cast_precision_loss)]
+                let scale = (self.head_dim as f64).sqrt();
+                let attn_weights = (q.matmul(&k.transpose(2, 3)?)? / scale)?;
 
                 let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
                 attn_weights.matmul(&v)?
@@ -183,19 +186,19 @@ struct VisionBlock {
 }
 
 impl VisionBlock {
-    fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &VisionConfig, vb: &VarBuilder) -> Result<Self> {
         let norm_cfg = LayerNormConfig {
             eps: 1e-6,
             ..Default::default()
         };
         let norm1 = layer_norm(cfg.hidden_size, norm_cfg, vb.pp("norm1"))?;
         let norm2 = layer_norm(cfg.hidden_size, norm_cfg, vb.pp("norm2"))?;
-        let attn = VisionAttention::new(cfg.hidden_size, cfg.num_heads, vb.pp("attn"))?;
+        let attn = VisionAttention::new(cfg.hidden_size, cfg.num_heads, &vb.pp("attn"))?;
         let mlp = VisionMlp::new(
             cfg.hidden_size,
             cfg.intermediate_size,
             cfg.hidden_act.to_activation(),
-            vb.pp("mlp"),
+            &vb.pp("mlp"),
         )?;
         Ok(Self {
             norm1,
@@ -230,7 +233,7 @@ struct PatchMerger {
 }
 
 impl PatchMerger {
-    fn new(cfg: &VisionConfig, use_postshuffle_norm: bool, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &VisionConfig, use_postshuffle_norm: bool, vb: &VarBuilder) -> Result<Self> {
         let merged_hidden_size = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
         let norm_dim = if use_postshuffle_norm {
             merged_hidden_size
@@ -286,9 +289,17 @@ impl VisionRotaryEmbedding {
     const THETA: f32 = 10000.;
 
     fn new(dim: usize, device: &Device) -> Result<Self> {
+        // dim is head_dim/2, a small ViT model dimension (well under 2^23),
+        // so this cast is exact.
+        #[allow(clippy::cast_precision_loss)]
+        let dim_f32 = dim as f32;
         let inv_freq = (0..dim)
             .step_by(2)
-            .map(|i| 1f32 / Self::THETA.powf(i as f32 / dim as f32))
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)] // i < dim, same bound as above
+                let i_f32 = i as f32;
+                1f32 / Self::THETA.powf(i_f32 / dim_f32)
+            })
             .collect::<Vec<_>>();
         let inv_freq_len = inv_freq.len();
         Ok(Self {
@@ -297,8 +308,11 @@ impl VisionRotaryEmbedding {
     }
 
     fn make_embeds(&self, seqlen: usize) -> Result<Tensor> {
-        let seq =
-            Tensor::arange(0f32, seqlen as f32, self.inv_freq.device())?.unsqueeze(D::Minus1)?;
+        // seqlen is a vision-grid position count (max image/video height or
+        // width in patches), always far below 2^23, so this cast is exact.
+        #[allow(clippy::cast_precision_loss)]
+        let seqlen_f32 = seqlen as f32;
+        let seq = Tensor::arange(0f32, seqlen_f32, self.inv_freq.device())?.unsqueeze(D::Minus1)?;
         seq.broadcast_matmul(&self.inv_freq)
     }
 }
@@ -317,8 +331,12 @@ pub struct Qwen3_5VisionModel {
 }
 
 impl Qwen3_5VisionModel {
-    pub fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
-        let patch_embed = PatchEmbed::new(cfg, vb.pp("patch_embed"))?;
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape, or if `num_position_embeddings` is not a perfect square.
+    pub fn new(cfg: &VisionConfig, vb: &VarBuilder) -> Result<Self> {
+        let patch_embed = PatchEmbed::new(cfg, &vb.pp("patch_embed"))?;
         let pos_embed = embedding(
             cfg.num_position_embeddings,
             cfg.hidden_size,
@@ -327,15 +345,15 @@ impl Qwen3_5VisionModel {
 
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
-            blocks.push(VisionBlock::new(cfg, vb.pp(format!("blocks.{i}")))?);
+            blocks.push(VisionBlock::new(cfg, &vb.pp(format!("blocks.{i}")))?);
         }
 
-        let merger = PatchMerger::new(cfg, false, vb.pp("merger"))?;
+        let merger = PatchMerger::new(cfg, false, &vb.pp("merger"))?;
         let deepstack_mergers = cfg
             .deepstack_visual_indexes
             .iter()
             .enumerate()
-            .map(|(i, _)| PatchMerger::new(cfg, true, vb.pp(format!("deepstack_merger_list.{i}"))))
+            .map(|(i, _)| PatchMerger::new(cfg, true, &vb.pp(format!("deepstack_merger_list.{i}"))))
             .collect::<Result<Vec<_>>>()?;
 
         let mut deepstack_lookup = vec![None; cfg.depth];
@@ -348,6 +366,13 @@ impl Qwen3_5VisionModel {
         let head_dim = cfg.hidden_size / cfg.num_heads;
         let rotary_pos_emb = VisionRotaryEmbedding::new(head_dim / 2, vb.device())?;
 
+        // num_position_embeddings is a small ViT grid size (e.g. 32*32), so this
+        // round-trip through f64 to take an integer sqrt is exact and non-negative.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let num_grid_per_side = (cfg.num_position_embeddings as f64).sqrt().round() as usize;
         if num_grid_per_side * num_grid_per_side != cfg.num_position_embeddings {
             candle_core::bail!(
@@ -370,6 +395,9 @@ impl Qwen3_5VisionModel {
         })
     }
 
+    // num_grid_per_side and steps are small ViT grid dimensions (well under
+    // 2^23), so these f32 round-trips are exact.
+    #[allow(clippy::cast_precision_loss)]
     fn linspace_points(&self, steps: usize) -> Vec<f32> {
         if steps == 1 {
             return vec![0.0];
@@ -379,6 +407,11 @@ impl Qwen3_5VisionModel {
         (0..steps).map(|i| i as f32 * step).collect()
     }
 
+    // This function's length comes from building four separate bilinear-
+    // interpolation corners (floor/ceil x h/w) with their per-corner bounded
+    // casts; splitting it up would scatter that construction logic across
+    // several small functions without simplifying the interpolation itself.
+    #[allow(clippy::too_many_lines)]
     fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let device = self.pos_embed.embeddings().device();
         let dtype = self.pos_embed.embeddings().dtype();
@@ -396,21 +429,32 @@ impl Qwen3_5VisionModel {
             let h_vals = self.linspace_points(h);
             let w_vals = self.linspace_points(w);
 
+            // h_vals/w_vals are non-negative linspace points bounded by
+            // num_grid_per_side, so floor()/ceil() as usize never truncates
+            // a fractional integer part or flips sign.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let h_floor: Vec<usize> = h_vals.iter().map(|v| v.floor() as usize).collect();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let w_floor: Vec<usize> = w_vals.iter().map(|v| v.floor() as usize).collect();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let h_ceil: Vec<usize> = h_vals
                 .iter()
                 .map(|v| (v.ceil() as usize).min(self.num_grid_per_side - 1))
                 .collect();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let w_ceil: Vec<usize> = w_vals
                 .iter()
                 .map(|v| (v.ceil() as usize).min(self.num_grid_per_side - 1))
                 .collect();
+            // h_floor/w_floor are grid indices bounded by num_grid_per_side, a
+            // small ViT dimension well under 2^23, so this cast back is exact.
+            #[allow(clippy::cast_precision_loss)]
             let dh: Vec<f32> = h_vals
                 .iter()
                 .zip(&h_floor)
                 .map(|(v, f)| v - *f as f32)
                 .collect();
+            #[allow(clippy::cast_precision_loss)]
             let dw: Vec<f32> = w_vals
                 .iter()
                 .zip(&w_floor)
@@ -419,9 +463,15 @@ impl Qwen3_5VisionModel {
 
             for ((&hf, &hc), &dh_val) in h_floor.iter().zip(&h_ceil).zip(&dh) {
                 for ((&wf, &wc), &dw_val) in w_floor.iter().zip(&w_ceil).zip(&dw) {
+                    // Grid indices are bounded by num_grid_per_side^2, a small ViT
+                    // grid size, so this cast to i64 (needed for index_select) cannot wrap.
+                    #[allow(clippy::cast_possible_wrap)]
                     let base00 = (hf * self.num_grid_per_side + wf) as i64;
+                    #[allow(clippy::cast_possible_wrap)]
                     let base01 = (hf * self.num_grid_per_side + wc) as i64;
+                    #[allow(clippy::cast_possible_wrap)]
                     let base10 = (hc * self.num_grid_per_side + wf) as i64;
+                    #[allow(clippy::cast_possible_wrap)]
                     let base11 = (hc * self.num_grid_per_side + wc) as i64;
 
                     let w00 = (1.0 - dh_val) * (1.0 - dw_val);
@@ -511,17 +561,21 @@ impl Qwen3_5VisionModel {
                 for bc in 0..merged_w {
                     for ir in 0..self.spatial_merge_size {
                         for ic in 0..self.spatial_merge_size {
-                            base_coords.push((
-                                (br * self.spatial_merge_size + ir) as i64,
-                                (bc * self.spatial_merge_size + ic) as i64,
-                            ));
+                            // Grid row/col indices are bounded by the image/video
+                            // grid size, so this cast to i64 (needed for
+                            // index_select) cannot wrap.
+                            #[allow(clippy::cast_possible_wrap)]
+                            let row = (br * self.spatial_merge_size + ir) as i64;
+                            #[allow(clippy::cast_possible_wrap)]
+                            let col = (bc * self.spatial_merge_size + ic) as i64;
+                            base_coords.push((row, col));
                         }
                     }
                 }
             }
 
             for _ in 0..(g[0] as usize) {
-                coords.extend(base_coords.iter().cloned());
+                coords.extend(base_coords.iter().copied());
             }
         }
 
@@ -540,7 +594,7 @@ impl Qwen3_5VisionModel {
             .reshape((total_tokens, freq_table.dim(D::Minus1)? * 2))
     }
 
-    fn build_cu_seqlens(&self, grid_thw: &Tensor) -> Result<Vec<usize>> {
+    fn build_cu_seqlens(grid_thw: &Tensor) -> Result<Vec<usize>> {
         let grid = grid_thw.to_vec2::<u32>()?;
         let mut cu = Vec::with_capacity(grid.iter().map(|v| v[0] as usize).sum::<usize>() + 1);
         cu.push(0usize);
@@ -555,6 +609,9 @@ impl Qwen3_5VisionModel {
         Ok(cu)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let dtype = self.pos_embed.embeddings().dtype();
         let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
@@ -568,7 +625,7 @@ impl Qwen3_5VisionModel {
         let cos = emb.cos()?.to_dtype(DType::F32)?;
         let sin = emb.sin()?.to_dtype(DType::F32)?;
 
-        let cu_seqlens = self.build_cu_seqlens(grid_thw)?;
+        let cu_seqlens = Self::build_cu_seqlens(grid_thw)?;
 
         let mut deepstack_features = Vec::new();
         for (layer_idx, block) in self.blocks.iter().enumerate() {

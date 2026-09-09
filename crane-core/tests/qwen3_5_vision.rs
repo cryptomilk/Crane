@@ -51,7 +51,7 @@ fn qwen3_5_vision_forward_shape() {
         .expect("mmap safetensors");
 
     let vision =
-        Qwen3_5VisionModel::new(vcfg, vb.pp("model").pp("visual")).expect("build vision tower");
+        Qwen3_5VisionModel::new(vcfg, &vb.pp("model").pp("visual")).expect("build vision tower");
 
     // 408x408 image → resize to multiple of 32 (patch * merge) → 416x416.
     // patches per side = 416 / 16 = 26.

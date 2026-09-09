@@ -1,10 +1,10 @@
 //! Qwen 3.5 transformer layer: hybrid full-attention + linear-attention stack.
 //!
 //! Layout (per layer):
-//!   residual = input_layernorm(x)
-//!   attn_or_gdn_out = full_or_linear(residual, …)   // dispatched by layer_types
-//!   x = x + attn_or_gdn_out
-//!   residual2 = post_attention_layernorm(x)
+//!   residual = `input_layernorm(x)`
+//!   `attn_or_gdn_out` = `full_or_linear`(residual, …)   // dispatched by `layer_types`
+//!   x = x + `attn_or_gdn_out`
+//!   residual2 = `post_attention_layernorm(x)`
 //!   x = x + mlp(residual2)
 //!
 //! The full-attention path uses MRoPE-interleaved rotary embeddings and gated
@@ -24,9 +24,9 @@ use crate::ops::linear::{LinearLayer, linear_layer};
 
 // ── Qwen 3.5 RMSNorm (unit-offset) ───────────────────────────────────────
 
-/// RMSNorm as used by Qwen 3.5: `x / rms(x) * (1 + weight)`.
+/// `RMSNorm` as used by Qwen 3.5: `x / rms(x) * (1 + weight)`.
 ///
-/// Unlike the standard (Llama/Qwen3) RMSNorm — which scales by `weight` — Qwen
+/// Unlike the standard (Llama/Qwen3) `RMSNorm` — which scales by `weight` — Qwen
 /// 3.5 adds a unit offset (`1 + weight`, Gemma-style). HF source:
 /// `output = self._norm(x.float()) * (1.0 + self.weight.float())`. The stored
 /// weights have mean ~0.24, so omitting the `+1` shrinks every normalized
@@ -50,13 +50,17 @@ pub struct Qwen35RmsNorm {
 }
 
 impl Qwen35RmsNorm {
-    pub fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if the `weight` tensor is missing or has an unexpected shape.
+    pub fn load(size: usize, eps: f64, vb: &VarBuilder) -> Result<Self> {
         let weight = vb.get(size, "weight")?;
         Ok(Self::from_folded(weight.affine(1.0, 1.0)?, eps))
     }
 
     /// Construct from a scale that already includes the `+1` unit offset
     /// (GGUF layout).
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn from_folded(alpha: Tensor, eps: f64) -> Self {
         Self {
@@ -89,8 +93,8 @@ use crate::ops::gdn::{
 
 /// Multimodal Rotary Position Embedding (interleaved variant, used by Qwen 3.5).
 ///
-/// For text-only inference the position_ids are identical across all three
-/// sections, so this reduces to standard RoPE applied to the first
+/// For text-only inference the `position_ids` are identical across all three
+/// sections, so this reduces to standard `RoPE` applied to the first
 /// `rot_dim = head_dim * partial_rotary_factor` components of each head.
 ///
 /// Precomputes `cos` and `sin` tables of shape `[max_pos, rot_dim/2]`. Use
@@ -99,14 +103,20 @@ pub struct MRotaryEmbedding {
     cos_table: Tensor,
     sin_table: Tensor,
     rot_dim: usize,
-    /// Doubled mrope_section (`[22, 22, 20]` for Qwen 3.5). Cached for the
+    /// Doubled `mrope_section` (`[22, 22, 20]` for Qwen 3.5). Cached for the
     /// vision-path gather.
     mrope_section_doubled: Vec<usize>,
 }
 
 impl MRotaryEmbedding {
+    /// # Errors
+    ///
+    /// Returns an error if building the cos/sin tables fails.
     pub fn new(cfg: &TextConfig, device: &Device) -> Result<Self> {
         let rot_dim = cfg.rot_dim();
+        // rope_theta is a positive frequency base (e.g. 10_000 or 10_000_000);
+        // computing the RoPE table in f32 matches HF's own float32 rotary math.
+        #[allow(clippy::cast_possible_truncation)]
         let base = cfg.rope_theta() as f32;
         let max_pos = cfg.max_position_embeddings;
 
@@ -119,11 +129,18 @@ impl MRotaryEmbedding {
         // whereas HF pairs `i` with `i+rot_dim/2` inside the rotary slice — a
         // different rotation entirely.
         let half_rot = rot_dim / 2;
+        // half_rot and rot_dim are at most head_dim (a small model dimension,
+        // e.g. <=512), well within f32's 24-bit exact-integer range.
+        #[allow(clippy::cast_precision_loss)]
         let inv: Vec<f32> = (0..half_rot)
             .map(|i| 1.0 / base.powf(i as f32 * 2.0 / rot_dim as f32))
             .collect();
         let inv_freq = Tensor::new(inv.as_slice(), device)?;
 
+        // max_pos (max_position_embeddings) stays well below 2^24 (16_777_216),
+        // the largest integer f32 can represent exactly, even for long-context
+        // configs (e.g. 262_144 or 1_000_000).
+        #[allow(clippy::cast_precision_loss)]
         let positions: Vec<f32> = (0..max_pos).map(|i| i as f32).collect();
         let positions = Tensor::new(positions.as_slice(), device)?;
         let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?; // [max_pos, half_rot]
@@ -148,6 +165,10 @@ impl MRotaryEmbedding {
 
     /// Slice cos/sin for positions `[start, start+seq_len)`. Used by the
     /// text-only path where all three axes share the same position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `start + seq_len` exceeds the precomputed table.
     pub fn cos_sin(&self, start: usize, seq_len: usize) -> Result<(Tensor, Tensor)> {
         let cos = self.cos_table.narrow(0, start, seq_len)?;
         let sin = self.sin_table.narrow(0, start, seq_len)?;
@@ -161,7 +182,7 @@ impl MRotaryEmbedding {
     /// row 2 = width position (W). Each row is gathered against
     /// `cos_table` / `sin_table` to produce a `[S, rot_dim/2]` per-axis tensor;
     /// the three per-axis tensors are then combined under the interleaved
-    /// MRoPE scheme using `mrope_section` (see HF's
+    /// `MRoPE` scheme using `mrope_section` (see HF's
     /// `apply_multimodal_rotary_pos_emb` for the reference).
     ///
     /// Returns `(cos, sin)` of shape `[S, rot_dim/2]`, ready to feed into
@@ -169,6 +190,11 @@ impl MRotaryEmbedding {
     /// its `i + rot_dim/2` counterpart inside the rotary slice, matching the
     /// HF behavior of the `q * cos + rotate_half(q) * sin` formulation when
     /// the cos/sin tables are not pair-duplicated).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `position_ids` has an unexpected shape or contains
+    /// out-of-range indices.
     pub fn cos_sin_with_position_ids(&self, position_ids: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_three, seq_len) = position_ids.dims2()?;
         let half_rot = self.rot_dim / 2;
@@ -244,6 +270,7 @@ impl MRotaryEmbedding {
         Ok((cos, sin))
     }
 
+    #[must_use]
     pub fn rot_dim(&self) -> usize {
         self.rot_dim
     }
@@ -260,6 +287,10 @@ impl MRotaryEmbedding {
 /// variant — it pairs component `i` with `i + rot_dim/2` *within the slice we
 /// hand it*, which matches HF's `rotate_half` over the rotary slice. We must
 /// slice first; rotating the full head would pair `i` with `i + head_dim/2`.
+///
+/// # Errors
+///
+/// Returns an error if `x`'s shape is incompatible with `rot_dim`.
 pub fn apply_mrope(x: &Tensor, cos: &Tensor, sin: &Tensor, rot_dim: usize) -> Result<Tensor> {
     let (_b, _h, _seq_len, head_dim) = x.dims4()?;
     let dtype = x.dtype();
@@ -299,10 +330,10 @@ pub struct RopeSlice<'a> {
 /// - `q_proj` outputs `num_heads * head_dim * 2`; the second half is a sigmoid
 ///   gate applied to the attention output.
 /// - Per-head QK-norm is always present (`q_norm`, `k_norm` of size `head_dim`).
-/// - RoPE is MRoPE-interleaved applied only to the first `rot_dim` components.
-/// `CRANE_ATTN_EXPAND=1` forces the legacy GQA-expansion path at decode
-/// instead of the grouped matmul. The two are mathematically identical, so
-/// this exists to A/B them: same binary, same weights, one variable.
+/// - `RoPE` is MRoPE-interleaved applied only to the first `rot_dim` components.
+///   `CRANE_ATTN_EXPAND=1` forces the legacy GQA-expansion path at decode
+///   instead of the grouped matmul. The two are mathematically identical, so
+///   this exists to A/B them: same binary, same weights, one variable.
 fn legacy_attn_expand() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -324,7 +355,10 @@ pub struct FullAttention {
 }
 
 impl FullAttention {
-    pub fn load(cfg: &TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    pub fn load(cfg: &TextConfig, vb: &VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -354,8 +388,8 @@ impl FullAttention {
             quant,
         )?;
 
-        let q_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let q_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, &vb.pp("q_norm"))?;
+        let k_norm = Qwen35RmsNorm::load(head_dim, cfg.rms_norm_eps, &vb.pp("k_norm"))?;
 
         Ok(Self {
             q_proj,
@@ -376,6 +410,10 @@ impl FullAttention {
     /// `attn_q` keeps HF's fused `[query | gate]` per-head layout (2× rows
     /// when `attn_output_gate`); per-head q/k norms are stored with the `+1`
     /// unit offset already folded in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing.
     pub fn from_gguf<R: Read + Seek>(
         cfg: &TextConfig,
         gg: &mut Gguf<R>,
@@ -410,6 +448,13 @@ impl FullAttention {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
+    // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key, value,
+    // batch, heads, seq_len, head_dim), matching the terminology used
+    // throughout this function's comments.
+    #[allow(clippy::many_single_char_names)]
     pub fn forward(
         &self,
         x: &Tensor,
@@ -476,6 +521,7 @@ impl FullAttention {
         };
 
         let n_rep = self.num_heads / self.num_kv_heads;
+        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
         if n_rep > 1 && seq_len == 1 && !legacy_attn_expand() {
@@ -572,58 +618,60 @@ fn attn_weights_with_mask(attn_logits: &Tensor, mask: &Tensor) -> Result<Tensor>
 
 // ── MLP ────────────────────────────────────────────────────────────────
 
-/// Standard SwiGLU MLP: `down(silu(gate(x)) * up(x))`.
+/// Standard `SwiGLU` MLP: `down(silu(gate(x)) * up(x))`.
 pub struct Mlp {
-    gate_proj: LinearLayer,
-    up_proj: LinearLayer,
-    down_proj: LinearLayer,
+    gate: LinearLayer,
+    up: LinearLayer,
+    down: LinearLayer,
 }
 
 impl Mlp {
-    pub fn load(cfg: &TextConfig, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
-        let gate_proj = linear_layer(
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    pub fn load(cfg: &TextConfig, vb: &VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        let gate = linear_layer(
             cfg.hidden_size,
             cfg.intermediate_size,
             vb.pp("gate_proj"),
             quant,
         )?;
-        let up_proj = linear_layer(
+        let up = linear_layer(
             cfg.hidden_size,
             cfg.intermediate_size,
             vb.pp("up_proj"),
             quant,
         )?;
-        let down_proj = linear_layer(
+        let down = linear_layer(
             cfg.intermediate_size,
             cfg.hidden_size,
             vb.pp("down_proj"),
             quant,
         )?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
+        Ok(Self { gate, up, down })
     }
 
     /// Construct from GGUF quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing.
     pub fn from_gguf<R: Read + Seek>(gg: &mut Gguf<R>, layer_idx: usize) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
-        let gate_proj = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
-        let up_proj = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
-        let down_proj = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-        })
+        let gate = gg.linear(&format!("{prefix}.ffn_gate.weight"))?;
+        let up = gg.linear(&format!("{prefix}.ffn_up.weight"))?;
+        let down = gg.linear(&format!("{prefix}.ffn_down.weight"))?;
+        Ok(Self { gate, up, down })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = candle_nn::ops::silu(&self.gate.forward(x)?)?;
+        let up = self.up.forward(x)?;
         let h = gate.broadcast_mul(&up)?;
-        let out = self.down_proj.forward(&h)?;
+        let out = self.down.forward(&h)?;
         Ok(out)
     }
 }
@@ -649,6 +697,9 @@ enum LayerImpl {
 }
 
 impl DecoderLayer {
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an unexpected shape.
     pub fn load(
         cfg: &TextConfig,
         layer_type: LayerType,
@@ -656,17 +707,17 @@ impl DecoderLayer {
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
         let input_layernorm =
-            Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
+            Qwen35RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, &vb.pp("input_layernorm"))?;
         let post_attention_layernorm = Qwen35RmsNorm::load(
             cfg.hidden_size,
             cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
+            &vb.pp("post_attention_layernorm"),
         )?;
-        let mlp = Mlp::load(cfg, vb.pp("mlp"), quant)?;
+        let mlp = Mlp::load(cfg, &vb.pp("mlp"), quant)?;
 
         let (layer_impl, gdn_dims) = match layer_type {
             LayerType::FullAttention => (
-                LayerImpl::FullAttention(FullAttention::load(cfg, vb.pp("self_attn"), quant)?),
+                LayerImpl::FullAttention(FullAttention::load(cfg, &vb.pp("self_attn"), quant)?),
                 None,
             ),
             LayerType::LinearAttention => {
@@ -697,8 +748,12 @@ impl DecoderLayer {
     /// The converter also orders the linear-attention value-head axis
     /// differently from HF ([`VHeadOrder::Chunked`] vs `Interleaved`); rather
     /// than permuting the affected weights — which would mean dequantizing and
-    /// re-quantizing them, and Q6_K's quantizer is not idempotent — the GDN
+    /// re-quantizing them, and `Q6_K`'s quantizer is not idempotent — the GDN
     /// dims record the order and the Q/K expansion adapts to it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing.
     pub fn from_gguf<R: Read + Seek>(
         cfg: &TextConfig,
         layer_type: LayerType,
@@ -774,6 +829,7 @@ impl DecoderLayer {
         })
     }
 
+    #[must_use]
     pub fn is_linear(&self) -> bool {
         matches!(self.layer_impl, LayerImpl::LinearAttention(_))
     }
@@ -781,6 +837,10 @@ impl DecoderLayer {
     /// Forward pass. For `LinearAttention` blocks pass `Some(gdn_cache)` and
     /// `None` for `attn_cache`; for `FullAttention` blocks pass `Some(attn_cache)`
     /// and `None` for `gdn_cache`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(
         &self,
         x: &Tensor,

@@ -17,7 +17,7 @@ use crate::ops::gdn::{GdnConfig, defaults};
 /// Whether a transformer block at layer index `i` is full (softmax) attention
 /// or linear (Gated Delta Net) attention.
 ///
-/// Layer indices run 0..num_hidden_layers. With `full_attention_interval = 4`
+/// Layer indices run `0..num_hidden_layers`. With `full_attention_interval = 4`
 /// the layout is `[linear, linear, linear, full, linear, linear, linear, full, …]`,
 /// so `full_attention_interval - 1` linear layers precede every full layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +28,7 @@ pub enum LayerType {
 
 /// `RopeParameters` block nested under `text_config.rope_parameters` in HF
 /// `config.json`. `mrope_interleaved: true` is the Qwen 3.5 variant (vs the
-/// non-interleaved MRoPE used by Qwen 3 VL).
+/// non-interleaved `MRoPE` used by Qwen 3 VL).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeParameters {
     #[serde(default = "defaults::rope_theta")]
@@ -37,7 +37,7 @@ pub struct RopeParameters {
     pub mrope_section: Vec<usize>,
     #[serde(default = "defaults::partial_rotary_factor")]
     pub partial_rotary_factor: f64,
-    /// Default false (i.e. standard MRoPE). Qwen 3.5 sets this to `true`.
+    /// Default false (i.e. standard `MRoPE`). Qwen 3.5 sets this to `true`.
     #[serde(default)]
     pub mrope_interleaved: bool,
 }
@@ -110,8 +110,8 @@ pub struct Config {
 }
 
 /// Qwen 3.5 vision tower config. The architecture is identical to the
-/// Qwen2.5-VL / Qwen3-VL ViT: Conv3d patch embed (temporal×spatial×spatial)
-/// with bias, 12-layer transformer with per-block LayerNorm, fast (flash)
+/// Qwen2.5-VL / Qwen3-VL `ViT`: Conv3d patch embed (temporal×spatial×spatial)
+/// with bias, 12-layer transformer with per-block `LayerNorm`, fast (flash)
 /// attention, and a `PatchMerger` MLP that 2×2-spacially-merges the patch
 /// grid and projects to `out_hidden_size` (== text hidden size for Qwen 3.5).
 #[derive(Debug, Clone, Deserialize)]
@@ -127,8 +127,8 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,
     #[serde(default)]
     pub num_position_embeddings: usize,
-    /// ViT MLP activation (Qwen 3.5 ships `gelu_pytorch_tanh` — exact GELU with
-    /// the tanh approximation, as used by every Qwen2.5/3 ViT).
+    /// `ViT` MLP activation (Qwen 3.5 ships `gelu_pytorch_tanh` — exact GELU with
+    /// the tanh approximation, as used by every Qwen2.5/3 `ViT`).
     #[serde(default = "default_vision_hidden_act")]
     pub hidden_act: VisionHiddenAct,
     /// Qwen 3.5 always sets this to `[]` (no deepstack injection).
@@ -141,7 +141,7 @@ fn default_vision_hidden_act() -> VisionHiddenAct {
 }
 
 /// Vision MLP activation function. Only `gelu_pytorch_tanh` is observed in
-/// the wild for the Qwen ViT family, but we keep the enum open.
+/// the wild for the Qwen `ViT` family, but we keep the enum open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionHiddenAct {
@@ -152,20 +152,20 @@ pub enum VisionHiddenAct {
 }
 
 impl VisionConfig {
+    #[must_use]
     pub fn merged_hidden_size(&self) -> usize {
         self.hidden_size * self.spatial_merge_size.pow(2)
     }
 }
 
 impl VisionHiddenAct {
-    /// Map to candle_nn::Activation.
+    /// Map to `candle_nn::Activation`.
     pub fn to_activation(self) -> candle_nn::Activation {
         use candle_nn::Activation;
         match self {
-            VisionHiddenAct::Gelu => Activation::Gelu,
             // `gelu_pytorch_tanh`: exact GELU with the tanh approximation,
             // matching nn.GELU(approximate='tanh') used by the Qwen ViT MLP.
-            VisionHiddenAct::GeluPytorchTanh => Activation::Gelu,
+            VisionHiddenAct::Gelu | VisionHiddenAct::GeluPytorchTanh => Activation::Gelu,
             VisionHiddenAct::Relu => Activation::Relu,
             VisionHiddenAct::Silu => Activation::Silu,
         }
@@ -173,6 +173,7 @@ impl VisionHiddenAct {
 }
 
 impl Config {
+    #[must_use]
     pub fn text(&self) -> &TextConfig {
         &self.text_config
     }
@@ -193,6 +194,10 @@ impl TextConfig {
     /// The only such knob today is [`Self::output_gate_type`]: the GDN gate is
     /// hardwired to swish, so any other activation would silently produce
     /// wrong activations rather than fail loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `output_gate_type` is set to an unsupported activation.
     pub fn validate(&self) -> Result<()> {
         if let Some(gate) = &self.output_gate_type
             && !matches!(gate.as_str(), "swish" | "silu")
@@ -205,29 +210,41 @@ impl TextConfig {
         Ok(())
     }
 
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_parameters.rope_theta
     }
 
+    #[must_use]
     pub fn partial_rotary_factor(&self) -> f64 {
         self.rope_parameters.partial_rotary_factor
     }
 
+    #[must_use]
     pub fn mrope_section(&self) -> &[usize] {
         &self.rope_parameters.mrope_section
     }
 
+    #[must_use]
     pub fn mrope_interleaved(&self) -> bool {
         self.rope_parameters.mrope_interleaved
     }
 
     /// `head_dim * partial_rotary_factor` — the slice of the head dim that
     /// actually receives rotary embeddings.
+    #[must_use]
     pub fn rot_dim(&self) -> usize {
-        (self.head_dim as f64 * self.partial_rotary_factor()) as usize
+        // head_dim is a small model dimension (e.g. <=512); the f64 round-trip
+        // through partial_rotary_factor cannot lose precision or sign here.
+        #[allow(clippy::cast_precision_loss)]
+        let head_dim = self.head_dim as f64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rot_dim = (head_dim * self.partial_rotary_factor()) as usize;
+        rot_dim
     }
 
     /// Layer-type sequence, indexed by transformer-block position.
+    #[must_use]
     pub fn layer_types(&self) -> Vec<LayerType> {
         (0..self.num_hidden_layers)
             .map(|i| {
@@ -240,14 +257,17 @@ impl TextConfig {
             .collect()
     }
 
+    #[must_use]
     pub fn linear_key_dim(&self) -> usize {
         self.linear_num_key_heads * self.linear_key_head_dim
     }
 
+    #[must_use]
     pub fn linear_value_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
     }
 
+    #[must_use]
     pub fn linear_conv_dim(&self) -> usize {
         2 * self.linear_key_dim() + self.linear_value_dim()
     }
@@ -281,6 +301,10 @@ impl GdnConfig for TextConfig {
 ///
 /// Vision config is deserialized into a generic JSON value since the text path
 /// never reads it; the caller's responsibility is to gate vision processing.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or does not parse as a valid config.
 pub fn load_config(path: &str) -> Result<Config> {
     let data = std::fs::read(path)
         .map_err(|e| candle_core::Error::Msg(format!("read config {path}: {e}")))?;

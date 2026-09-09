@@ -17,11 +17,14 @@ pub struct Gguf<R: Read + Seek> {
     device: Device,
     /// Target compute dtype. Dequantized tensors (norms, embeddings) are
     /// cast to this dtype so they match the activations flowing through the
-    /// model (e.g. BF16 on CUDA). Quantized linear layers (QMatMul) handle
+    /// model (e.g. BF16 on CUDA). Quantized linear layers (`QMatMul`) handle
     /// their own internal dtype and the `LinearLayer` wrapper casts their
     /// output to the input's dtype.
     dtype: DType,
 }
+
+/// Per-layer KV caches for a batch of sequences: `caches[seq][layer]`.
+pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
 
 impl<R: Read + Seek> Gguf<R> {
     pub fn new(ct: gguf_file::Content, reader: R, device: Device, dtype: DType) -> Self {
@@ -33,15 +36,23 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
-    /// Load a quantized tensor and wrap as a LinearLayer (QMatMul).
+    /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn linear(&mut self, name: &str) -> Result<LinearLayer> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(LinearLayer::Quantized(qmm))
     }
 
-    /// Load a tensor, dequantize, and create an RmsNorm.
+    /// Load a tensor, dequantize, and create an `RmsNorm`.
     /// The weight is cast to the target `dtype` so it matches activations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
@@ -52,7 +63,11 @@ impl<R: Read + Seek> Gguf<R> {
     /// only the rows a forward pass gathers.
     ///
     /// Prefer this over [`Self::embedding`] for large vocabularies: a 248k-row
-    /// table costs ~2.4 GiB dense in BF16 versus ~0.7 GiB as Q4_K.
+    /// table costs ~2.4 GiB dense in BF16 versus ~0.7 GiB as `Q4_K`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn quantized_embedding(
         &mut self,
         name: &str,
@@ -65,19 +80,31 @@ impl<R: Read + Seek> Gguf<R> {
     /// Load a tensor, dequantize, and create an Embedding.
     /// The weight is cast to the target `dtype` so lookups produce
     /// tensors in the expected compute precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(candle_nn::Embedding::new(weight, hidden_size))
     }
 
-    /// Load a raw QTensor by name.
+    /// Load a raw `QTensor` by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing.
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 
     /// Load a tensor, dequantize, and cast to the target compute dtype.
     /// For small full-precision tensors (norm weights, biases, conv kernels).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn dequant_tensor(&mut self, name: &str) -> Result<Tensor> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         ws.dequantize(&self.device)?.to_dtype(self.dtype)
@@ -139,15 +166,18 @@ fn default_true() -> bool {
 }
 
 impl Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    #[must_use]
     pub fn attention_bias(&self) -> bool {
         self.attention_bias.unwrap_or(false)
     }
 
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_theta.unwrap_or(10000.0)
     }
@@ -181,7 +211,7 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
-    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Merged QKV weight [`q_dim` + 2*`kv_dim`, `hidden_size`] — one gemv instead of 3.
     /// Only set for Standard (non-quantized) weights.
     qkv_proj: Option<Linear>,
     query_layernorm: Option<RmsNorm>,
@@ -199,7 +229,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    // This function's length comes from building four separate q/k/v/o
+    // projections, each with a bias/no-bias branch, plus the merged-QKV
+    // fast path; splitting it up would scatter that construction logic
+    // across several small functions without simplifying it.
+    #[allow(clippy::too_many_lines)]
+    fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -359,62 +394,62 @@ impl Attention {
     ///
     /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
     /// Falls back to cat + reallocate when the buffer is full.
-    /// Returns (k_full, v_full) views covering all valid cached data.
-    fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
+    /// Returns (`k_full`, `v_full`) views covering all valid cached data.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
+    fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
         let k = k.contiguous()?;
         let v = v.contiguous()?;
         let new_seq_len = k.dim(2)?;
         let cache_seq_len = self.cache_seq_len;
 
-        match self.kv_cache.take() {
-            Some((buf_k, buf_v)) => {
-                let buf_len = buf_k.dim(2)?;
-                let new_total = cache_seq_len + new_seq_len;
+        if let Some((buf_k, buf_v)) = self.kv_cache.take() {
+            let buf_len = buf_k.dim(2)?;
+            let new_total = cache_seq_len + new_seq_len;
 
-                if new_total <= buf_len {
-                    // In-place write: O(new_seq_len) instead of O(cache_len)
-                    buf_k.slice_set(&k, 2, cache_seq_len)?;
-                    buf_v.slice_set(&v, 2, cache_seq_len)?;
-                    let k_view = buf_k.narrow(2, 0, new_total)?;
-                    let v_view = buf_v.narrow(2, 0, new_total)?;
-                    self.kv_cache = Some((buf_k, buf_v));
-                    self.cache_seq_len = new_total;
-                    Ok((k_view, v_view))
-                } else {
-                    // Buffer too small: grow with extra room.
-                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
-                    let room = 256; // fixed small room — avoids 2x over-allocation
-                    let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
-                    self.kv_cache = Some((new_buf_k, new_buf_v));
-                    self.cache_seq_len = total;
-                    Ok((full_k, full_v))
-                }
-            },
-            None => {
-                // First use: allocate buffer with extra room.
-                let (b, h, s, d) = k.dims4()?;
-                let room = 256; // fixed small room — avoids 2x over-allocation
-                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-                buf_k.slice_set(&k, 2, 0)?;
-                buf_v.slice_set(&v, 2, 0)?;
+            if new_total <= buf_len {
+                // In-place write: O(new_seq_len) instead of O(cache_len)
+                buf_k.slice_set(&k, 2, cache_seq_len)?;
+                buf_v.slice_set(&v, 2, cache_seq_len)?;
+                let k_view = buf_k.narrow(2, 0, new_total)?;
+                let v_view = buf_v.narrow(2, 0, new_total)?;
                 self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = s;
-                Ok((k, v))
-            },
+                self.cache_seq_len = new_total;
+                Ok((k_view, v_view))
+            } else {
+                // Buffer too small: grow with extra room.
+                let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
+                let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
+                drop(buf_k);
+                drop(buf_v);
+                let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
+                let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
+                drop(cur_k);
+                drop(cur_v);
+                let total = full_k.dim(2)?;
+                let room = 256; // fixed small room — avoids 2x over-allocation
+                let (b, h, _, d) = full_k.dims4()?;
+                let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                new_buf_k.slice_set(&full_k, 2, 0)?;
+                new_buf_v.slice_set(&full_v, 2, 0)?;
+                self.kv_cache = Some((new_buf_k, new_buf_v));
+                self.cache_seq_len = total;
+                Ok((full_k, full_v))
+            }
+        } else {
+            // First use: allocate buffer with extra room.
+            let (b, h, s, d) = k.dims4()?;
+            let room = 256; // fixed small room — avoids 2x over-allocation
+            let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
+            let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
+            buf_k.slice_set(&k, 2, 0)?;
+            buf_v.slice_set(&v, 2, 0)?;
+            self.kv_cache = Some((buf_k, buf_v));
+            self.cache_seq_len = s;
+            Ok((k, v))
         }
     }
 
@@ -440,7 +475,7 @@ impl Attention {
             } else {
                 q
             };
-            return self.compute_attention(q, k, v, attention_mask, b_sz, seq_len);
+            return self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len);
         }
 
         // ── QKV projection: merged (1 gemv) or separate (3 gemv) ──
@@ -484,15 +519,19 @@ impl Attention {
             k
         };
 
-        let (k, v) = self.update_kv_cache(k, v)?;
+        let (k, v) = self.update_kv_cache(&k, &v)?;
 
-        self.compute_attention(q, k, v, attention_mask, b_sz, seq_len)
+        self.compute_attention(&q, k, v, attention_mask, b_sz, seq_len)
     }
 
     /// Shared attention computation used by both normal and CLA paths.
+    // b/h/kv_heads/s/d are standard tensor-shape notation (batch, heads,
+    // seq_len, head_dim), matching the BHSD terminology used elsewhere in
+    // this file.
+    #[allow(clippy::many_single_char_names)]
     fn compute_attention(
         &self,
-        q: Tensor,
+        q: &Tensor,
         k: Tensor,
         v: Tensor,
         attention_mask: Option<&Tensor>,
@@ -506,6 +545,7 @@ impl Attention {
             // ── GQA-grouped SDPA for decode (seq_len=1) ──
             // Keep 4D tensors throughout; candle matmul handles
             // non-contiguous K internally with a single flatten pass.
+            #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
             let scale = 1.0 / (self.head_dim as f64).sqrt();
 
             // Q: [B, H, 1, D] → [B, kv_heads, n_rep, D], pre-scaled
@@ -555,6 +595,7 @@ impl Attention {
         };
 
         // Scaled dot-product attention
+        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let attn_weights = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
         let attn_weights = match attention_mask {
@@ -600,7 +641,7 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let gate_proj = linear_no_bias(
             config.hidden_size,
             config.intermediate_size,
@@ -686,9 +727,9 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Attention::new(config, vb.pp("self_attn"))?;
-        let mlp = Mlp::new(config, vb.pp("mlp"))?;
+    fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
+        let self_attn = Attention::new(config, &vb.pp("self_attn"))?;
+        let mlp = Mlp::new(config, &vb.pp("mlp"))?;
         let input_layernorm = candle_nn::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -764,7 +805,11 @@ pub struct HunYuanDenseV1 {
 }
 
 impl HunYuanDenseV1 {
-    pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
+    pub fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let dtype = vb.dtype();
         let model_vb = vb.pp("model");
         let embed_tokens = candle_nn::embedding(
@@ -776,7 +821,7 @@ impl HunYuanDenseV1 {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
         for i in 0..config.num_hidden_layers {
-            layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
+            layers.push(DecoderLayer::new(config, &layers_vb.pp(i))?);
         }
 
         let norm =
@@ -823,8 +868,12 @@ impl HunYuanDenseV1 {
     }
 
     /// Construct from a GGUF file. Reads config from GGUF metadata and loads
-    /// all weights as quantized tensors (QMatMul for linear layers, dequantized
+    /// all weights as quantized tensors (`QMatMul` for linear layers, dequantized
     /// for embeddings and norms).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -849,7 +898,7 @@ impl HunYuanDenseV1 {
             .metadata()
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map(|s| s.clone())
+            .cloned()
             .unwrap_or_else(|| "qwen2".to_string());
 
         let num_attention_heads =
@@ -868,16 +917,18 @@ impl HunYuanDenseV1 {
             .get(&format!("{arch}.context_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(32768) as usize;
-        let rms_norm_eps = gg
-            .metadata()
-            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6) as f64;
-        let rope_theta = gg
-            .metadata()
-            .get(&format!("{arch}.rope.freq_base"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(10_000.0) as f64;
+        let rms_norm_eps = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1e-6),
+        );
+        let rope_theta = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.rope.freq_base"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(10_000.0),
+        );
 
         // Check for QK norm by probing tensor existence
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
@@ -891,7 +942,7 @@ impl HunYuanDenseV1 {
             hidden_size,
             intermediate_size,
             num_hidden_layers,
-            num_attention_heads: num_attention_heads,
+            num_attention_heads,
             num_key_value_heads: num_kv_heads,
             head_dim: Some(head_dim),
             hidden_act: "silu".to_string(),
@@ -950,6 +1001,15 @@ impl HunYuanDenseV1 {
         })
     }
 
+    /// # Panics
+    ///
+    /// Panics if narrowing an anchor layer's KV cache to its valid length
+    /// fails, which cannot happen because `cache_seq_len` is always within
+    /// the cache tensor's bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         // Disable per-tensor CUDA event tracking — Crane uses a single stream.
         #[cfg(feature = "cuda")]
@@ -1027,7 +1087,7 @@ impl HunYuanDenseV1 {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
         // rotary_emb tables are static and reusable — do not clear.
@@ -1035,24 +1095,22 @@ impl HunYuanDenseV1 {
 
     /// Compute the total bytes held by the model's KV caches without any
     /// GPU copies. Uses `elem_count()` which is pure arithmetic on dims.
+    #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
             .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
+                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
+                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                    k_bytes + v_bytes
+                })
             })
             .sum()
     }
 
     /// Number of transformer layers.
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -1063,6 +1121,7 @@ impl HunYuanDenseV1 {
     /// that need to free the buffer (e.g. batch-decode extract) should use
     /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
     /// consuming the views.
+    #[must_use]
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -1085,11 +1144,8 @@ impl HunYuanDenseV1 {
     /// Restore per-layer KV caches (e.g. after swapping sequences).
     /// The tensors are stored as-is; `cache_seq_len` is set to their dim(2).
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
-            let seq_len = cache
-                .as_ref()
-                .map(|(k, _)| k.dim(2).unwrap_or(0))
-                .unwrap_or(0);
+        for (layer, cache) in self.layers.iter_mut().zip(caches) {
+            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
             layer.self_attn.kv_cache = cache;
             layer.self_attn.cache_seq_len = seq_len;
         }
@@ -1106,6 +1162,13 @@ impl HunYuanDenseV1 {
     /// then `extract_batch_kv` to get clean per-sequence caches back.
     /// `extra_room`: number of decode tokens to pre-allocate in the buffer
     /// (avoids `Tensor::cat` reallocation during multi-round decode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
+    // b/h/s/d are standard tensor-shape notation (batch, heads, seq_len,
+    // head_dim), matching the BHSD terminology used elsewhere in this file.
+    #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -1122,8 +1185,7 @@ impl HunYuanDenseV1 {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
-                    .unwrap_or(0)
+                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
@@ -1181,6 +1243,10 @@ impl HunYuanDenseV1 {
     ///
     /// # Returns
     /// Logits tensor `[N, 1, vocab_size]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         input_ids: &Tensor,
@@ -1194,6 +1260,8 @@ impl HunYuanDenseV1 {
         let device = input_ids.device();
         let (full_cos, full_sin) = self.rotary_emb.forward(0, max_pos)?;
 
+        // Sequence positions are bounded by max_seq_len, always far below u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let pos_ids: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
         let pos_tensor = Tensor::new(pos_ids.as_slice(), device)?;
         // cos/sin: [N, dim/2] after index_select → [N, 1, dim/2] for rope()
@@ -1209,7 +1277,7 @@ impl HunYuanDenseV1 {
         let _ = batch_kv_info;
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
         }
 
@@ -1226,19 +1294,23 @@ impl HunYuanDenseV1 {
     /// - `kv_lens` — original per-sequence KV lengths (from `setup_batch_decode`)
     /// - `original_max_kv` — max KV length at setup time (from `setup_batch_decode`)
     /// - `rounds_done` — number of `step_batch_decode` calls completed
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if extracting the KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
-        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+        let mut result: BatchKvCache = (0..n_seqs)
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
 
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
@@ -1258,8 +1330,8 @@ impl HunYuanDenseV1 {
                     result[i].push(clean);
                 }
             } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
+                for row in &mut result {
+                    row.push(None);
                 }
             }
             layer.self_attn.kv_cache = None;
@@ -1270,11 +1342,13 @@ impl HunYuanDenseV1 {
     }
 
     /// Access the model config.
+    #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
     /// Access the model dtype.
+    #[must_use]
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }
@@ -1286,6 +1360,10 @@ impl HunYuanDenseV1 {
 /// Positions before `kv_lens[i]` and after `original_max_kv` are 0.0 (attend).
 ///
 /// Returns `None` if no padding exists (all sequences have the same KV length).
+///
+/// # Errors
+///
+/// Returns an error if building the mask tensor fails.
 pub fn build_batch_decode_mask(
     kv_lens: &[usize],
     original_max_kv: usize,
@@ -1313,6 +1391,9 @@ pub fn build_batch_decode_mask(
 ///
 /// Returns `Some((K, V))` with shape `[N, kv_heads, max_len, head_dim]`,
 /// or `None` if `max_len == 0`.
+// `padded_ks`/`padded_vs` are natural parallel names (key/value buffers built
+// in lockstep), not a typo risk.
+#[allow(clippy::similar_names)]
 fn pad_and_stack_kv_caches(
     caches: &[&Option<(Tensor, Tensor)>],
     max_len: usize,
@@ -1349,27 +1430,24 @@ fn pad_and_stack_kv_caches(
     };
 
     for cache in caches {
-        match cache {
-            Some((k, v)) => {
-                let cur_len = k.dim(2)?;
-                let pad_len = max_len - cur_len;
-                if pad_len > 0 {
-                    // Right-align: [padding | real_data] so that decode tokens
-                    // appended after max_kv form a contiguous valid range with
-                    // the pre-existing data, enabling flash_attn_varlen.
-                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
-                } else {
-                    padded_ks.push(k.clone());
-                    padded_vs.push(v.clone());
-                }
-            },
-            None => {
-                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
-                padded_ks.push(zeros.clone());
-                padded_vs.push(zeros);
-            },
+        if let Some((k, v)) = cache {
+            let cur_len = k.dim(2)?;
+            let pad_len = max_len - cur_len;
+            if pad_len > 0 {
+                // Right-align: [padding | real_data] so that decode tokens
+                // appended after max_kv form a contiguous valid range with
+                // the pre-existing data, enabling flash_attn_varlen.
+                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
+                padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
+            } else {
+                padded_ks.push(k.clone());
+                padded_vs.push(v.clone());
+            }
+        } else {
+            let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+            padded_ks.push(zeros.clone());
+            padded_vs.push(zeros);
         }
     }
 

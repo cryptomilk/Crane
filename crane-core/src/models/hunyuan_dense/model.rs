@@ -25,7 +25,7 @@ use crate::utils::utils;
 pub enum ModelFormat {
     /// Auto-detect from path (default).
     Auto,
-    /// Standard HuggingFace safetensors.
+    /// Standard `HuggingFace` safetensors.
     Safetensors,
     /// GGUF quantized format.
     Gguf,
@@ -39,10 +39,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new_with_format(
         model_path: &str,
         device: &Device,
@@ -52,7 +58,7 @@ impl Model {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
-                if p.is_file() && p.extension().map(|e| e == "gguf").unwrap_or(false) {
+                if p.is_file() && p.extension().is_some_and(|e| e == "gguf") {
                     ModelFormat::Gguf
                 } else {
                     ModelFormat::Safetensors
@@ -63,7 +69,7 @@ impl Model {
 
         match format {
             ModelFormat::Gguf | ModelFormat::Auto => Self::from_gguf(model_path, device),
-            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, dtype),
+            ModelFormat::Safetensors => Self::from_pretrained(model_path, device, *dtype),
         }
     }
 
@@ -75,7 +81,7 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
-    fn from_pretrained(model_path: &str, device: &Device, dtype: &DType) -> Result<Model> {
+    fn from_pretrained(model_path: &str, device: &Device, dtype: DType) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
             anyhow::bail!("Tokenizer not found at {}", tokenizer_path.display());
@@ -88,18 +94,18 @@ impl Model {
         // The model weights are stored in BF16, which is unsupported for CPU matmul.
         // We use mmap loading but the VarBuilder's dtype field ensures each tensor
         // is cast to the requested dtype (e.g. F32) when accessed.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, *dtype, device) }?;
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, device) }?;
 
         let config_file = std::path::Path::new(model_path).join("config.json");
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = HunYuanDenseV1::new(&config, vb)?;
+        let inner = HunYuanDenseV1::new(&config, &vb)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: device.clone(),
-            dtype: *dtype,
+            dtype,
             inner,
         })
     }
@@ -160,13 +166,15 @@ impl Model {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_inputs(&self, inputs: &str) -> Result<Vec<u32>> {
         let input_ids = self
             .tokenizer
             .tokenizer
             .encode(inputs, true)
-            .map_err(E::msg)
-            .unwrap()
+            .map_err(E::msg)?
             .get_ids()
             .to_vec();
         Ok(input_ids)
@@ -177,19 +185,26 @@ impl Model {
     pub fn format_chat(&self, user_message: &str) -> String {
         format!(
             "<\u{ff5c}hy_begin\u{2581}of\u{2581}sentence\u{ff5c}>\
-             <\u{ff5c}hy_User\u{ff5c}>{}\
-             <\u{ff5c}hy_Assistant\u{ff5c}>",
-            user_message
+             <\u{ff5c}hy_User\u{ff5c}>{user_message}\
+             <\u{ff5c}hy_Assistant\u{ff5c}>"
         )
     }
 
     /// Tokenize a user message with the Hunyuan chat template applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_chat(&self, user_message: &str) -> Result<Vec<u32>> {
         let formatted = self.format_chat(user_message);
         self.prepare_inputs(&formatted)
     }
 
     /// Run a single forward step, returning raw logits. Caller manages KV cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_step(
         &mut self,
         input_ids: &[u32],
@@ -206,6 +221,10 @@ impl Model {
     ///
     /// `extra_room`: number of decode tokens to pre-allocate in the KV buffer
     /// (avoids `Tensor::cat` reallocation during multi-round decode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -218,6 +237,10 @@ impl Model {
     ///
     /// Builds the `[N, 1]` input tensor from `tokens` (one per sequence).
     /// Returns logits `[N, 1, vocab]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         tokens: &[u32],
@@ -231,6 +254,9 @@ impl Model {
             .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode_with_input_ids(
         &mut self,
         input_ids: &Tensor,
@@ -244,12 +270,16 @@ impl Model {
 
     /// Extract per-sequence KV caches from the model's batched state,
     /// removing padding. Clears model KV cache afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if extracting the KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<super::modeling::BatchKvCache> {
         self.inner
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
@@ -304,7 +334,7 @@ impl ModelForCausalLM for Model {
 
         let mut generated_tokens = 0usize;
         // Hunyuan uses eos_token_id = 120020
-        let eos_token = config.eos_token_id.unwrap_or(120020);
+        let eos_token = config.eos_token_id.unwrap_or(120_020);
         let mut streamer_finalized = false;
 
         let start_gen = std::time::Instant::now();
@@ -318,11 +348,15 @@ impl ModelForCausalLM for Model {
             let logits = logits.squeeze(0)?.squeeze(0)?;
 
             // Greedy + no repetition penalty: GPU argmax avoids D→H logits copy.
-            let next_token = if config.temperature.is_none() && config.repetition_penalty == 1. {
+            // repetition_penalty is compared against the exact default sentinel 1.0,
+            // not a computed value, so exact float equality is intentional here.
+            #[allow(clippy::float_cmp)]
+            let no_repetition_penalty = config.repetition_penalty == 1.;
+            let next_token = if config.temperature.is_none() && no_repetition_penalty {
                 crate::ops::gpu_argmax(&logits)?
             } else {
                 let logits = logits.to_dtype(DType::F32)?;
-                let logits = if config.repetition_penalty == 1. {
+                let logits = if no_repetition_penalty {
                     logits
                 } else {
                     let start_at = tokens.len().saturating_sub(config.repeat_last_n);
@@ -350,17 +384,18 @@ impl ModelForCausalLM for Model {
             }
         }
         let dt = start_gen.elapsed();
-        if let Some(ref mut s) = streamer {
-            if !streamer_finalized {
-                s.finalize()?;
-            }
+        if let Some(ref mut s) = streamer
+            && !streamer_finalized
+        {
+            s.finalize()?;
         }
 
         if config.report_speed {
-            println!(
-                "\n{generated_tokens} tokens generated ({:.2} token/s)\n",
-                generated_tokens as f64 / dt.as_secs_f64(),
-            );
+            // generated_tokens is a small per-request token count; f64 has ample
+            // precision for it, this is purely a display metric.
+            #[allow(clippy::cast_precision_loss)]
+            let tokens_per_sec = generated_tokens as f64 / dt.as_secs_f64();
+            println!("\n{generated_tokens} tokens generated ({tokens_per_sec:.2} token/s)\n");
         }
 
         Ok(tokens)
