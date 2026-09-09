@@ -1,6 +1,6 @@
 //! Qwen 3.5 vision-language model.
 //!
-//! Glues the [`vision::Qwen3_5VisionModel`] (ViT + 2×2-spatial-merge MLP)
+//! Glues the [`vision::Qwen3_5VisionModel`] (`ViT` + 2×2-spatial-merge MLP)
 //! onto [`Qwen3_5TextModel`] (hybrid Mamba/Transformer text decoder).
 //!
 //! Forward flow:
@@ -8,13 +8,13 @@
 //!    each image position.
 //! 2. Run the vision tower on the pre-processed pixel values → projected
 //!    image embeddings `[total_image_tokens, hidden_size]`.
-//! 3. Embed the input_ids normally, then **splice** the image embeddings
+//! 3. Embed the `input_ids` normally, then **splice** the image embeddings
 //!    over the `<|image_pad|>` positions.
-//! 4. Build a `[3, S]` position_ids tensor: text tokens advance a single
+//! 4. Build a `[3, S]` `position_ids` tensor: text tokens advance a single
 //!    T/H/W counter, image tokens use the (t, h, w) coordinates derived
 //!    from `image_grid_thw`.
 //! 5. Call [`Qwen3_5TextModel::forward_embeds`] with the spliced hidden
-//!    states + 3D position_ids; MRoPE handles the rotation correctly.
+//!    states + 3D `position_ids`; `MRoPE` handles the rotation correctly.
 //!
 //! Single-sequence only for now (the hybrid cache complexity isn't worth
 //! tackling in the MVP). The Qwen 3.5 engine already caps
@@ -58,9 +58,9 @@ pub struct Qwen3_5VLModel {
     pub device: Device,
     pub dtype: DType,
     pub image_token_id: u32,
-    /// `<|image_pad|>` appears N times per image, where N = h/spatial_merge *
-    /// w/spatial_merge (so the text model sees merged patch tokens, not raw
-    /// ones). Cached here so the caller can build the input_ids sequence.
+    /// `<|image_pad|>` appears N times per image, where N = `h/spatial_merge` *
+    /// `w/spatial_merge` (so the text model sees merged patch tokens, not raw
+    /// ones). Cached here so the caller can build the `input_ids` sequence.
     pub spatial_merge_size: usize,
     /// The checkpoint's `preprocessor_config.json`, so callers don't have to
     /// load it separately just to turn a `DynamicImage` into pixel values.
@@ -68,7 +68,7 @@ pub struct Qwen3_5VLModel {
     /// Token ids that terminate generation, resolved from the tokenizer vocab
     /// (`<|im_end|>`, `<|endoftext|>`, `<|im_start|>`) rather than hardcoded.
     pub eos_token_ids: Vec<u32>,
-    /// MRoPE position the next decoded token should use. Seeded by `forward`;
+    /// `MRoPE` position the next decoded token should use. Seeded by `forward`;
     /// diverges from the absolute token index whenever the prompt has images.
     next_mrope_pos: u32,
     vision: Qwen3_5VisionModel,
@@ -77,6 +77,10 @@ pub struct Qwen3_5VLModel {
 
 impl Qwen3_5VLModel {
     /// Load a multimodal Qwen 3.5 checkpoint from a HF directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint, tokenizer, or config cannot be loaded.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_options(model_path, device, dtype, None)
     }
@@ -86,6 +90,10 @@ impl Qwen3_5VLModel {
     /// Vision tower linears are NOT quantized — they're tiny (depth=12, ~600M
     /// params total) and quantized linears don't play well with bf16 vision
     /// activations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint, tokenizer, or config cannot be loaded.
     pub fn new_with_options(
         model_path: &str,
         device: &Device,
@@ -122,12 +130,12 @@ impl Qwen3_5VLModel {
             vcfg.patch_size,
             vcfg.spatial_merge_size,
         );
-        let vision = Qwen3_5VisionModel::new(vcfg, vb.pp("model").pp("visual"))
+        let vision = Qwen3_5VisionModel::new(vcfg, &vb.pp("model").pp("visual"))
             .context("build vision tower")?;
 
         eprintln!("[qwen3_5_vl] loading text model");
         let text =
-            Qwen3_5TextModel::new(&cfg, vb, device, *dtype, quant).context("build text model")?;
+            Qwen3_5TextModel::new(&cfg, &vb, device, *dtype, quant).context("build text model")?;
 
         let preprocessor = load_preprocessor_config(model_path)?;
 
@@ -137,7 +145,7 @@ impl Qwen3_5VLModel {
         let vocab = tokenizer.get_vocab(true);
         let eos_token_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>", "<|im_start|>"]
             .iter()
-            .filter_map(|t| vocab.get(*t).map(|id| *id as u32))
+            .filter_map(|t| vocab.get(*t).copied())
             .collect();
         if eos_token_ids.is_empty() {
             anyhow::bail!("tokenizer has none of <|im_end|> / <|endoftext|> / <|im_start|>");
@@ -165,6 +173,10 @@ impl Qwen3_5VLModel {
     ///
     /// Returns projected embeddings ready to splice into the text token stream:
     /// `[total_image_tokens, hidden_size]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vision tower forward pass fails.
     pub fn encode_images(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<Tensor> {
         let (out, _deepstack) = self
             .vision
@@ -187,6 +199,11 @@ impl Qwen3_5VLModel {
     /// Returns the position tensor and the counter value the next token after
     /// this sequence should use (needed by [`Self::decode_step`], since with
     /// images that value is much smaller than the absolute token index).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `image_grid_thw` has fewer entries than image spans
+    /// in `text_ids`, or if building the position tensor fails.
     pub fn build_position_ids(
         &self,
         text_ids: &[u32],
@@ -194,10 +211,16 @@ impl Qwen3_5VLModel {
         start_pos: usize,
     ) -> Result<(Tensor, u32)> {
         let grids: Vec<Vec<u32>> = image_grid_thw.to_vec2::<u32>()?;
+        // spatial_merge_size is a tiny fixed ViT config knob (e.g. 2), never
+        // remotely close to u32::MAX.
+        #[allow(clippy::cast_possible_truncation)]
         let merge = self.spatial_merge_size as u32;
         let seq_len = text_ids.len();
 
         let mut positions = vec![[0u32; 3]; seq_len];
+        // Sequence positions stay well under u32::MAX (bounded by
+        // max_position_embeddings, at most a few hundred thousand).
+        #[allow(clippy::cast_possible_truncation)]
         let mut next_pos = start_pos as u32;
         let mut image_idx = 0usize;
         let mut i = 0usize;
@@ -224,6 +247,9 @@ impl Qwen3_5VLModel {
             let base = next_pos;
             let hw = gh * gw;
             for k in 0..span {
+                // span is a single image's patch count (t*h*w after merge),
+                // always far below u32::MAX.
+                #[allow(clippy::cast_possible_truncation)]
                 let k = k as u32;
                 positions[i + k as usize] =
                     [base + k / hw, base + (k % hw) / gw, base + (k % hw) % gw];
@@ -243,10 +269,15 @@ impl Qwen3_5VLModel {
     /// Forward pass for a vision-language prefill.
     ///
     /// `input_ids` already has `<|image_pad|>` placeholder tokens in place
-    /// (length = text tokens + sum of merged_image_tokens).
+    /// (length = text tokens + sum of `merged_image_tokens`).
     /// `pixel_values` / `image_grid_thw` come from the image preprocessor.
     /// Returns logits of shape `[B, V]` (last position only — matches the
     /// text-only forward contract).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vision or text forward pass fails, or if
+    /// building the position-ids tensor fails.
     pub fn forward(
         &mut self,
         input_ids: &Tensor,
@@ -267,16 +298,21 @@ impl Qwen3_5VLModel {
                 splice_image_features(input_ids, &hidden_states, &img_emb, self.image_token_id)?;
         }
 
-        let position_ids = if image_grid_thw.is_some() {
+        let position_ids = if let Some(grid_thw) = image_grid_thw {
             let ids: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-            let (pos, next) = self.build_position_ids(&ids, image_grid_thw.unwrap(), start_pos)?;
+            let (pos, next) = self.build_position_ids(&ids, grid_thw, start_pos)?;
             self.next_mrope_pos = next;
             pos
         } else {
+            // Sequence positions stay well under u32::MAX (bounded by
+            // max_position_embeddings, at most a few hundred thousand).
+            #[allow(clippy::cast_possible_truncation)]
             let flat: Vec<u32> = (0..seq_len)
-                .flat_map(|i| std::iter::repeat((start_pos + i) as u32).take(3))
+                .flat_map(|i| std::iter::repeat_n((start_pos + i) as u32, 3))
                 .collect();
-            self.next_mrope_pos = (start_pos + seq_len) as u32;
+            #[allow(clippy::cast_possible_truncation)]
+            let next_pos = (start_pos + seq_len) as u32;
+            self.next_mrope_pos = next_pos;
             Tensor::from_vec(flat, (3, seq_len), &self.device)?
         };
 
@@ -288,9 +324,13 @@ impl Qwen3_5VLModel {
     /// (`start_pos` is the absolute index of the new token, used for the cache
     /// offset). No image embeddings are needed — they're already in the cache.
     ///
-    /// The MRoPE position is *not* `start_pos`: image spans consume far fewer
+    /// The `MRoPE` position is *not* `start_pos`: image spans consume far fewer
     /// position slots than tokens, so the rope counter is tracked separately
     /// (seeded by the preceding [`Self::forward`]) and advanced by 1 here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text forward pass fails.
     pub fn decode_step(&mut self, token: u32, start_pos: usize) -> Result<Tensor> {
         let input = Tensor::from_vec(vec![token], (1usize, 1usize), &self.device)?;
         let hidden = self.text.embed_only(&input)?;
@@ -300,6 +340,10 @@ impl Qwen3_5VLModel {
         self.text.forward_embeds(&hidden, &pos, start_pos, None)
     }
 
+    /// # Panics
+    ///
+    /// Panics if resetting the GDN recurrent caches fails, which cannot
+    /// happen because it only clears in-memory state.
     pub fn clear_kv_cache(&mut self) {
         self.text.reset_gdn_caches().expect("GDN reset failed");
     }
@@ -352,6 +396,14 @@ impl Qwen3_5VLModel {
     /// is produced; pass `|_| {}` if you don't need streaming.
     ///
     /// This resets the KV cache, so each call is an independent single turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if image preprocessing, tokenization, or the forward/
+    /// decode passes fail.
+    // t/h/w are the grid's temporal/height/width dimensions, matching the
+    // THW terminology used throughout this module.
+    #[allow(clippy::many_single_char_names)]
     pub fn generate(
         &mut self,
         image: Option<&image::DynamicImage>,
@@ -367,6 +419,9 @@ impl Qwen3_5VLModel {
         let (pixel_values, grid_tensor, n_image_tokens) = match &processed {
             Some(p) => {
                 let (t, h, w) = p.grid_thw;
+                // merge_size is a tiny fixed ViT config knob (e.g. 2), never
+                // remotely close to u32::MAX.
+                #[allow(clippy::cast_possible_truncation)]
                 let merge = self.preprocessor.merge_size as u32;
                 let n = (t * (h / merge) * (w / merge)) as usize;
                 let grid = Tensor::from_vec(vec![t, h, w], (1usize, 3usize), &self.device)?;
@@ -384,8 +439,7 @@ impl Qwen3_5VLModel {
 
         let mut generated: Vec<u32> = Vec::with_capacity(cfg.max_new_tokens);
         let mut output_stream = TokenOutputStream::new(self.tokenizer.tokenizer.clone());
-        let mut cur_pos = input_ids.len();
-        for _ in 0..cfg.max_new_tokens {
+        for cur_pos in (input_ids.len()..).take(cfg.max_new_tokens) {
             let next = logits
                 .squeeze(0)?
                 .to_dtype(DType::F32)?
@@ -399,7 +453,6 @@ impl Qwen3_5VLModel {
             }
             generated.push(next);
             logits = self.decode_step(next, cur_pos)?;
-            cur_pos += 1;
         }
         if let Ok(Some(text)) = output_stream.decode_rest() {
             on_token(&text);
