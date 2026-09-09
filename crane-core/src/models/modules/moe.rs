@@ -345,8 +345,21 @@ impl SparseMoeBlock {
 }
 
 /// Narrow one expert's 2D weight out of a packed `[num_experts, out, in]` tensor.
+///
+/// Uses `force_contiguous` rather than `contiguous`: a `narrow(0, ..)` slice
+/// of an outer row-major tensor is already contiguous in the stride sense,
+/// so plain `contiguous()` short-circuits to `self.clone()` and keeps
+/// sharing the *entire* packed tensor's storage, just with a narrower
+/// `Layout` window on top. `Tensor::to_device` transfers the raw storage,
+/// not the logical view, so every later per-expert device transfer (e.g.
+/// `Qwen3Model::from_gguf`'s promotion pass) would re-upload the whole
+/// packed tensor instead of one expert's slice — 128x the intended
+/// transfer size and VRAM footprint per expert.
 fn slice_packed_expert(packed: &Tensor, expert_idx: usize) -> Result<Tensor> {
-    packed.narrow(0, expert_idx, 1)?.squeeze(0)?.contiguous()
+    packed
+        .narrow(0, expert_idx, 1)?
+        .squeeze(0)?
+        .force_contiguous()
 }
 
 impl Module for SparseMoeBlock {
