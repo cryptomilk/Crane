@@ -1382,10 +1382,17 @@ impl Qwen3Model {
                 }
             }
             let mask = Tensor::from_vec(mask_data, (seq_len, total_len), device)?;
+            // Multiply in F32, cast to `self.dtype` last: candle's affine op
+            // converts the -1e9 scalar to the tensor's own dtype *before*
+            // multiplying, so doing this in F16 turns -1e9 into literal
+            // -Inf and then corrupts every *unmasked* (0.0) position to NaN
+            // via 0.0 * -Inf. F32 keeps -1e9 finite through the multiply;
+            // only the final cast may turn masked positions into -Inf
+            // (which softmax handles correctly via max-subtraction).
             let mask = mask
                 .broadcast_lt(&Tensor::new(0.5f32, device)?)?
-                .to_dtype(self.dtype)?;
-            let mask = (mask * (-1e9f64))?;
+                .to_dtype(DType::F32)?;
+            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?)
         } else {
             None
@@ -2271,6 +2278,39 @@ mod tests {
 
         assert_eq!(out_a.dims(), out_b.dims());
         assert!(max_abs_diff(&out_a, &out_b) < 1e-5);
+    }
+
+    /// Regression test for the causal mask's additive penalty overflowing
+    /// F16: `b_sz > 1` forces `decode()`'s `broadcast_add` mask path (skips
+    /// the CPU/`b_sz==1` flash_attn fast path, which builds its mask via
+    /// `AttnMask::Causal` instead and never hits this code). In F16, naively
+    /// casting the boolean mask to F16 *before* multiplying by -1e9 makes
+    /// candle's affine op convert -1e9 to literal -Inf first, so every
+    /// *unmasked* (0.0) position computes `0.0 * -Inf = NaN`.
+    #[test]
+    fn test_prefill_batch_gt1_f16_mask_stays_finite() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F16, &device);
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        // b_sz=2, seq_len=3: not the b_sz==1 CPU fast path, so this hits
+        // decode()'s broadcast_add causal mask in F16.
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3], [4u32, 5, 6]], &device).expect("ids");
+        let logits = model.forward(&prefill_ids, 0).expect("prefill");
+
+        let values = logits
+            .to_dtype(DType::F32)
+            .expect("to_dtype")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "logits contain a non-finite value: {values:?}"
+        );
     }
 
     /// Chunked prefill (two smaller prefills) must produce the same decode

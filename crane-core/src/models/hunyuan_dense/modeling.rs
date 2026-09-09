@@ -1094,8 +1094,8 @@ impl HunYuanDenseV1 {
             // Convert: 0.0 (masked) -> -1e9, 1.0 (attend) -> 0.0
             let mask = mask
                 .broadcast_lt(&Tensor::new(0.5f32, input_ids.device())?)?
-                .to_dtype(self.dtype)?;
-            let mask = (mask * (-1e9f64))?;
+                .to_dtype(DType::F32)?;
+            let mask = (mask * (-1e9f64))?.to_dtype(self.dtype)?;
             Some(mask.unsqueeze(0)?.unsqueeze(0)?) // [1, 1, seq_len, total_len]
         } else {
             None
