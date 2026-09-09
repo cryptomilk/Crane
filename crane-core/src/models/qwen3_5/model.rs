@@ -742,9 +742,7 @@ impl Model {
     /// a sibling `tokenizer.json` is only consulted if the GGUF lacks the
     /// embedded metadata (older / third-party quantizers).
     fn from_gguf_file(model_path: &str, device: &Device) -> Result<Self> {
-        use crate::utils::tokenizer_utils::{
-            build_tokenizer_from_gguf_path, gguf_has_embedded_tokenizer,
-        };
+        use crate::utils::tokenizer_utils::resolve_gguf_tokenizer;
 
         let gguf_path = std::path::Path::new(model_path);
         let parent = gguf_path.parent().unwrap_or(gguf_path);
@@ -758,28 +756,7 @@ impl Model {
             ct.metadata.len()
         );
 
-        // Prefer the embedded tokenizer; fall back to a sibling tokenizer.json
-        // only when the GGUF lacks the necessary metadata.
-        let tokenizer = if gguf_has_embedded_tokenizer(&ct) {
-            build_tokenizer_from_gguf_path(gguf_path)?.ok_or_else(|| {
-                anyhow::anyhow!("GGUF reports embedded tokenizer but build returned None")
-            })?
-        } else {
-            let tokenizer_path = parent.join("tokenizer.json");
-            if !tokenizer_path.exists() {
-                anyhow::bail!(
-                    "GGUF lacks `tokenizer.ggml.tokens`/`merges` metadata and no sibling \
-                     tokenizer.json was found at {}. Re-export the model with a current \
-                     llama.cpp to get the embedded tokenizer.",
-                    tokenizer_path.display()
-                );
-            }
-            eprintln!(
-                "[qwen3_5] GGUF has no embedded tokenizer; falling back to {}",
-                tokenizer_path.display()
-            );
-            Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?
-        };
+        let tokenizer = resolve_gguf_tokenizer(&ct, gguf_path)?;
 
         // EOS: sibling generation_config.json wins (may hold the full multi-id
         // set); fall back to the single id in GGUF metadata, then fill in any

@@ -18,6 +18,7 @@ use super::modeling::{Gemma4Config, Gemma4Model};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
+use crate::utils::tokenizer_utils;
 use crate::utils::utils;
 
 /// Format of model weights on disk.
@@ -112,32 +113,6 @@ impl Model {
     fn from_gguf(model_path: &str, device: &Device) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
 
-        let tokenizer_path = {
-            let same_dir = gguf_path
-                .parent()
-                .unwrap_or(gguf_path)
-                .join("tokenizer.json");
-            if same_dir.exists() {
-                same_dir
-            } else {
-                let parent = gguf_path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .unwrap_or(gguf_path)
-                    .join("tokenizer.json");
-                if parent.exists() {
-                    parent
-                } else {
-                    anyhow::bail!(
-                        "Cannot find tokenizer.json near {}. \
-                         Place tokenizer.json in the same directory as the GGUF file.",
-                        gguf_path.display()
-                    );
-                }
-            }
-        };
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
-
         let mut file = std::fs::File::open(gguf_path)?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
 
@@ -146,6 +121,8 @@ impl Model {
             ct.tensor_infos.len(),
             ct.metadata.len(),
         );
+
+        let tokenizer = tokenizer_utils::resolve_gguf_tokenizer(&ct, gguf_path)?;
 
         let inner = Gemma4Model::from_gguf(ct, &mut file, device)?;
         let dtype = inner.model_dtype();
