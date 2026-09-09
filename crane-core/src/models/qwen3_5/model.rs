@@ -95,7 +95,7 @@ impl Qwen3_5TextModel {
         let norm = Qwen35RmsNorm::load(
             text_cfg.hidden_size,
             text_cfg.rms_norm_eps,
-            vb_lm.pp("norm"),
+            &vb_lm.pp("norm"),
         )?;
 
         // Resolve the output projection. With `tie_word_embeddings: true`
