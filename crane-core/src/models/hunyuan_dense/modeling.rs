@@ -723,7 +723,7 @@ impl HunYuanDenseV1 {
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
         let lm_head = if config.tie_word_embeddings {
-            embed_tokens.tied_output()?
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -871,9 +871,9 @@ impl HunYuanDenseV1 {
         // Final norm
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
-        // LM head (may be tied to embeddings)
+        // LM head (may be tied to embeddings).
         let lm_head = if tie_word_embeddings {
-            embed_tokens.tied_output()?
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             gg.linear("output.weight")?
         };
@@ -977,7 +977,7 @@ impl HunYuanDenseV1 {
         let hidden_states = self.norm.forward(&hidden_states)?;
         let logits = self
             .lm_head
-            .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
     }
 
@@ -1177,7 +1177,7 @@ impl HunYuanDenseV1 {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+        self.lm_head.forward_logits(&hidden_states) // [N, 1, vocab]
     }
 
     /// Extract per-sequence KV caches from the batched state, removing padding.
