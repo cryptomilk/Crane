@@ -163,15 +163,18 @@ fn default_true() -> bool {
 }
 
 impl Config {
+    #[must_use]
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    #[must_use]
     pub fn attention_bias(&self) -> bool {
         self.attention_bias.unwrap_or(false)
     }
 
+    #[must_use]
     pub fn rope_theta(&self) -> f64 {
         self.rope_theta.unwrap_or(10000.0)
     }
@@ -1076,6 +1079,7 @@ impl HunYuanDenseV1 {
 
     /// Compute the total bytes held by the model's KV caches without any
     /// GPU copies. Uses `elem_count()` which is pure arithmetic on dims.
+    #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
@@ -1094,6 +1098,7 @@ impl HunYuanDenseV1 {
     }
 
     /// Number of transformer layers.
+    #[must_use]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -1104,6 +1109,7 @@ impl HunYuanDenseV1 {
     /// that need to free the buffer (e.g. batch-decode extract) should use
     /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
     /// consuming the views.
+    #[must_use]
     pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers
             .iter()
@@ -1323,11 +1329,13 @@ impl HunYuanDenseV1 {
     }
 
     /// Access the model config.
+    #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
     /// Access the model dtype.
+    #[must_use]
     pub fn model_dtype(&self) -> DType {
         self.dtype
     }
