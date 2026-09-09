@@ -293,6 +293,24 @@ impl SparseMoeBlock {
         if self.expert_device.location() == device.location() {
             return Ok(());
         }
+        match batched_promote(&self.experts, device, dtype) {
+            Ok(Some(moved)) => {
+                self.experts = moved;
+                self.expert_device = device.clone();
+                return Ok(());
+            },
+            Ok(None) => {},
+            Err(err) => {
+                if let Some((free, mem_total)) = query_gpu_memory(device) {
+                    log::warn!(
+                        "batched promotion to {:?} failed, falling back to per-expert: free={}, total={}, err={err}",
+                        device.location(),
+                        format_budget(free),
+                        format_budget(mem_total),
+                    );
+                }
+            },
+        }
         // Collect into a new Vec first and only commit on full success: if
         // e.g. expert 50 of 128 fails (an out-of-memory device transfer),
         // an in-place per-expert overwrite would leave `self.experts` with
@@ -360,6 +378,99 @@ fn slice_packed_expert(packed: &Tensor, expert_idx: usize) -> Result<Tensor> {
         .narrow(0, expert_idx, 1)?
         .squeeze(0)?
         .force_contiguous()
+}
+
+/// Narrows one expert's view out of an already-promoted, single-owner
+/// `[num_experts, out, in]` tensor, without forcing a copy.
+///
+/// Unlike [`slice_packed_expert`], the source here (`batched_promote`'s
+/// freshly-transferred `gate_all`/`up_all`/`down_all`) is never handed to
+/// another `to_device` call, so sharing storage across all `num_experts`
+/// views back into one buffer is safe and avoids re-introducing the
+/// exact per-allocation overhead `batched_promote` exists to eliminate.
+fn narrow_packed_expert(packed: &Tensor, expert_idx: usize) -> Result<Tensor> {
+    packed.narrow(0, expert_idx, 1)?.squeeze(0)
+}
+
+/// Stacks `experts`' projection selected by `proj` into one
+/// `[num_experts, out, in]` tensor and transfers it to `device` in `dtype`
+/// with a single allocation.
+///
+/// Returns `Ok(None)` if any expert's projection isn't a bias-free
+/// `Standard` layer (the per-expert GGUF layout keeps `Quantized` layers,
+/// which can't be stacked this way). `Tensor::stack` builds the stacked
+/// tensor on the experts' current device before `to_device` transfers it,
+/// so this transiently doubles host-side memory for the stacked
+/// projection's size when promoting from CPU.
+fn stack_projection(
+    experts: &[MoeExpert],
+    device: &Device,
+    dtype: DType,
+    proj: impl Fn(&MoeExpert) -> &LinearLayer,
+) -> Result<Option<Tensor>> {
+    let mut weights = Vec::with_capacity(experts.len());
+    for expert in experts {
+        match proj(expert) {
+            LinearLayer::Standard(l) if l.bias().is_none() => weights.push(l.weight()),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(
+        Tensor::stack(&weights, 0)?
+            .to_device(device)?
+            .to_dtype(dtype)?,
+    ))
+}
+
+/// Attempts single-shot batched promotion of `experts` to `device` in
+/// `dtype`: all experts' same projection stacked into one tensor and
+/// transferred with one device allocation per projection (3 total)
+/// instead of one per expert projection (`3 * experts.len()`).
+///
+/// Exists because transferring `3 * num_experts` small tensors
+/// individually (`SparseMoeBlock::promote_experts_to`'s per-expert
+/// fallback loop below) measured a fixed ~1MB overhead per allocation on
+/// ROCm — ~0.4G of pure overhead on top of the tensors' actual combined
+/// size for a 128-expert layer. Returns `Ok(None)` (fall back to the
+/// per-expert loop) if any projection isn't stackable, i.e. the
+/// checkpoint uses the per-expert (still-quantized) GGUF layout rather
+/// than the packed one, or if `experts` is empty.
+fn batched_promote(
+    experts: &[MoeExpert],
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Vec<MoeExpert>>> {
+    if experts.is_empty() {
+        return Ok(None);
+    }
+    let Some(gate_all) = stack_projection(experts, device, dtype, |e| &e.gate_proj)? else {
+        return Ok(None);
+    };
+    let Some(up_all) = stack_projection(experts, device, dtype, |e| &e.up_proj)? else {
+        return Ok(None);
+    };
+    let Some(down_all) = stack_projection(experts, device, dtype, |e| &e.down_proj)? else {
+        return Ok(None);
+    };
+    if let Some((free, mem_total)) = query_gpu_memory(device) {
+        log::debug!(
+            "batched promotion to {:?}: {} experts transferred in 3 allocations, free={}, total={}",
+            device.location(),
+            experts.len(),
+            format_budget(free),
+            format_budget(mem_total),
+        );
+    }
+    (0..experts.len())
+        .map(|i| {
+            Ok(MoeExpert::from_layers(
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&gate_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&up_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&down_all, i)?, None)),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 impl Module for SparseMoeBlock {
@@ -857,6 +968,103 @@ mod tests {
             before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
         );
+    }
+
+    // Verifies `batched_promote`'s stack-transfer-narrow path preserves
+    // each expert's distinct forward-pass output and index order (CPU->CPU
+    // here, same constructibility limitation as `promote_experts_to_*`
+    // above). Each expert's `up_proj` is scaled differently so a bug that
+    // mixed up narrowed slices across experts would be caught.
+    #[test]
+    fn batched_promote_preserves_per_expert_output_and_order() {
+        let hidden = 2;
+        let intermediate = 2;
+        let identity = vec![1.0f32, 0.0, 0.0, 1.0];
+        let scaled = |c: f32| vec![c, 0.0, 0.0, c];
+        let experts: Vec<MoeExpert> = (0..3)
+            .map(|i| {
+                let vb = make_vb(
+                    hidden,
+                    intermediate,
+                    identity.clone(),
+                    scaled((i + 1) as f32),
+                    identity.clone(),
+                );
+                MoeExpert::new(hidden, intermediate, vb).expect("new")
+            })
+            .collect();
+
+        let promoted = batched_promote(&experts, &Device::Cpu, DType::F32)
+            .expect("batched_promote")
+            .expect("packed-style experts should take the batched path");
+        assert_eq!(promoted.len(), 3);
+
+        let x = Tensor::new(&[1.0f32, 0.5], &Device::Cpu)
+            .expect("tensor")
+            .reshape((1, 2))
+            .expect("reshape");
+        for (i, expert) in promoted.iter().enumerate() {
+            let got = expert
+                .forward(&x)
+                .expect("forward")
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let scale = (i + 1) as f32;
+            let silu = |v: f32| v / (1.0 + (-v).exp());
+            // gate = identity(x) = x; up = scale * x; down = identity, so
+            // output = silu(x) * (scale * x) elementwise.
+            let expected = [silu(1.0f32) * scale * 1.0, silu(0.5f32) * scale * 0.5];
+            for (g, e) in got.iter().zip(expected.iter()) {
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "expert {i}: got {got:?}, expected {expected:?}"
+                );
+            }
+        }
+    }
+
+    // Verifies the per-expert quantized GGUF layout (which can't be stacked
+    // into one tensor) makes `batched_promote` decline rather than silently
+    // dropping data, so `promote_experts_to` falls back to its per-expert
+    // loop instead.
+    #[test]
+    fn batched_promote_declines_quantized_experts() {
+        use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+        use std::sync::Arc;
+
+        let weight = Tensor::from_vec(vec![1.0f32; 4], (2, 2), &Device::Cpu).unwrap();
+        let qt = QTensor::quantize(&weight, GgmlDType::F32).unwrap();
+        let quantized = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(qt)).unwrap());
+        let expert = MoeExpert::from_layers(
+            quantized,
+            LinearLayer::Standard(Linear::new(weight.clone(), None)),
+            LinearLayer::Standard(Linear::new(weight, None)),
+        );
+
+        let result = batched_promote(std::slice::from_ref(&expert), &Device::Cpu, DType::F32)
+            .expect("batched_promote should not error, just decline");
+        assert!(result.is_none());
+    }
+
+    // Verifies a bias-present `Standard` layer (distinct from the
+    // `Quantized`-variant decline above) also makes `batched_promote`
+    // decline rather than silently dropping the bias.
+    #[test]
+    fn batched_promote_declines_biased_experts() {
+        let weight = Tensor::from_vec(vec![1.0f32; 4], (2, 2), &Device::Cpu).unwrap();
+        let bias = Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap();
+        let biased = LinearLayer::Standard(Linear::new(weight.clone(), Some(bias)));
+        let expert = MoeExpert::from_layers(
+            biased,
+            LinearLayer::Standard(Linear::new(weight.clone(), None)),
+            LinearLayer::Standard(Linear::new(weight, None)),
+        );
+
+        let result = batched_promote(std::slice::from_ref(&expert), &Device::Cpu, DType::F32)
+            .expect("batched_promote should not error, just decline");
+        assert!(result.is_none());
     }
 
     #[test]
