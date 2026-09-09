@@ -131,7 +131,18 @@ impl Qwen3_5TextModel {
         // overhead. Quantize only a dedicated (untied) output projection.
         let lm_head = match quant {
             Some(dt) if !is_tied => quantize_linear(Linear::new(lm_head_raw, None), dt)?,
-            _ => LinearLayer::Standard(Linear::new(lm_head_raw, None)),
+            _ => {
+                // Pre-store in F32 only when the compute dtype is F16: at
+                // this model's 248k vocab, raw logits overflow F16's 65504
+                // max even more readily than smaller-vocab models (see
+                // `forward_logits`). BF16/F32 stay native.
+                let w = if dtype == DType::F16 {
+                    lm_head_raw.to_dtype(DType::F32)?
+                } else {
+                    lm_head_raw
+                };
+                LinearLayer::Standard(Linear::new(w, None))
+            },
         };
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
@@ -320,7 +331,17 @@ impl Qwen3_5TextModel {
         let lm_head = if tie_word_embeddings {
             // Tied: the output projection is this very table, so it reuses the
             // same buffer rather than materializing a dense copy.
-            embed_tokens.tied_output()?
+            let tied = embed_tokens.tied_output()?;
+            // Pre-store a `Standard` tied head as F32 only for F16, same
+            // overflow reasoning as the safetensors path above. A
+            // `Quantized` table already computes in F32 internally via
+            // QMatMul, so it needs no change.
+            match tied {
+                LinearLayer::Standard(l) if dtype == DType::F16 => {
+                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
+                },
+                other => other,
+            }
         } else {
             gg.linear("output.weight")?
         };
@@ -547,7 +568,7 @@ impl Qwen3_5TextModel {
         crate::ops::prof::timed(crate::ops::prof::Span::Head, || {
             let (b, _s, _h) = hidden.dims3()?;
             let xs = self.norm.forward(hidden)?.reshape((b, ()))?;
-            Ok(self.lm_head.forward(&xs)?)
+            Ok(self.lm_head.forward_logits(&xs)?)
         })
     }
 }
