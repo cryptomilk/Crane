@@ -858,8 +858,20 @@ impl HunYuanDenseV1 {
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
+        // Tied embeddings are pre-stored in F32 only when the compute dtype
+        // is F16, to avoid overflowing F16's 65504 max on the vocab-sized
+        // `lm_head` projection (see `forward_logits`). BF16/F32 stay native
+        // since they share F32's exponent range and can't overflow.
+        let lm_head_dtype = if dtype == DType::F16 {
+            DType::F32
+        } else {
+            dtype
+        };
         let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            LinearLayer::Standard(Linear::new(
+                embed_tokens.embeddings().to_dtype(lm_head_dtype)?,
+                None,
+            ))
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -1007,9 +1019,19 @@ impl HunYuanDenseV1 {
         // Final norm
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
-        // LM head (may be tied to embeddings)
+        // LM head (may be tied to embeddings). Tied path pre-stored in F32
+        // only for F16, same reasoning as the safetensors path above. The
+        // untied `Quantized` path already computes in F32 internally.
         let lm_head = if tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            let lm_head_dtype = if dtype == DType::F16 {
+                DType::F32
+            } else {
+                dtype
+            };
+            LinearLayer::Standard(Linear::new(
+                embed_tokens.embeddings().to_dtype(lm_head_dtype)?,
+                None,
+            ))
         } else {
             gg.linear("output.weight")?
         };
@@ -1113,7 +1135,7 @@ impl HunYuanDenseV1 {
         let hidden_states = self.norm.forward(&hidden_states)?;
         let logits = self
             .lm_head
-            .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
     }
 
@@ -1313,7 +1335,7 @@ impl HunYuanDenseV1 {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+        self.lm_head.forward_logits(&hidden_states) // [N, 1, vocab]
     }
 
     /// Extract per-sequence KV caches from the batched state, removing padding.

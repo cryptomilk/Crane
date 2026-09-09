@@ -993,14 +993,30 @@ impl Qwen3Model {
         let norm =
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
-        let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+        // Pre-stored in F32 only when the compute dtype is F16: raw logits
+        // over a 100k+ vocab routinely exceed F16's 65504 max, and
+        // pre-converting avoids a per-token cast of the weight at the
+        // `LinearLayer::forward_logits` call site. BF16/F32 share F32's
+        // exponent range and can't overflow, so they stay native -- BF16 in
+        // particular must stay BF16 for the CUDA `gpu_argmax` sampling fast
+        // path, which only accepts BF16 logits.
+        let lm_head_dtype = if dtype == DType::F16 {
+            DType::F32
         } else {
-            LinearLayer::Standard(linear_no_bias(
-                config.hidden_size,
-                config.vocab_size,
-                root_vb.pp("lm_head"),
-            )?)
+            dtype
+        };
+        let lm_head = if config.tie_word_embeddings {
+            LinearLayer::Standard(Linear::new(
+                embed_tokens.embeddings().to_dtype(lm_head_dtype)?,
+                None,
+            ))
+        } else {
+            LinearLayer::Standard(Linear::new(
+                linear_no_bias(config.hidden_size, config.vocab_size, root_vb.pp("lm_head"))?
+                    .weight()
+                    .to_dtype(lm_head_dtype)?,
+                None,
+            ))
         };
 
         let rotary_emb = RotaryEmbedding::new(
@@ -1257,8 +1273,19 @@ impl Qwen3Model {
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
+        // Tied path pre-stored in F32 only for F16, same reasoning as the
+        // safetensors path above. The untied `Quantized` path already
+        // computes in F32 internally, so it needs no change here.
         let lm_head = if tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            let lm_head_dtype = if dtype == DType::F16 {
+                DType::F32
+            } else {
+                dtype
+            };
+            LinearLayer::Standard(Linear::new(
+                embed_tokens.embeddings().to_dtype(lm_head_dtype)?,
+                None,
+            ))
         } else {
             gg.linear("output.weight")?
         };
@@ -1379,7 +1406,7 @@ impl Qwen3Model {
         self.last_hidden_states = Some(hidden_states.clone());
         let logits = self
             .lm_head
-            .forward(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
         Ok(logits)
     }
 
@@ -1578,7 +1605,7 @@ impl Qwen3Model {
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
-        self.lm_head.forward(&hidden_states) // [N, 1, vocab]
+        self.lm_head.forward_logits(&hidden_states) // [N, 1, vocab]
     }
 
     /// Extract per-sequence KV caches from batched state.
