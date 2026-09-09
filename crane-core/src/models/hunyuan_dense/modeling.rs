@@ -884,7 +884,7 @@ impl HunYuanDenseV1 {
             .metadata()
             .get("general.architecture")
             .and_then(|v| v.to_string().ok())
-            .map(|s| s.clone())
+            .cloned()
             .unwrap_or_else(|| "qwen2".to_string());
 
         let num_attention_heads =
@@ -903,16 +903,18 @@ impl HunYuanDenseV1 {
             .get(&format!("{arch}.context_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(32768) as usize;
-        let rms_norm_eps = gg
-            .metadata()
-            .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(1e-6) as f64;
-        let rope_theta = gg
-            .metadata()
-            .get(&format!("{arch}.rope.freq_base"))
-            .and_then(|v| v.to_f32().ok())
-            .unwrap_or(10_000.0) as f64;
+        let rms_norm_eps = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(1e-6),
+        );
+        let rope_theta = f64::from(
+            gg.metadata()
+                .get(&format!("{arch}.rope.freq_base"))
+                .and_then(|v| v.to_f32().ok())
+                .unwrap_or(10_000.0),
+        );
 
         // Check for QK norm by probing tensor existence
         let use_qk_norm = gg.ct.tensor_infos.contains_key("blk.0.attn_q_norm.weight");
@@ -1071,7 +1073,7 @@ impl HunYuanDenseV1 {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
         // rotary_emb tables are static and reusable — do not clear.
@@ -1084,15 +1086,11 @@ impl HunYuanDenseV1 {
         self.layers
             .iter()
             .map(|l| {
-                l.self_attn
-                    .kv_cache
-                    .as_ref()
-                    .map(|(k, v)| {
-                        let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                        let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                        k_bytes + v_bytes
-                    })
-                    .unwrap_or(0)
+                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
+                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
+                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
+                    k_bytes + v_bytes
+                })
             })
             .sum()
     }
@@ -1132,11 +1130,8 @@ impl HunYuanDenseV1 {
     /// Restore per-layer KV caches (e.g. after swapping sequences).
     /// The tensors are stored as-is; `cache_seq_len` is set to their dim(2).
     pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        for (layer, cache) in self.layers.iter_mut().zip(caches.into_iter()) {
-            let seq_len = cache
-                .as_ref()
-                .map(|(k, _)| k.dim(2).unwrap_or(0))
-                .unwrap_or(0);
+        for (layer, cache) in self.layers.iter_mut().zip(caches) {
+            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
             layer.self_attn.kv_cache = cache;
             layer.self_attn.cache_seq_len = seq_len;
         }
@@ -1173,8 +1168,7 @@ impl HunYuanDenseV1 {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map(|(k, _)| k.dim(2).unwrap_or(0))
-                    .unwrap_or(0)
+                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
@@ -1264,7 +1258,7 @@ impl HunYuanDenseV1 {
         let _ = batch_kv_info;
 
         let mut hidden_states = hidden_states;
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask, None)?;
         }
 
@@ -1297,7 +1291,7 @@ impl HunYuanDenseV1 {
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
 
-        for layer in self.layers.iter_mut() {
+        for layer in &mut self.layers {
             if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
@@ -1317,8 +1311,8 @@ impl HunYuanDenseV1 {
                     result[i].push(clean);
                 }
             } else {
-                for i in 0..n_seqs {
-                    result[i].push(None);
+                for row in &mut result {
+                    row.push(None);
                 }
             }
             layer.self_attn.kv_cache = None;
@@ -1423,8 +1417,8 @@ fn pad_and_stack_kv_caches(
                     // appended after max_kv form a contiguous valid range with
                     // the pre-existing data, enabling flash_attn_varlen.
                     let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k.as_ref()], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v.as_ref()], 2)?);
+                    padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
+                    padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
                 } else {
                     padded_ks.push(k.clone());
                     padded_vs.push(v.clone());
