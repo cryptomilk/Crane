@@ -1,4 +1,4 @@
-//! Conv3dConfig assuming a temporal patch size of 2
+//! `Conv3dConfig` assuming a temporal patch size of 2
 
 use candle_core::{IndexOp, Module, Result, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, VarBuilder};
@@ -33,7 +33,7 @@ impl Conv3dNoBias {
         out_channels: usize,
         kernel_sizes: [usize; 3],
         cfg: Conv3dConfig,
-        vb: VarBuilder,
+        vb: &VarBuilder,
     ) -> Result<Self> {
         let ws = vb.get(
             (
