@@ -17,7 +17,7 @@ pub struct Gguf<R: Read + Seek> {
     device: Device,
     /// Target compute dtype. Dequantized tensors (norms, embeddings) are
     /// cast to this dtype so they match the activations flowing through the
-    /// model (e.g. BF16 on CUDA). Quantized linear layers (QMatMul) handle
+    /// model (e.g. BF16 on CUDA). Quantized linear layers (`QMatMul`) handle
     /// their own internal dtype and the `LinearLayer` wrapper casts their
     /// output to the input's dtype.
     dtype: DType,
@@ -33,15 +33,23 @@ impl<R: Read + Seek> Gguf<R> {
         }
     }
 
-    /// Load a quantized tensor and wrap as a LinearLayer (QMatMul).
+    /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn linear(&mut self, name: &str) -> Result<LinearLayer> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(LinearLayer::Quantized(qmm))
     }
 
-    /// Load a tensor, dequantize, and create an RmsNorm.
+    /// Load a tensor, dequantize, and create an `RmsNorm`.
     /// The weight is cast to the target `dtype` so it matches activations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
@@ -52,7 +60,11 @@ impl<R: Read + Seek> Gguf<R> {
     /// only the rows a forward pass gathers.
     ///
     /// Prefer this over [`Self::embedding`] for large vocabularies: a 248k-row
-    /// table costs ~2.4 GiB dense in BF16 versus ~0.7 GiB as Q4_K.
+    /// table costs ~2.4 GiB dense in BF16 versus ~0.7 GiB as `Q4_K`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn quantized_embedding(
         &mut self,
         name: &str,
@@ -65,19 +77,31 @@ impl<R: Read + Seek> Gguf<R> {
     /// Load a tensor, dequantize, and create an Embedding.
     /// The weight is cast to the target `dtype` so lookups produce
     /// tensors in the expected compute precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(candle_nn::Embedding::new(weight, hidden_size))
     }
 
-    /// Load a raw QTensor by name.
+    /// Load a raw `QTensor` by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing.
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 
     /// Load a tensor, dequantize, and cast to the target compute dtype.
     /// For small full-precision tensors (norm weights, biases, conv kernels).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing or malformed.
     pub fn dequant_tensor(&mut self, name: &str) -> Result<Tensor> {
         let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
         ws.dequantize(&self.device)?.to_dtype(self.dtype)
@@ -181,7 +205,7 @@ struct Attention {
     k_proj: LinearLayer,
     v_proj: LinearLayer,
     o_proj: LinearLayer,
-    /// Merged QKV weight [q_dim + 2*kv_dim, hidden_size] — one gemv instead of 3.
+    /// Merged QKV weight [`q_dim` + 2*`kv_dim`, `hidden_size`] — one gemv instead of 3.
     /// Only set for Standard (non-quantized) weights.
     qkv_proj: Option<Linear>,
     query_layernorm: Option<RmsNorm>,
@@ -359,7 +383,7 @@ impl Attention {
     ///
     /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
     /// Falls back to cat + reallocate when the buffer is full.
-    /// Returns (k_full, v_full) views covering all valid cached data.
+    /// Returns (`k_full`, `v_full`) views covering all valid cached data.
     fn update_kv_cache(&mut self, k: Tensor, v: Tensor) -> Result<(Tensor, Tensor)> {
         // slice_set requires contiguous tensors; K/V after transpose(1,2) are strided.
         let k = k.contiguous()?;
@@ -764,6 +788,10 @@ pub struct HunYuanDenseV1 {
 }
 
 impl HunYuanDenseV1 {
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
     pub fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let dtype = vb.dtype();
         let model_vb = vb.pp("model");
@@ -823,8 +851,12 @@ impl HunYuanDenseV1 {
     }
 
     /// Construct from a GGUF file. Reads config from GGUF metadata and loads
-    /// all weights as quantized tensors (QMatMul for linear layers, dequantized
+    /// all weights as quantized tensors (`QMatMul` for linear layers, dequantized
     /// for embeddings and norms).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required GGUF metadata or tensors are missing or malformed.
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
@@ -950,6 +982,15 @@ impl HunYuanDenseV1 {
         })
     }
 
+    /// # Panics
+    ///
+    /// Panics if narrowing an anchor layer's KV cache to its valid length
+    /// fails, which cannot happen because `cache_seq_len` is always within
+    /// the cache tensor's bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward(&mut self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor> {
         // Disable per-tensor CUDA event tracking — Crane uses a single stream.
         #[cfg(feature = "cuda")]
@@ -1106,6 +1147,10 @@ impl HunYuanDenseV1 {
     /// then `extract_batch_kv` to get clean per-sequence caches back.
     /// `extra_room`: number of decode tokens to pre-allocate in the buffer
     /// (avoids `Tensor::cat` reallocation during multi-round decode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -1181,6 +1226,10 @@ impl HunYuanDenseV1 {
     ///
     /// # Returns
     /// Logits tensor `[N, 1, vocab_size]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         input_ids: &Tensor,
@@ -1226,6 +1275,10 @@ impl HunYuanDenseV1 {
     /// - `kv_lens` — original per-sequence KV lengths (from `setup_batch_decode`)
     /// - `original_max_kv` — max KV length at setup time (from `setup_batch_decode`)
     /// - `rounds_done` — number of `step_batch_decode` calls completed
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if extracting the KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
@@ -1286,6 +1339,10 @@ impl HunYuanDenseV1 {
 /// Positions before `kv_lens[i]` and after `original_max_kv` are 0.0 (attend).
 ///
 /// Returns `None` if no padding exists (all sequences have the same KV length).
+///
+/// # Errors
+///
+/// Returns an error if building the mask tensor fails.
 pub fn build_batch_decode_mask(
     kv_lens: &[usize],
     original_max_kv: usize,

@@ -25,7 +25,7 @@ use crate::utils::utils;
 pub enum ModelFormat {
     /// Auto-detect from path (default).
     Auto,
-    /// Standard HuggingFace safetensors.
+    /// Standard `HuggingFace` safetensors.
     Safetensors,
     /// GGUF quantized format.
     Gguf,
@@ -39,10 +39,16 @@ pub struct Model {
 }
 
 impl Model {
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new(model_path: &str, device: &Device, dtype: &DType) -> Result<Self> {
         Self::new_with_format(model_path, device, dtype, ModelFormat::Auto)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the model or tokenizer cannot be loaded from `model_path`.
     pub fn new_with_format(
         model_path: &str,
         device: &Device,
@@ -160,6 +166,9 @@ impl Model {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_inputs(&self, inputs: &str) -> Result<Vec<u32>> {
         let input_ids = self
             .tokenizer
@@ -184,12 +193,20 @@ impl Model {
     }
 
     /// Tokenize a user message with the Hunyuan chat template applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization fails.
     pub fn prepare_chat(&self, user_message: &str) -> Result<Vec<u32>> {
         let formatted = self.format_chat(user_message);
         self.prepare_inputs(&formatted)
     }
 
     /// Run a single forward step, returning raw logits. Caller manages KV cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn forward_step(
         &mut self,
         input_ids: &[u32],
@@ -206,6 +223,10 @@ impl Model {
     ///
     /// `extra_room`: number of decode tokens to pre-allocate in the KV buffer
     /// (avoids `Tensor::cat` reallocation during multi-round decode).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if padding or stacking the KV caches fails.
     pub fn setup_batch_decode(
         &mut self,
         seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
@@ -218,6 +239,10 @@ impl Model {
     ///
     /// Builds the `[N, 1]` input tensor from `tokens` (one per sequence).
     /// Returns logits `[N, 1, vocab]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode(
         &mut self,
         tokens: &[u32],
@@ -231,6 +256,9 @@ impl Model {
             .step_batch_decode(&input, positions, attention_mask, batch_kv_info)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the forward pass fails.
     pub fn step_batch_decode_with_input_ids(
         &mut self,
         input_ids: &Tensor,
@@ -244,6 +272,10 @@ impl Model {
 
     /// Extract per-sequence KV caches from the model's batched state,
     /// removing padding. Clears model KV cache afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if extracting the KV caches fails.
     pub fn extract_batch_kv(
         &mut self,
         kv_lens: &[usize],
