@@ -41,10 +41,13 @@ use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::attention::AttnMask;
 use candle_nn::rotary_emb::rope_thd;
 use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
+use ribo::utils::log;
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
-use crate::device::{DeviceAssignment, GpuBudget, WeightBudget, format_budget};
+use crate::device::{
+    DeviceAssignment, GpuBudget, WeightBudget, format_budget, greedy_fit_layers, query_gpu_memory,
+};
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
@@ -894,7 +897,10 @@ fn expert_tensor_layer(name: &str) -> Option<usize> {
 /// Packed experts are dequantized to `compute_dtype_bytes` up front (see
 /// [`SparseMoeBlock::new_from_gguf`]'s doc comment on `load_packed_experts`),
 /// so their cost is the dequantized size, not the on-disk quantized size.
-/// Per-expert tensors stay quantized, so their cost is the on-disk size.
+/// Per-expert tensors are loaded quantized but are also dequantized to
+/// `compute_dtype_bytes` on promotion (see `LinearLayer::to_device`), so
+/// their cost estimate uses the same dequantized size, not the smaller
+/// on-disk quantized size.
 fn estimate_expert_layer_vram(
     tensor_infos: &std::collections::HashMap<String, gguf_file::TensorInfo>,
     layer_idx: usize,
@@ -917,7 +923,7 @@ fn estimate_expert_layer_vram(
             .filter(|(name, _)| {
                 is_expert_tensor(name) && expert_tensor_layer(name) == Some(layer_idx)
             })
-            .map(|(_, info)| gguf_tensor_bytes(info))
+            .map(|(_, info)| info.shape.elem_count() as u64 * compute_dtype_bytes as u64)
             .sum()
     }
 }
@@ -1155,109 +1161,24 @@ impl Qwen3Model {
         // Non-expert weights (attention, norms, embeddings, router) always
         // load to `devices.main`; only MoE expert weights are considered
         // for offloading to `Device::Cpu`, based on `gpu_budget`.
-        let expert_devices: Vec<Device> = {
-            let is_moe = config.num_experts.is_some_and(|n| n > 0);
-            if !is_moe {
-                vec![devices.main.clone(); num_hidden_layers]
-            } else if gpu_budget.offload_all_experts {
-                eprintln!("--offload-experts: all MoE expert layers -> CPU");
-                vec![Device::Cpu; num_hidden_layers]
-            } else {
-                match gpu_budget.weight_budget {
-                    WeightBudget::NoGpu | WeightBudget::Unlimited => {
-                        vec![devices.main.clone(); num_hidden_layers]
-                    },
-                    WeightBudget::Limited(total_vram) => {
-                        let runtime_reserved = gpu_budget.runtime_reservation_bytes(
-                            num_hidden_layers,
-                            num_kv_heads,
-                            head_dim,
-                            dtype.size_in_bytes(),
-                        );
-                        // `token_embd.weight` is dequantized by
-                        // `gg.embedding()` above, so its VRAM cost is its
-                        // dequantized size, not its on-disk quantized size
-                        // like every other non-expert tensor.
-                        let non_expert_bytes: u64 = gg
-                            .ct
-                            .tensor_infos
-                            .iter()
-                            .filter(|(name, _)| {
-                                name.as_str() != "token_embd.weight" && !is_expert_tensor(name)
-                            })
-                            .map(|(_, info)| gguf_tensor_bytes(info))
-                            .sum::<u64>()
-                            + gg.ct
-                                .tensor_infos
-                                .get("token_embd.weight")
-                                .map_or(0, |info| {
-                                    info.shape.elem_count() as u64 * dtype.size_in_bytes() as u64
-                                });
-
-                        let weight_budget = total_vram.saturating_sub(runtime_reserved);
-                        let expert_budget = weight_budget.saturating_sub(non_expert_bytes);
-
-                        eprintln!(
-                            "VRAM budget: total={}, runtime_reserved={}, non_expert_weights={}, expert_budget={}",
-                            format_budget(total_vram),
-                            format_budget(runtime_reserved),
-                            format_budget(non_expert_bytes),
-                            format_budget(expert_budget),
-                        );
-
-                        // All MoE layers in a checkpoint share the same
-                        // expert tensor layout; detect it from the first
-                        // MoE layer found.
-                        let is_packed = (0..num_hidden_layers)
-                            .find(|&i| gg.contains_tensor(&format!("blk.{i}.ffn_gate_inp.weight")))
-                            .is_some_and(|i| {
-                                gg.contains_tensor(&format!("blk.{i}.ffn_gate_exps.weight"))
-                            });
-
-                        // Greedy first-fit in layer-index order. Every MoE
-                        // layer in a Qwen3 checkpoint has identical
-                        // expert-tensor shapes, so `layer_cost` is uniform
-                        // and index-order assignment already yields the
-                        // budget-maximizing selection; this stops being
-                        // optimal if a future checkpoint has heterogeneous
-                        // per-layer expert costs.
-                        let mut remaining = expert_budget;
-                        let mut gpu_layers = 0usize;
-                        let mut total_moe_layers = 0usize;
-                        let mut placements = Vec::with_capacity(num_hidden_layers);
-                        for i in 0..num_hidden_layers {
-                            let is_moe_layer =
-                                gg.contains_tensor(&format!("blk.{i}.ffn_gate_inp.weight"));
-                            if !is_moe_layer {
-                                placements.push(devices.main.clone());
-                                continue;
-                            }
-                            total_moe_layers += 1;
-                            let layer_cost = estimate_expert_layer_vram(
-                                &gg.ct.tensor_infos,
-                                i,
-                                is_packed,
-                                dtype.size_in_bytes(),
-                            );
-                            if remaining >= layer_cost {
-                                remaining -= layer_cost;
-                                gpu_layers += 1;
-                                placements.push(devices.main.clone());
-                            } else {
-                                placements.push(Device::Cpu);
-                            }
-                        }
-
-                        eprintln!(
-                            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on GPU, \
-                             {} on CPU (remaining budget: {})",
-                            total_moe_layers - gpu_layers,
-                            format_budget(remaining),
-                        );
-
-                        placements
-                    },
-                }
+        //
+        // `WeightBudget::Limited` loads every MoE layer to CPU here (a safe
+        // default) and defers the real GPU/CPU decision to
+        // `promote_experts_after_probe`, called once this model exists and
+        // can run a probe forward pass — see that method's doc comment for
+        // why a static pre-load estimate isn't good enough on its own.
+        let is_moe_checkpoint = config.num_experts.is_some_and(|n| n > 0);
+        let expert_devices: Vec<Device> = if !is_moe_checkpoint {
+            vec![devices.main.clone(); num_hidden_layers]
+        } else if gpu_budget.offload_all_experts {
+            eprintln!("--offload-experts: all MoE expert layers -> CPU");
+            vec![Device::Cpu; num_hidden_layers]
+        } else {
+            match gpu_budget.weight_budget {
+                WeightBudget::NoGpu | WeightBudget::Unlimited => {
+                    vec![devices.main.clone(); num_hidden_layers]
+                },
+                WeightBudget::Limited(_) => vec![Device::Cpu; num_hidden_layers],
             }
         };
 
@@ -1297,7 +1218,7 @@ impl Qwen3Model {
             device,
         )?;
 
-        Ok(Self {
+        let mut model = Self {
             embed_tokens,
             layers,
             norm,
@@ -1306,7 +1227,258 @@ impl Qwen3Model {
             config,
             dtype,
             last_hidden_states: None,
-        })
+        };
+
+        if is_moe_checkpoint
+            && !gpu_budget.offload_all_experts
+            && let WeightBudget::Limited(total_vram) = gpu_budget.weight_budget
+        {
+            let runtime_reservation = gpu_budget.runtime_reservation_bytes(
+                num_hidden_layers,
+                num_kv_heads,
+                head_dim,
+                dtype.size_in_bytes(),
+            );
+            model.promote_experts_after_probe(
+                devices,
+                total_vram,
+                runtime_reservation,
+                &gg.ct.tensor_infos,
+                num_hidden_layers,
+                dtype.size_in_bytes(),
+            )?;
+        }
+
+        Ok(model)
+    }
+
+    /// Runs a probe forward pass to force GPU backends' lazy first-use
+    /// library initialization (rocBLAS/hipRAND/JIT-compiled kernels), then
+    /// live-queries actual free VRAM and promotes CPU-placed `MoE` expert
+    /// layers to GPU based on real remaining headroom.
+    ///
+    /// A purely static pre-load estimate (subtracting an estimated
+    /// KV-cache reservation from `--gpu-memory-limit`) was found, via
+    /// `crane-serve`'s live-queried `record_baseline()` compared across
+    /// several real `ROCm` runs, to consistently underestimate actual
+    /// post-warmup VRAM usage by several GB — a gap that didn't scale
+    /// with the number of GPU-resident expert layers, so it isn't a
+    /// weight-sizing bug. It's the cost of compute libraries that don't
+    /// initialize until something actually runs on the device, which is
+    /// unavoidably *after* model loading decides placement unless loading
+    /// itself forces that initialization first.
+    ///
+    /// Best effort: if the probe forward pass fails, this logs a warning
+    /// and leaves every expert on CPU (safe, just unoptimized) rather
+    /// than failing model load. If live VRAM querying isn't supported for
+    /// this device (e.g. Metal), falls back to the static estimate this
+    /// replaces.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if constructing the probe input tensor fails.
+    /// A failed probe forward pass or failed expert promotion is handled
+    /// gracefully (logged, affected experts left on CPU) and does not
+    /// propagate an error.
+    // One sequential pipeline (probe -> cost estimate -> budget -> promote)
+    // sharing local state (`gpu_location`, `layer_costs`) throughout;
+    // splitting it up would scatter that shared context across several
+    // small functions without simplifying the control flow itself — same
+    // rationale as `Attention::forward`'s existing `too_many_lines` allow.
+    #[allow(clippy::too_many_lines)]
+    fn promote_experts_after_probe(
+        &mut self,
+        devices: &DeviceAssignment,
+        total_vram: u64,
+        runtime_reservation: u64,
+        tensor_infos: &std::collections::HashMap<String, gguf_file::TensorInfo>,
+        num_hidden_layers: usize,
+        dtype_bytes: usize,
+    ) -> Result<()> {
+        // `RocmDevice`'s `Debug` output (e.g. `DeviceId(1)`) is a
+        // process-wide counter of *how many `RocmDevice`s this process has
+        // ever constructed* — it is not the physical GPU ordinal, and is
+        // frequently `1` even when the real ordinal is `0`. `location()`
+        // is the only way to recover the real ordinal (CUDA/ROCm/Metal
+        // `gpu_id`) for logging.
+        let gpu_location = devices.main.location();
+        log::info!(
+            "Expert placement: running probe forward pass + live VRAM query on {gpu_location:?} \
+             before deciding MoE GPU/CPU split (may take a few seconds)"
+        );
+        let probe_ids = Tensor::new(&[45u32, 546, 456], &devices.main)?.unsqueeze(0)?;
+        if let Err(e) = self.forward(&probe_ids, 0) {
+            log::warn!(
+                "expert-placement probe forward failed on {gpu_location:?} (non-fatal, all \
+                 experts stay on CPU): {e}"
+            );
+            return Ok(());
+        }
+        self.clear_kv_cache();
+
+        // All MoE layers in a checkpoint share the same expert tensor
+        // layout; detect it from the first MoE layer found.
+        let is_packed = (0..num_hidden_layers)
+            .find(|&i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_inp.weight")))
+            .is_some_and(|i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_exps.weight")));
+
+        let is_moe_layer: Vec<bool> = (0..num_hidden_layers)
+            .map(|i| tensor_infos.contains_key(&format!("blk.{i}.ffn_gate_inp.weight")))
+            .collect();
+        // Every MoE layer in a Qwen3 checkpoint has identical expert-tensor
+        // shapes, so this cost is uniform across MoE layers; non-MoE
+        // layers cost 0 so they never affect the greedy budget below.
+        let layer_costs: Vec<u64> = (0..num_hidden_layers)
+            .map(|i| {
+                if is_moe_layer[i] {
+                    estimate_expert_layer_vram(tensor_infos, i, is_packed, dtype_bytes)
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let total_moe_layers = is_moe_layer.iter().filter(|&&m| m).count();
+        log::debug!(
+            "MoE layout: {total_moe_layers} layers, packed={is_packed}, \
+             per-layer expert cost estimate={}",
+            format_budget(layer_costs.iter().copied().find(|&c| c > 0).unwrap_or(0)),
+        );
+
+        let available = if let Some((free, total)) = query_gpu_memory(&devices.main) {
+            let used = total.saturating_sub(free);
+            let ceiling = total_vram.min(total);
+            let remaining = ceiling.saturating_sub(used);
+            let available = remaining.saturating_sub(runtime_reservation);
+            log::info!(
+                "Live VRAM on {gpu_location:?} after probe: free={}, total={}, used={}, \
+                 available_for_experts={} (configured limit={})",
+                format_budget(free),
+                format_budget(total),
+                format_budget(used),
+                format_budget(available),
+                format_budget(total_vram),
+            );
+            available
+        } else {
+            // `token_embd.weight` is dequantized by `gg.embedding()`, so
+            // its VRAM cost is its dequantized size, not its on-disk
+            // quantized size like every other non-expert tensor.
+            let non_expert_bytes: u64 = tensor_infos
+                .iter()
+                .filter(|(name, _)| name.as_str() != "token_embd.weight" && !is_expert_tensor(name))
+                .map(|(_, info)| gguf_tensor_bytes(info))
+                .sum::<u64>()
+                + tensor_infos.get("token_embd.weight").map_or(0, |info| {
+                    info.shape.elem_count() as u64 * dtype_bytes as u64
+                });
+            let weight_budget = total_vram.saturating_sub(runtime_reservation);
+            let available = weight_budget.saturating_sub(non_expert_bytes);
+            log::warn!(
+                "No live VRAM query available for {gpu_location:?}; falling back to static \
+                 estimate: total={}, runtime_reserved={}, non_expert_weights={}, \
+                 expert_budget={}",
+                format_budget(total_vram),
+                format_budget(runtime_reservation),
+                format_budget(non_expert_bytes),
+                format_budget(available),
+            );
+            available
+        };
+
+        let promoted: std::collections::HashSet<usize> = greedy_fit_layers(&layer_costs, available)
+            .into_iter()
+            .filter(|&i| is_moe_layer[i])
+            .collect();
+        log::debug!(
+            "Attempting promotion of {} of {total_moe_layers} MoE layers to {gpu_location:?}: {:?}",
+            promoted.len(),
+            {
+                let mut sorted: Vec<usize> = promoted.iter().copied().collect();
+                sorted.sort_unstable();
+                sorted
+            },
+        );
+        // The greedy budget above is a heuristic upper bound on what to
+        // *attempt* — allocator fragmentation and per-expert allocation
+        // overhead (128 experts, each its own device transfer) mean actual
+        // usage can still exceed it even though `promote_experts_to` is
+        // itself atomic per layer. A failed promotion here (e.g. real GPU
+        // out-of-memory) must not abort model load: stop promoting further
+        // layers and leave the rest on CPU — degraded, not fatal.
+        let mut gpu_layers = 0usize;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if !promoted.contains(&i) {
+                continue;
+            }
+            let MlpOrMoe::Moe(block) = &mut layer.mlp else {
+                continue;
+            };
+            // Re-query immediately before attempting, not the stale
+            // snapshot from before this loop started: this tells us
+            // whether a failure below reflects state that already
+            // changed by the time we act, or whether it was already
+            // consistent with the earlier estimate right up to the
+            // moment of the actual allocation call.
+            if let Some((free_before, total_before)) = query_gpu_memory(&devices.main) {
+                log::debug!(
+                    "layer {i}: live VRAM immediately before attempt on {gpu_location:?}: \
+                     free={}, total={}, layer_cost={}",
+                    format_budget(free_before),
+                    format_budget(total_before),
+                    format_budget(layer_costs[i]),
+                );
+            }
+            match block.promote_experts_to(&devices.main, self.dtype) {
+                Ok(()) => {
+                    gpu_layers += 1;
+                    log::debug!(
+                        "layer {i}: promoted to {gpu_location:?} (cost={})",
+                        format_budget(layer_costs[i]),
+                    );
+                },
+                Err(e) => {
+                    // Re-query right after the failure: if free VRAM
+                    // dropped far more than `layer_costs[i]` despite the
+                    // allocation itself failing, that points at the
+                    // underlying GPU allocator reserving/growing a much
+                    // larger pool on a failed attempt, rather than at
+                    // Crane's own cost estimate being wrong.
+                    if let Some((free_after, total_after)) = query_gpu_memory(&devices.main) {
+                        log::warn!(
+                            "layer {i}: live VRAM immediately after the failed attempt on \
+                             {gpu_location:?}: free={}, total={} (compare to the \"before\" line \
+                             above to see if the failed allocation itself consumed VRAM)",
+                            format_budget(free_after),
+                            format_budget(total_after),
+                        );
+                    }
+                    log::warn!(
+                        "expert promotion stopped at layer {i} on {gpu_location:?} (device \
+                         allocation failed, this and remaining layers stay on CPU): {e}"
+                    );
+                    break;
+                },
+            }
+        }
+
+        log::info!(
+            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on {gpu_location:?}, \
+             {} on CPU",
+            total_moe_layers - gpu_layers,
+        );
+        // Final checkpoint before returning to the caller (crane-serve's
+        // own separate `Model::warmup()` + `record_baseline()` run next):
+        // if VRAM usage jumps between this line and that later baseline,
+        // the growth happened *after* model loading, not during it.
+        if let Some((free, total)) = query_gpu_memory(&devices.main) {
+            log::info!(
+                "Live VRAM on {gpu_location:?} at end of from_gguf(): free={}, total={}, used={}",
+                format_budget(free),
+                format_budget(total),
+                format_budget(total.saturating_sub(free)),
+            );
+        }
+        Ok(())
     }
 
     // ── Forward ─────────────────────────────────────────────────────────

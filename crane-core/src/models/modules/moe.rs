@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 
+use crate::device::{format_budget, query_gpu_memory};
 use crate::models::hunyuan_dense::modeling::Gguf;
 use crate::ops::linear::LinearLayer;
 use crate::ops::prof::{self, Span};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias};
+use ribo::utils::log;
 use std::io::{Read, Seek};
 
 /// Configuration for Mixture-of-Experts feed-forward layers.
@@ -99,6 +101,22 @@ impl MoeExpert {
             up_proj,
             down_proj,
         }
+    }
+
+    /// Moves all three projections to `device`, in `dtype`. See
+    /// [`LinearLayer::to_device`] for the `Quantized` dequantization
+    /// tradeoff this implies and why `dtype` must match the model's
+    /// compute dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any projection's device transfer fails.
+    pub fn to_device(&self, device: &Device, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            gate_proj: self.gate_proj.to_device(device, dtype)?,
+            up_proj: self.up_proj.to_device(device, dtype)?,
+            down_proj: self.down_proj.to_device(device, dtype)?,
+        })
     }
 }
 
@@ -255,6 +273,74 @@ impl SparseMoeBlock {
                 ))
             })
             .collect()
+    }
+
+    /// Moves every expert's weights to `device`, in `dtype`, updating
+    /// `expert_device`. No-op if experts are already on `device`. The
+    /// router gate always stays on the main device and is never moved.
+    ///
+    /// Used to promote a CPU-placed layer to GPU once real post-warmup VRAM
+    /// headroom is known (see `Qwen3Model::from_gguf`'s promotion pass) —
+    /// the inverse of the offloading `expert_device` already supports at
+    /// load time. `dtype` must be the model's compute dtype: see
+    /// [`LinearLayer::to_device`] for why a mismatched dtype breaks the
+    /// next forward pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any expert's device transfer fails.
+    pub fn promote_experts_to(&mut self, device: &Device, dtype: DType) -> Result<()> {
+        if self.expert_device.location() == device.location() {
+            return Ok(());
+        }
+        // Collect into a new Vec first and only commit on full success: if
+        // e.g. expert 50 of 128 fails (an out-of-memory device transfer),
+        // an in-place per-expert overwrite would leave `self.experts` with
+        // a mix of old- and new-device tensors while `self.expert_device`
+        // still names the old device — `forward()`'s `same_device` check
+        // would then be wrong for the already-moved experts, causing a
+        // tensor-device mismatch on the next real forward pass. Partial
+        // failure here must leave the block exactly as it was.
+        //
+        // Uses an explicit indexed loop (not `.map().collect()`) so a
+        // failure can be pinpointed to the exact expert index and paired
+        // with a live VRAM query — a whole-layer promotion is ~1GB but made
+        // of ~3*num_experts small per-projection transfers, and a plain
+        // per-layer before/after query can't tell a gradual drain from a
+        // single-transfer cliff.
+        let total = self.experts.len();
+        let mut moved: Vec<MoeExpert> = Vec::with_capacity(total);
+        for (idx, expert) in self.experts.iter().enumerate() {
+            let promoted = match expert.to_device(device, dtype) {
+                Ok(promoted) => promoted,
+                Err(err) => {
+                    if let Some((free, mem_total)) = query_gpu_memory(device) {
+                        log::warn!(
+                            "expert {idx}/{total}: to_device failed on {:?}: free={}, total={}",
+                            device.location(),
+                            format_budget(free),
+                            format_budget(mem_total),
+                        );
+                    }
+                    return Err(err);
+                },
+            };
+            moved.push(promoted);
+            if (idx % 16 == 0 || idx + 1 == total)
+                && let Some((free, mem_total)) = query_gpu_memory(device)
+            {
+                log::debug!(
+                    "expert {}/{total} moved to {:?}: free={}, total={}",
+                    idx + 1,
+                    device.location(),
+                    format_budget(free),
+                    format_budget(mem_total),
+                );
+            }
+        }
+        self.experts = moved;
+        self.expert_device = device.clone();
+        Ok(())
     }
 }
 
@@ -601,6 +687,33 @@ mod tests {
         }
     }
 
+    // Verifies `MoeExpert::to_device` preserves forward-pass output. Only
+    // CPU->CPU is exercisable without real GPU hardware (matching this
+    // file's existing note that cross-device dispatch is CPU-only in unit
+    // tests), but this still exercises the actual per-projection transfer
+    // loop, unlike `SparseMoeBlock::promote_experts_to`'s same-device
+    // early-return short-circuit tested separately below.
+    #[test]
+    fn moe_expert_to_device_preserves_output() {
+        let vb = identity_vb(8);
+        let expert = MoeExpert::new(8, 8, vb).expect("new");
+        let x = Tensor::arange(0f32, 8f32, &Device::Cpu)
+            .expect("arange")
+            .reshape((1, 8))
+            .expect("reshape");
+        let before = expert.forward(&x).expect("forward");
+
+        let moved = expert
+            .to_device(&Device::Cpu, DType::F32)
+            .expect("to_device");
+        let after = moved.forward(&x).expect("forward");
+
+        assert_eq!(
+            before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+    }
+
     // Router weight key is "gate.weight" (VarBuilder::pp("gate")); expert keys
     // are "experts.{i}.{gate,up,down}_proj.weight" (VarBuilder::pp("experts.{i}")).
     fn make_sparse_moe_vb(
@@ -705,6 +818,32 @@ mod tests {
         let x = Tensor::zeros((1, 8), DType::F32, &Device::Cpu).expect("zeros");
         let y = moe.forward(&x).expect("forward");
         assert_eq!(y.dims(), &[1, 8]);
+    }
+
+    // Verifies `promote_experts_to` is a safe no-op when already on the
+    // target device (the `expert_device.location() == device.location()`
+    // early return) — output and forward behavior stay identical. The
+    // actual cross-device transfer loop is exercised at the `MoeExpert`/
+    // `LinearLayer` unit level instead, since a second distinct device
+    // isn't constructible without real GPU hardware (see this file's
+    // existing note on `SparseMoeBlock::forward`'s `same_device` check).
+    #[test]
+    fn promote_experts_to_same_device_is_noop() {
+        let (mut moe, _, _) = routing_test_setup(false, 2);
+        let x = Tensor::new(&[1.0f32, 0.0], &Device::Cpu)
+            .expect("tensor")
+            .reshape((1, 2))
+            .expect("reshape");
+        let before = moe.forward(&x).expect("forward");
+
+        moe.promote_experts_to(&Device::Cpu, DType::F32)
+            .expect("promote");
+        let after = moe.forward(&x).expect("forward");
+
+        assert_eq!(
+            before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
     }
 
     #[test]

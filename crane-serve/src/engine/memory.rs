@@ -140,6 +140,10 @@ impl MemoryConfig {
 
 /// Query current GPU memory usage. Returns (`used_bytes`, `total_bytes`).
 /// Returns (0, 0) if the device is neither CUDA nor ROCm (or the query fails).
+///
+/// Mirrors `crane-core/src/device.rs`'s `query_gpu_memory` (duplicated, not
+/// reused, since `crane-core` cannot depend on `crane-serve`). Keep the two
+/// in sync if the underlying query logic changes.
 pub(super) fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     #[cfg(feature = "cuda")]
     {

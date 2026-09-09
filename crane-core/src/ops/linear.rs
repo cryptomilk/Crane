@@ -7,7 +7,7 @@
 //! users (hunyuan, qwen3).
 
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
-use candle_core::{DType, Module, Result, Tensor};
+use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder, linear_no_bias};
 use std::sync::Arc;
 
@@ -103,6 +103,40 @@ impl LinearLayer {
             self.forward_f32(xs)
         } else {
             self.forward(xs)
+        }
+    }
+
+    /// Moves this layer's weights to `device`, in `dtype`.
+    ///
+    /// `Standard` moves its tensors directly, casting to `dtype`. `QTensor`
+    /// has no device-transfer primitive, so `Quantized` dequantizes (via
+    /// `QMatMul::dequantize_f16`, then casts to `dtype`) and returns a
+    /// `Standard` layer on `device` — this loses the quantized memory
+    /// footprint for the moved weight, a deliberate tradeoff for promoting
+    /// an expert from CPU to GPU once real headroom is known (see
+    /// `Qwen3Model::from_gguf`'s post-warmup promotion pass). `dtype` must
+    /// match the model's compute dtype (`Qwen3Model::dtype`): candle's
+    /// matmul requires both operands to share a dtype, so a promoted
+    /// weight left in the wrong dtype fails on its very next forward pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dequantization, dtype cast, or device
+    /// transfer fails.
+    pub fn to_device(&self, device: &Device, dtype: DType) -> Result<LinearLayer> {
+        match self {
+            Self::Standard(l) => {
+                let weight = l.weight().to_device(device)?.to_dtype(dtype)?;
+                let bias = l
+                    .bias()
+                    .map(|b| b.to_device(device)?.to_dtype(dtype))
+                    .transpose()?;
+                Ok(Self::Standard(Linear::new(weight, bias)))
+            },
+            Self::Quantized(q) => {
+                let weight = q.dequantize_f16()?.to_device(device)?.to_dtype(dtype)?;
+                Ok(Self::Standard(Linear::new(weight, None)))
+            },
         }
     }
 }
@@ -302,5 +336,65 @@ mod tests {
         assert_eq!(out.dtype(), DType::F32);
         let values = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!((values[0] - 360_000.0).abs() < 1.0);
+    }
+
+    // Verifies `Standard::to_device` preserves the forward-pass output
+    // (a CPU->CPU move is a data copy, not a value change).
+    #[test]
+    fn to_device_standard_preserves_output() {
+        let (weight, input) = overflow_weight_and_input();
+        let layer = LinearLayer::Standard(Linear::new(weight, None));
+        let before = layer.forward(&input).unwrap();
+
+        let moved = layer.to_device(&Device::Cpu, DType::F32).unwrap();
+        assert!(matches!(moved, LinearLayer::Standard(_)));
+        let after = moved.forward(&input).unwrap();
+
+        assert_eq!(
+            before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+    }
+
+    // Verifies `Quantized::to_device` dequantizes to a `Standard` layer on
+    // the target device and produces (near-)identical output — a promoted
+    // expert must still forward correctly, just no longer quantized.
+    #[test]
+    fn to_device_quantized_dequantizes_and_preserves_output() {
+        let (weight, input) = overflow_weight_and_input();
+        let qt = QTensor::quantize(&weight, GgmlDType::F32).unwrap();
+        let layer = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(qt)).unwrap());
+        let before = layer.forward_f32(&input).unwrap();
+
+        let moved = layer.to_device(&Device::Cpu, DType::F32).unwrap();
+        assert!(matches!(moved, LinearLayer::Standard(_)));
+        let after = moved.forward_f32(&input).unwrap();
+
+        let before_vals = before.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let after_vals = after.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (b, a) in before_vals.iter().zip(after_vals.iter()) {
+            assert!((b - a).abs() < 1.0, "before={b} after={a}");
+        }
+    }
+
+    // Verifies `to_device` casts a promoted quantized expert's weight to
+    // the requested compute dtype rather than hard-coding F16, and that
+    // plain `forward` (not `forward_f32`) succeeds afterward with a
+    // matching-dtype input — this is the path that broke when `to_device`
+    // ignored its caller's compute dtype and always dequantized to F16.
+    #[test]
+    fn to_device_quantized_casts_to_requested_dtype() {
+        let (weight, input) = overflow_weight_and_input();
+        let qt = QTensor::quantize(&weight, GgmlDType::F32).unwrap();
+        let layer = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(qt)).unwrap());
+
+        let moved = layer.to_device(&Device::Cpu, DType::F32).unwrap();
+        let LinearLayer::Standard(l) = &moved else {
+            panic!("expected Standard after to_device");
+        };
+        assert_eq!(l.weight().dtype(), DType::F32);
+
+        let out = moved.forward(&input).unwrap();
+        assert_eq!(out.dtype(), DType::F32);
     }
 }
