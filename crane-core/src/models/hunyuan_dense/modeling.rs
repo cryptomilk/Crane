@@ -394,54 +394,51 @@ impl Attention {
         let new_seq_len = k.dim(2)?;
         let cache_seq_len = self.cache_seq_len;
 
-        match self.kv_cache.take() {
-            Some((buf_k, buf_v)) => {
-                let buf_len = buf_k.dim(2)?;
-                let new_total = cache_seq_len + new_seq_len;
+        if let Some((buf_k, buf_v)) = self.kv_cache.take() {
+            let buf_len = buf_k.dim(2)?;
+            let new_total = cache_seq_len + new_seq_len;
 
-                if new_total <= buf_len {
-                    // In-place write: O(new_seq_len) instead of O(cache_len)
-                    buf_k.slice_set(&k, 2, cache_seq_len)?;
-                    buf_v.slice_set(&v, 2, cache_seq_len)?;
-                    let k_view = buf_k.narrow(2, 0, new_total)?;
-                    let v_view = buf_v.narrow(2, 0, new_total)?;
-                    self.kv_cache = Some((buf_k, buf_v));
-                    self.cache_seq_len = new_total;
-                    Ok((k_view, v_view))
-                } else {
-                    // Buffer too small: grow with extra room.
-                    let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
-                    let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
-                    drop(buf_k);
-                    drop(buf_v);
-                    let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
-                    let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
-                    drop(cur_k);
-                    drop(cur_v);
-                    let total = full_k.dim(2)?;
-                    let room = 256; // fixed small room — avoids 2x over-allocation
-                    let (b, h, _, d) = full_k.dims4()?;
-                    let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
-                    let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
-                    new_buf_k.slice_set(&full_k, 2, 0)?;
-                    new_buf_v.slice_set(&full_v, 2, 0)?;
-                    self.kv_cache = Some((new_buf_k, new_buf_v));
-                    self.cache_seq_len = total;
-                    Ok((full_k, full_v))
-                }
-            },
-            None => {
-                // First use: allocate buffer with extra room.
-                let (b, h, s, d) = k.dims4()?;
-                let room = 256; // fixed small room — avoids 2x over-allocation
-                let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
-                let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
-                buf_k.slice_set(&k, 2, 0)?;
-                buf_v.slice_set(&v, 2, 0)?;
+            if new_total <= buf_len {
+                // In-place write: O(new_seq_len) instead of O(cache_len)
+                buf_k.slice_set(&k, 2, cache_seq_len)?;
+                buf_v.slice_set(&v, 2, cache_seq_len)?;
+                let k_view = buf_k.narrow(2, 0, new_total)?;
+                let v_view = buf_v.narrow(2, 0, new_total)?;
                 self.kv_cache = Some((buf_k, buf_v));
-                self.cache_seq_len = s;
-                Ok((k, v))
-            },
+                self.cache_seq_len = new_total;
+                Ok((k_view, v_view))
+            } else {
+                // Buffer too small: grow with extra room.
+                let cur_k = buf_k.narrow(2, 0, cache_seq_len)?;
+                let cur_v = buf_v.narrow(2, 0, cache_seq_len)?;
+                drop(buf_k);
+                drop(buf_v);
+                let full_k = Tensor::cat(&[&cur_k, &k], 2)?;
+                let full_v = Tensor::cat(&[&cur_v, &v], 2)?;
+                drop(cur_k);
+                drop(cur_v);
+                let total = full_k.dim(2)?;
+                let room = 256; // fixed small room — avoids 2x over-allocation
+                let (b, h, _, d) = full_k.dims4()?;
+                let new_buf_k = Tensor::zeros((b, h, total + room, d), k.dtype(), k.device())?;
+                let new_buf_v = Tensor::zeros((b, h, total + room, d), v.dtype(), v.device())?;
+                new_buf_k.slice_set(&full_k, 2, 0)?;
+                new_buf_v.slice_set(&full_v, 2, 0)?;
+                self.kv_cache = Some((new_buf_k, new_buf_v));
+                self.cache_seq_len = total;
+                Ok((full_k, full_v))
+            }
+        } else {
+            // First use: allocate buffer with extra room.
+            let (b, h, s, d) = k.dims4()?;
+            let room = 256; // fixed small room — avoids 2x over-allocation
+            let buf_k = Tensor::zeros((b, h, s + room, d), k.dtype(), k.device())?;
+            let buf_v = Tensor::zeros((b, h, s + room, d), v.dtype(), v.device())?;
+            buf_k.slice_set(&k, 2, 0)?;
+            buf_v.slice_set(&v, 2, 0)?;
+            self.kv_cache = Some((buf_k, buf_v));
+            self.cache_seq_len = s;
+            Ok((k, v))
         }
     }
 
@@ -1408,27 +1405,24 @@ fn pad_and_stack_kv_caches(
     };
 
     for cache in caches {
-        match cache {
-            Some((k, v)) => {
-                let cur_len = k.dim(2)?;
-                let pad_len = max_len - cur_len;
-                if pad_len > 0 {
-                    // Right-align: [padding | real_data] so that decode tokens
-                    // appended after max_kv form a contiguous valid range with
-                    // the pre-existing data, enabling flash_attn_varlen.
-                    let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
-                    padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
-                    padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
-                } else {
-                    padded_ks.push(k.clone());
-                    padded_vs.push(v.clone());
-                }
-            },
-            None => {
-                let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
-                padded_ks.push(zeros.clone());
-                padded_vs.push(zeros);
-            },
+        if let Some((k, v)) = cache {
+            let cur_len = k.dim(2)?;
+            let pad_len = max_len - cur_len;
+            if pad_len > 0 {
+                // Right-align: [padding | real_data] so that decode tokens
+                // appended after max_kv form a contiguous valid range with
+                // the pre-existing data, enabling flash_attn_varlen.
+                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                padded_ks.push(Tensor::cat(&[&pad, k], 2)?);
+                padded_vs.push(Tensor::cat(&[&pad, v], 2)?);
+            } else {
+                padded_ks.push(k.clone());
+                padded_vs.push(v.clone());
+            }
+        } else {
+            let zeros = Tensor::zeros((1, kv_heads, max_len, head_dim), dtype, device)?;
+            padded_ks.push(zeros.clone());
+            padded_vs.push(zeros);
         }
     }
 
