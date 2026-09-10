@@ -1171,7 +1171,7 @@ impl Qwen3Model {
         let expert_devices: Vec<Device> = if !is_moe_checkpoint {
             vec![devices.main.clone(); num_hidden_layers]
         } else if gpu_budget.offload_all_experts {
-            eprintln!("--offload-experts: all MoE expert layers -> CPU");
+            log::info!("--offload-experts: all MoE expert layers -> CPU");
             vec![Device::Cpu; num_hidden_layers]
         } else {
             match gpu_budget.weight_budget {
@@ -1182,6 +1182,14 @@ impl Qwen3Model {
             }
         };
 
+        log::info!(
+            "Loading {num_hidden_layers} layers from GGUF (dequantizing attention{} weights)...",
+            if is_moe_checkpoint {
+                " + MoE expert"
+            } else {
+                ""
+            },
+        );
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
             layers.push(DecoderLayer::new_from_gguf(
