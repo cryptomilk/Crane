@@ -148,6 +148,17 @@ impl Config {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// Bytes of KV cache one sequence consumes per generated token, summed
+    /// across every layer (standard full-attention: one K and one V tensor
+    /// per layer, no sharing).
+    #[must_use]
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> u64 {
+        2 * self.num_hidden_layers as u64
+            * self.num_key_value_heads as u64
+            * self.head_dim() as u64
+            * dtype_bytes as u64
+    }
+
     /// Builds the `MoE` configuration for this model, or `None` if this is a
     /// dense (non-`MoE`) checkpoint.
     #[must_use]
@@ -1962,6 +1973,27 @@ mod tests {
             "tie_word_embeddings": true
         }"#;
         serde_json::from_str(json).expect("tiny_config parse")
+    }
+
+    // Formula matches the real Qwen3-Coder-30B-A3B GGUF geometry verified
+    // against its own metadata: 48 layers, 4 KV heads, head_dim 128, F16
+    // (2 bytes) -> 96 KiB/token.
+    #[test]
+    fn test_kv_bytes_per_token_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(config.kv_bytes_per_token(2), 96 * 1024);
+    }
+
+    // Uses the tiny test config's own geometry: 1 layer, 2 KV heads,
+    // head_dim 4, F32 (4 bytes) -> 2*1*2*4*4 = 64 bytes/token.
+    #[test]
+    fn test_kv_bytes_per_token_tiny_config() {
+        assert_eq!(tiny_config().kv_bytes_per_token(4), 64);
     }
 
     // Dense checkpoints carry no MoE fields, so `moe_config()` must return `None`.

@@ -79,7 +79,12 @@ const PREFILL_CHUNK_SIZE: usize = 2048;
 /// We use 6× so that `kv_budget = (limit - baseline) / 6`.  This gives the
 /// engine a realistic estimate of how much KV it can afford before the GPU
 /// runs out of memory.
-const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+///
+/// Also reused by `crate::derive_safe_max_seq_len` for the same reason: a
+/// naive raw-KV-bytes budget (no overhead factor) undercounts real usage by
+/// the same 5-8× and lets a single long-running session's own prefill blow
+/// past physical VRAM (verified in production — see git history).
+pub(crate) const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
 
 /// Continuous-batching inference engine.
 ///

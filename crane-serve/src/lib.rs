@@ -21,11 +21,11 @@ use axum::{
 use clap::Parser;
 use crane_core::device::{GpuBudget, WeightBudget};
 use crane_core::utils::DeviceExt;
-use tracing::info;
+use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, MemoryConfig};
+use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
 use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, MinicpmVVlmRequest, Qwen3_5VlmRequest, VlmRequest};
@@ -604,7 +604,55 @@ fn resolve_gpu_budget(
     }
 }
 
-pub async fn run(args: Args) -> Result<()> {
+/// Auto-derives a safe `--max-seq-len` when the caller left it at `0`
+/// (unlimited) while `--gpu-memory-limit` is set. Without this, a single
+/// long-running session's own KV cache can grow past physical VRAM with
+/// no runtime protection: eviction (`InferenceEngine::is_over_kv_budget`)
+/// only preempts *other* competing sequences when a new prefill is
+/// scheduled, never a lone session's own growth. The safe headroom is
+/// divided evenly across `max_concurrent`, since every concurrent slot
+/// could independently grow to the derived cap. Returns `None` when
+/// derivation isn't applicable (an explicit `--max-seq-len` or no
+/// `--gpu-memory-limit`) or isn't safely computable (VRAM query
+/// unsupported for this device, or zero headroom).
+fn derive_safe_max_seq_len(
+    memory_config: &MemoryConfig,
+    physical_total_bytes: u64,
+    kv_bytes_per_token: u64,
+    max_concurrent: usize,
+) -> Option<usize> {
+    if memory_config.max_seq_len != 0 || memory_config.gpu_memory_limit_bytes == 0 {
+        return None;
+    }
+    if physical_total_bytes == 0 || kv_bytes_per_token == 0 {
+        return None;
+    }
+    let ceiling = memory_config
+        .gpu_memory_limit_bytes
+        .min(physical_total_bytes);
+    let headroom = ceiling.saturating_sub(memory_config.baseline_gpu_bytes);
+    // Raw KV-tensor bytes are only ~15-20% of real GPU growth (padded
+    // batch-decode copies, allocator retention, forward-pass intermediates
+    // like chunked-prefill attention scores that scale with chunk_size ×
+    // kv_len) — see `KV_GPU_OVERHEAD_FACTOR`'s doc comment. Reuse the same
+    // empirically-measured factor here instead of a separate guess: an
+    // earlier version of this function used an arbitrary 80% margin, which
+    // was ~6x too generous and let a single session's own prefill blow
+    // past physical VRAM in production.
+    let safe_headroom = headroom / KV_GPU_OVERHEAD_FACTOR;
+    let per_seq_budget = safe_headroom / max_concurrent.max(1) as u64;
+    let derived = per_seq_budget / kv_bytes_per_token;
+    if derived == 0 {
+        return None;
+    }
+    // Token counts are bounded by realistic VRAM sizes divided by
+    // per-token byte cost — always comfortably within usize range.
+    #[allow(clippy::cast_possible_truncation)]
+    let derived = derived as usize;
+    Some(derived)
+}
+
+pub async fn run(mut args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
 
     let device = if args.cpu {
@@ -1268,6 +1316,35 @@ pub async fn run(args: Args) -> Result<()> {
         let mut memory_config =
             MemoryConfig::parse(args.max_seq_len, args.gpu_memory_limit.as_deref(), &device);
         memory_config.record_baseline(&device);
+        // This guard duplicates derive_safe_max_seq_len's own first-line check
+        // intentionally, so that function stays independently callable (and
+        // testable) without relying on the caller to have already checked.
+        if memory_config.max_seq_len == 0 && memory_config.gpu_memory_limit_bytes > 0 {
+            let physical_total = MemoryConfig::query_total_gpu_memory(&device);
+            match backend.kv_bytes_per_token().and_then(|kv_bpt| {
+                derive_safe_max_seq_len(&memory_config, physical_total, kv_bpt, args.max_concurrent)
+            }) {
+                Some(derived) => {
+                    info!(
+                        "max_seq_len unset with gpu_memory_limit set; auto-derived {derived} \
+                         tokens from physical_vram={}, baseline={}",
+                        format_bytes(physical_total),
+                        format_bytes(memory_config.baseline_gpu_bytes),
+                    );
+                    memory_config.max_seq_len = derived;
+                    args.max_seq_len = derived;
+                },
+                None => {
+                    warn!(
+                        "max_seq_len is unlimited (0) with gpu_memory_limit set; a single \
+                         long-running session's KV cache can grow past VRAM with no runtime \
+                         eviction protection (eviction only guards against multiple competing \
+                         sequences). Could not auto-derive a safe cap for this model/device — \
+                         set --max-seq-len explicitly."
+                    );
+                },
+            }
+        }
         let baseline_gpu = memory_config.baseline_gpu_bytes;
         info!(
             "Memory config: max_seq_len={}, gpu_limit={}, baseline_gpu={}",
@@ -1579,5 +1656,97 @@ mod config_tests {
             budget.weight_budget,
             crane_core::device::WeightBudget::NoGpu
         );
+    }
+
+    // ── derive_safe_max_seq_len ──
+
+    fn memory_config_for_test(
+        max_seq_len: usize,
+        limit_bytes: u64,
+        baseline_bytes: u64,
+    ) -> MemoryConfig {
+        MemoryConfig {
+            max_seq_len,
+            gpu_memory_limit_bytes: limit_bytes,
+            baseline_gpu_bytes: baseline_bytes,
+        }
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_already_set() {
+        // An explicit --max-seq-len must never be silently overridden.
+        let cfg = memory_config_for_test(4096, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_no_gpu_limit() {
+        // No --gpu-memory-limit means genuinely unlimited — nothing to derive.
+        let cfg = memory_config_for_test(0, 0, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_vram_query_unsupported() {
+        // physical_total_bytes == 0 signals an unsupported device query
+        // (e.g. Metal) — can't safely compute a bound.
+        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 0, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_backend_has_no_kv_cost() {
+        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 0, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_none_when_no_headroom() {
+        // Baseline already consumes the entire limit — zero room for KV.
+        let cfg = memory_config_for_test(0, 10 << 30, 10 << 30);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
+    fn derive_max_seq_len_computes_expected_value() {
+        // Mirrors this session's real numbers: 16 GiB card, 10 GiB limit,
+        // 4 GiB baseline, 96 KiB/token, max_concurrent=1,
+        // KV_GPU_OVERHEAD_FACTOR=6. headroom=6 GiB, /6 -> 1 GiB safe budget
+        // -> 1 GiB / 96 KiB = 10922 tokens (integer division).
+        //
+        // Notably this is well *below* the 47080-token real workload this
+        // session debugged — with the correct overhead factor applied,
+        // that workload genuinely does not fit safely in a 10G limit on
+        // this card, it isn't just a smaller-than-expected safe cap. An
+        // earlier, buggy version of this function used an 80% margin
+        // instead of dividing by `KV_GPU_OVERHEAD_FACTOR`, which computed
+        // 49152 — 4.5x too generous — and that value OOM'd in production.
+        let cfg = memory_config_for_test(0, 10 << 30, 4 << 30);
+        let kv_bytes_per_token = 96 * 1024;
+        let derived =
+            derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token, 1).expect("derived");
+        assert_eq!(derived, 10_922);
+    }
+
+    #[test]
+    fn derive_max_seq_len_divides_budget_across_max_concurrent() {
+        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
+        let single = derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).expect("derived");
+        let quad = derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 4).expect("derived");
+        assert_eq!(single / 4, quad);
+    }
+
+    #[test]
+    fn derive_max_seq_len_clamps_to_physical_vram() {
+        // A --gpu-memory-limit larger than the card's actual physical VRAM
+        // (typo, or a shared/overcommitted device) must not let the
+        // headroom calculation use the inflated configured limit.
+        let cfg_inflated = memory_config_for_test(0, 20 << 30, 1 << 30);
+        let cfg_matching = memory_config_for_test(0, 10 << 30, 1 << 30);
+        let clamped =
+            derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
+        let unclamped =
+            derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
+        assert_eq!(clamped, unclamped);
     }
 }
