@@ -83,7 +83,7 @@ impl Module for Qwen35RmsNorm {
 }
 
 use super::config::{LayerType, TextConfig};
-use super::kv_cache::KvCache;
+use crate::models::modules::quant_kv_cache::KvCache;
 use crate::ops::gdn::{
     GatedDeltaNet, GdnDims, GdnInputProjection, GdnInputProjectionKind, GdnLayerCache,
     RmsNormGated, VHeadOrder,
