@@ -70,21 +70,20 @@ const PREFILL_CHUNK_SIZE: usize = 2048;
 
 /// KV-to-GPU overhead factor.
 ///
-/// `tracked_kv_bytes` only captures live per-sequence KV cache tensors, which
-/// is roughly 15-20% of the *real* GPU memory consumed.  Batch-decode setup
-/// creates padded copies, the CUDA caching allocator retains freed blocks,
-/// and forward-pass intermediates add extra pressure.  Empirically the ratio
-/// between actual GPU growth over baseline and tracked KV bytes is 5-8×.
-///
-/// We use 6× so that `kv_budget = (limit - baseline) / 6`.  This gives the
-/// engine a realistic estimate of how much KV it can afford before the GPU
-/// runs out of memory.
-///
+/// Used here so that `kv_budget = (limit - baseline) / KV_GPU_OVERHEAD_FACTOR`
+/// (see [`InferenceEngine::kv_budget_bytes`]), giving the engine a realistic
+/// estimate of how much KV it can afford before the GPU runs out of memory.
 /// Also reused by `crate::derive_safe_max_seq_len` for the same reason: a
-/// naive raw-KV-bytes budget (no overhead factor) undercounts real usage by
-/// the same 5-8× and lets a single long-running session's own prefill blow
-/// past physical VRAM (verified in production — see git history).
-pub(crate) const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+/// naive raw-KV-bytes budget (no overhead factor) undercounts real usage and
+/// lets a single long-running session's own prefill blow past physical VRAM
+/// (verified in production — see git history).
+///
+/// Defined in `crane_core::device` (not here) so the model-load-time
+/// reservation in `GpuBudget::runtime_reservation_bytes` and this engine's
+/// runtime KV-eviction budget share one constant instead of two copies that
+/// can drift apart; see that constant's doc comment for why the factor's
+/// value is what it is.
+pub(crate) use crane_core::device::KV_GPU_OVERHEAD_FACTOR;
 
 /// Continuous-batching inference engine.
 ///

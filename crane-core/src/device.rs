@@ -5,6 +5,20 @@
 
 use candle_core::Device;
 
+/// Overhead multiplier applied to raw KV-tensor bytes to approximate real
+/// GPU memory growth (padded batch-decode copies, allocator block
+/// retention, forward-pass intermediates that scale with batch and context
+/// size during prefill). Raw KV-tensor bytes are only ~15-20% of real GPU
+/// growth in production, i.e. real growth is 5-8x raw tracked bytes; `6` is
+/// a conservative point estimate within that range.
+///
+/// Defined here (rather than in `crane-serve`, which owns the runtime
+/// KV-eviction budget that also uses this factor) because `crane-core`
+/// cannot depend on `crane-serve` but `crane-serve` can and does depend on
+/// `crane-core` — this is the only direction that lets both sides share a
+/// single constant instead of drifting copies.
+pub const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+
 /// Bundles the primary inference device with the device MoE expert weights
 /// load onto.
 ///
@@ -87,11 +101,18 @@ impl GpuBudget {
     /// [`WeightBudget::Unlimited`], since there is no weight budget to
     /// subtract from.
     ///
+    /// The returned value already includes [`KV_GPU_OVERHEAD_FACTOR`] over
+    /// raw KV-tensor bytes to approximate real GPU memory growth; it is not
+    /// a plain tensor-size calculation.
+    ///
     /// `num_layers`, `num_kv_heads`, and `head_dim` come from the model's
-    /// own config; `dtype_bytes` is the compute dtype's `size_in_bytes()`.
-    /// [`Self::max_concurrent`] defaults to `1` and [`Self::max_seq_len`]
-    /// defaults to `4096` when unset, since the real values may not be
-    /// known yet at the point this is called.
+    /// own config; `dtype_bytes` is the KV cache's own per-element byte
+    /// cost (the compute dtype's `size_in_bytes()` today; a future
+    /// quantized KV cache would pass its own smaller per-element size
+    /// here instead — this function's overhead accounting is unaffected
+    /// either way). [`Self::max_concurrent`] defaults to `1` and
+    /// [`Self::max_seq_len`] defaults to `4096` when unset, since the real
+    /// values may not be known yet at the point this is called.
     #[must_use]
     pub fn runtime_reservation_bytes(
         &self,
@@ -124,7 +145,8 @@ impl GpuBudget {
             * num_layers as u64
             * num_kv_heads as u64
             * head_dim as u64
-            * dtype_bytes as u64;
+            * dtype_bytes as u64
+            * KV_GPU_OVERHEAD_FACTOR;
 
         kv_bytes + SAFETY_MARGIN_BYTES
     }
@@ -271,8 +293,10 @@ mod tests {
             max_concurrent: Some(8),
             max_seq_len: Some(2048),
         };
-        // kv_bytes = 8 * 2048 * 2 * 48 * 4 * 128 * 2 = 1_610_612_736
-        let expected_kv_bytes: u64 = 8 * 2048 * 2 * 48 * 4 * 128 * 2;
+        // kv_bytes = 8 * 2048 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR.
+        // The `6` is hardcoded (not `KV_GPU_OVERHEAD_FACTOR`) so a change to
+        // the constant's value itself is caught by this test.
+        let expected_kv_bytes: u64 = 8 * 2048 * 2 * 48 * 4 * 128 * 2 * 6;
         let expected = expected_kv_bytes + (256 << 20);
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
@@ -288,7 +312,7 @@ mod tests {
             max_concurrent: None,
             max_seq_len: None,
         };
-        let expected_kv_bytes: u64 = 1 * 4096 * 2 * 48 * 4 * 128 * 2;
+        let expected_kv_bytes: u64 = 1 * 4096 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR;
         let expected = expected_kv_bytes + (256 << 20);
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
@@ -315,7 +339,7 @@ mod tests {
             max_concurrent: Some(1),
             max_seq_len: Some(32768),
         };
-        let expected_kv_bytes: u64 = 1 * 32768 * 2 * 48 * 4 * 128 * 2;
+        let expected_kv_bytes: u64 = 1 * 32768 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR;
         let expected = expected_kv_bytes + (256 << 20);
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
