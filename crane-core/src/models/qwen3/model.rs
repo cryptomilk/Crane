@@ -74,6 +74,31 @@ impl Model {
         format: ModelFormat,
         gpu_budget: &GpuBudget,
     ) -> Result<Self> {
+        Self::new_with_options(
+            model_path,
+            devices,
+            dtype,
+            format,
+            gpu_budget,
+            KvCacheKind::from_env(),
+        )
+    }
+
+    /// Like [`Self::new_with_format`], but takes an explicit `kv_kind`
+    /// (e.g. from a `--kv-quant` CLI flag) instead of reading
+    /// `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model files cannot be found or loaded.
+    pub fn new_with_options(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        format: ModelFormat,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
         let format = match format {
             ModelFormat::Auto => {
                 let p = std::path::Path::new(model_path);
@@ -88,10 +113,10 @@ impl Model {
 
         match format {
             ModelFormat::Gguf | ModelFormat::Auto => {
-                Self::from_gguf(model_path, devices, gpu_budget)
+                Self::from_gguf(model_path, devices, gpu_budget, kv_kind)
             },
             ModelFormat::Safetensors => {
-                Self::from_pretrained(model_path, devices, *dtype, gpu_budget)
+                Self::from_pretrained(model_path, devices, *dtype, gpu_budget, kv_kind)
             },
         }
     }
@@ -126,6 +151,7 @@ impl Model {
         devices: &DeviceAssignment,
         dtype: DType,
         gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
     ) -> Result<Model> {
         let tokenizer_path = std::path::Path::new(model_path).join("tokenizer.json");
         if !tokenizer_path.exists() {
@@ -140,7 +166,8 @@ impl Model {
         let config_data = std::fs::read(config_file)?;
         let config: Config = serde_json::from_slice(&config_data)?;
 
-        let inner = Qwen3Model::new(&config, vb, &devices.expert, gpu_budget)?;
+        let inner =
+            Qwen3Model::new_with_kv_kind(&config, vb, &devices.expert, gpu_budget, kv_kind)?;
 
         Ok(Self {
             tokenizer: TokenOutputStream::new(tokenizer),
@@ -155,6 +182,7 @@ impl Model {
         model_path: &str,
         devices: &DeviceAssignment,
         gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
     ) -> Result<Model> {
         let gguf_path = std::path::Path::new(model_path);
 
@@ -169,7 +197,8 @@ impl Model {
 
         let tokenizer = tokenizer_utils::resolve_gguf_tokenizer(&ct, gguf_path)?;
 
-        let inner = Qwen3Model::from_gguf(ct, &mut file, devices, gpu_budget)?;
+        let inner =
+            Qwen3Model::from_gguf_with_kv_kind(ct, &mut file, devices, gpu_budget, kv_kind)?;
         let dtype = inner.model_dtype();
 
         Ok(Self {

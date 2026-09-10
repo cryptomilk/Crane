@@ -234,7 +234,10 @@ impl MiniCpmOLlm {
     /// # Errors
     ///
     /// Returns an error if re-quantizing any layer's cache state fails.
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) -> candle_core::Result<()> {
+    pub fn set_kv_caches(
+        &mut self,
+        caches: Vec<Option<(Tensor, Tensor)>>,
+    ) -> candle_core::Result<()> {
         let kv_kind = self.inner.kv_kind();
         let wrapped = caches
             .into_iter()

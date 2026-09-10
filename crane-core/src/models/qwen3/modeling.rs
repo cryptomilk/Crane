@@ -814,9 +814,10 @@ pub struct Qwen3Model {
     /// Full-sequence post-norm hidden states from the most recent forward
     /// call — see [`Self::last_hidden_states`].
     last_hidden_states: Option<Tensor>,
-    /// KV cache representation in use, read once from `CRANE_KV_QUANT` at
-    /// construction (see [`KvCacheKind::from_env`]). Needed by
-    /// [`Self::extract_batch_kv`] to decide whether to re-quantize.
+    /// KV cache representation in use, selected at construction either
+    /// from `CRANE_KV_QUANT` or an explicit `kv_kind` argument (e.g.
+    /// `--kv-quant`). Needed by [`Self::extract_batch_kv`] to decide
+    /// whether to re-quantize.
     kv_kind: KvCacheKind,
 }
 
@@ -956,6 +957,30 @@ impl Qwen3Model {
         Self::new_inner(config, vb.pp("model"), vb, expert_device, gpu_budget)
     }
 
+    /// Like [`Self::new`], but takes an explicit `kv_kind` (e.g. from a
+    /// `--kv-quant` CLI flag) instead of reading `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required weight tensor is missing or has an
+    /// unexpected shape.
+    pub fn new_with_kv_kind(
+        config: &Config,
+        vb: VarBuilder,
+        expert_device: &Device,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
+    ) -> Result<Self> {
+        Self::new_inner_with_kv_kind(
+            config,
+            vb.pp("model"),
+            vb,
+            expert_device,
+            gpu_budget,
+            kv_kind,
+        )
+    }
+
     /// Construct from a checkpoint where the decoder is nested under a
     /// deeper prefix than the standard `model.*` layout (e.g. Qwen3-ASR's
     /// `model.language_model.*`). `model_vb` must already be scoped to the
@@ -997,10 +1022,10 @@ impl Qwen3Model {
         )
     }
 
-    /// Test-only entry point: like [`Self::new_inner`], but takes an
-    /// explicit `kv_kind` instead of reading `CRANE_KV_QUANT` — avoids
-    /// mutating process-wide env state from parallel tests.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Like [`Self::new_inner`], but takes an explicit `kv_kind` instead of
+    /// reading `CRANE_KV_QUANT` — used by [`Self::new_with_kv_kind`] and by
+    /// tests (avoids mutating process-wide env state from parallel tests).
+    // See `Attention::new`'s comment on `VarBuilder` by-value.
     #[allow(clippy::needless_pass_by_value)]
     fn new_inner_with_kv_kind(
         config: &Config,
@@ -1090,16 +1115,33 @@ impl Qwen3Model {
     ///
     /// Returns an error if a required tensor or metadata entry is missing
     /// or has an unexpected shape.
-    // This function's length comes from reading many independent GGUF
-    // metadata keys (attention, RoPE, MoE) into `Config` one field at a
-    // time; splitting it up would scatter that flat read-and-assign
-    // sequence across several small functions without simplifying it.
-    #[allow(clippy::too_many_lines)]
     pub fn from_gguf<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         devices: &DeviceAssignment,
         gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::from_gguf_with_kv_kind(ct, reader, devices, gpu_budget, KvCacheKind::from_env())
+    }
+
+    /// Like [`Self::from_gguf`], but takes an explicit `kv_kind` (e.g. from
+    /// a `--kv-quant` CLI flag) instead of reading `CRANE_KV_QUANT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a required tensor or metadata entry is missing
+    /// or has an unexpected shape.
+    // This function's length comes from reading many independent GGUF
+    // metadata keys (attention, RoPE, MoE) into `Config` one field at a
+    // time; splitting it up would scatter that flat read-and-assign
+    // sequence across several small functions without simplifying it.
+    #[allow(clippy::too_many_lines)]
+    pub fn from_gguf_with_kv_kind<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        devices: &DeviceAssignment,
+        gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
         let device = &devices.main;
         let dtype = if device.is_cuda() {
@@ -1224,7 +1266,6 @@ impl Qwen3Model {
                 ""
             },
         );
-        let kv_kind = KvCacheKind::from_env();
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
             layers.push(DecoderLayer::new_from_gguf(
@@ -1902,8 +1943,9 @@ impl Qwen3Model {
         &self.config
     }
 
-    /// The KV cache representation this model was constructed with (read
-    /// once from `CRANE_KV_QUANT` at load time — see [`KvCacheKind::from_env`]).
+    /// The KV cache representation this model was constructed with, either
+    /// from `CRANE_KV_QUANT` (see [`KvCacheKind::from_env`]) or an explicit
+    /// `kv_kind` argument (see [`KvCacheKind::parse`]).
     #[must_use]
     pub fn kv_kind(&self) -> KvCacheKind {
         self.kv_kind
@@ -2447,7 +2489,10 @@ mod tests {
         assert_eq!(max_kv_len, 3);
 
         let (kv_lens_fp, max_kv_len_fp) = model_fp
-            .setup_batch_decode(&[vec![cache_a_fp[0].clone()], vec![cache_b_fp[0].clone()]], 4)
+            .setup_batch_decode(
+                &[vec![cache_a_fp[0].clone()], vec![cache_b_fp[0].clone()]],
+                4,
+            )
             .expect("fp setup_batch_decode");
         assert_eq!(kv_lens_fp, kv_lens);
         assert_eq!(max_kv_len_fp, max_kv_len);
@@ -2479,8 +2524,8 @@ mod tests {
             .step_batch_decode(&tokens, &positions, mask.as_ref(), None)
             .expect("fp step_batch_decode");
         assert_eq!(logits.dims(), logits_fp.dims());
-        let scale = max_abs_diff(&logits_fp, &Tensor::zeros_like(&logits_fp).expect("zeros"))
-            .max(1e-3);
+        let scale =
+            max_abs_diff(&logits_fp, &Tensor::zeros_like(&logits_fp).expect("zeros")).max(1e-3);
         let diff = max_abs_diff(&logits, &logits_fp);
         assert!(
             diff < scale,
