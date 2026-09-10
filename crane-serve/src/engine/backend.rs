@@ -14,7 +14,7 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use crane_core::device::{DeviceAssignment, GpuBudget};
-use crane_core::models::modules::quant_kv_cache::KvCacheState;
+use crane_core::models::modules::quant_kv_cache::{KvCacheKind, KvCacheState};
 use tracing::error;
 
 /// Per-layer KV cache for one sequence: a [`KvCacheState`] (plain or
@@ -319,7 +319,9 @@ impl ModelBackend for HunyuanBackend {
                 c.and_then(|s| match s.to_fp_pair(dtype) {
                     Ok(pair) => Some(pair),
                     Err(e) => {
-                        error!("Hunyuan set_kv_caches: failed to convert layer state, dropping: {e}");
+                        error!(
+                            "Hunyuan set_kv_caches: failed to convert layer state, dropping: {e}"
+                        );
                         None
                     },
                 })
@@ -678,6 +680,37 @@ impl Qwen3Backend {
         gpu_budget: &GpuBudget,
     ) -> Result<Self> {
         let model = crane_core::models::qwen3::Model::new(model_path, devices, dtype, gpu_budget)?;
+        Ok(Self {
+            model,
+            dtype: *dtype,
+        })
+    }
+
+    /// `kv_quant` requests KV-cache quantization (`--kv-quant` /
+    /// `CRANE_KV_QUANT`); `None` falls back to the `CRANE_KV_QUANT` env var
+    /// inside the model loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model fails to load from `model_path`.
+    pub fn new_with_options(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        gpu_budget: &GpuBudget,
+        kv_quant: Option<KvCacheKind>,
+    ) -> Result<Self> {
+        let model = match kv_quant {
+            Some(kind) => crane_core::models::qwen3::Model::new_with_options(
+                model_path,
+                devices,
+                dtype,
+                crane_core::models::qwen3::ModelFormat::Auto,
+                gpu_budget,
+                kind,
+            )?,
+            None => crane_core::models::qwen3::Model::new(model_path, devices, dtype, gpu_budget)?,
+        };
         Ok(Self {
             model,
             dtype: *dtype,
