@@ -65,6 +65,12 @@ pub struct Args {
     /// q8_0). Currently supported for qwen3_5 only. Overrides `CRANE_ISQ`.
     #[arg(long)]
     pub quant: Option<String>,
+    /// KV-cache quantization level: `int8` (~2x smaller) or `int4` (~4x
+    /// smaller). A separate setting from `--quant` (that's the model's
+    /// weights; this is the attention cache). Currently supported for
+    /// qwen3 only. Overrides `CRANE_KV_QUANT`.
+    #[arg(long)]
+    pub kv_quant: Option<String>,
     /// Compute dtype: f16, bf16 or f32. Defaults per device: BF16 on CUDA,
     /// F16 on ROCm and Metal, and F32 on CPU.
     #[arg(long)]
@@ -1288,6 +1294,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             &dtype,
             format,
             args.quant.as_deref(),
+            args.kv_quant.as_deref(),
             &gpu_budget,
         )?;
         info!(

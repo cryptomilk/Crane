@@ -8,6 +8,7 @@ use anyhow::Context;
 use anyhow::Result;
 use candle_core::{DType, Device};
 use crane_core::device::{DeviceAssignment, GpuBudget};
+use crane_core::models::modules::quant_kv_cache::KvCacheKind;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -473,14 +474,17 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 /// Create a model backend.
 ///
 /// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
-/// `q4k`, `q8_0`); only backends that support it accept the flag. `gpu_budget`
-/// constrains MoE expert placement; only backends with MoE experts consume it.
+/// `q4k`, `q8_0`); only backends that support it accept the flag. `kv_quant`
+/// requests KV-cache quantization (`int8`/`int4`) — a separate, unrelated
+/// setting (weights vs. the attention cache); only backends that support it
+/// accept the flag. `gpu_budget` constrains MoE expert placement; only
+/// backends with MoE experts consume it.
 ///
 /// # Errors
 ///
-/// Returns an error if `quant` is requested for an unsupported model type, the
-/// model type/format combination is unsupported, or the underlying backend
-/// fails to load.
+/// Returns an error if `quant` or `kv_quant` is requested for an unsupported
+/// model type, `kv_quant` isn't a recognized value, the model type/format
+/// combination is unsupported, or the underlying backend fails to load.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
@@ -488,6 +492,7 @@ pub fn create_backend(
     dtype: &DType,
     format: ModelFormat,
     quant: Option<&str>,
+    kv_quant: Option<&str>,
     gpu_budget: &GpuBudget,
 ) -> Result<Box<dyn ModelBackend>> {
     let model_type = resolve(model_type, model_path);
@@ -498,6 +503,17 @@ pub fn create_backend(
             "--quant (in-situ quantization) is currently only supported for qwen3_5 models; \
              for other models use a GGUF checkpoint with --format gguf"
         );
+    }
+
+    let kv_quant = kv_quant
+        .map(|s| {
+            KvCacheKind::parse(s).ok_or_else(|| {
+                anyhow::anyhow!("invalid --kv-quant value {s:?} (expected \"int8\" or \"int4\")")
+            })
+        })
+        .transpose()?;
+    if kv_quant.is_some() && model_type != ModelType::Qwen3 {
+        anyhow::bail!("--kv-quant is currently only supported for qwen3 models");
     }
 
     match model_type {
@@ -534,11 +550,12 @@ pub fn create_backend(
             )?))
         },
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
-        ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(
+        ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new_with_options(
             model_path,
             &DeviceAssignment::uniform(device),
             dtype,
             gpu_budget,
+            kv_quant,
         )?)),
         ModelType::Qwen3_5 => {
             let quant = quant
@@ -774,6 +791,46 @@ pub fn create_asr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── create_backend kv_quant validation ──
+
+    #[test]
+    fn create_backend_rejects_invalid_kv_quant() {
+        let result = create_backend(
+            ModelType::Qwen3,
+            "unused",
+            &Device::Cpu,
+            &DType::F32,
+            ModelFormat::Auto,
+            None,
+            Some("bogus"),
+            &GpuBudget::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected an error for an invalid --kv-quant value"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("invalid --kv-quant value"));
+    }
+
+    #[test]
+    fn create_backend_rejects_kv_quant_for_non_qwen3() {
+        let result = create_backend(
+            ModelType::Qwen25,
+            "unused",
+            &Device::Cpu,
+            &DType::F32,
+            ModelFormat::Auto,
+            None,
+            Some("int8"),
+            &GpuBudget::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("expected an error for --kv-quant on a non-qwen3 model"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("only supported for qwen3"));
+    }
 
     // ── ModelType::from_str ──
 

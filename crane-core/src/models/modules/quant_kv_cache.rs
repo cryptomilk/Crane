@@ -243,7 +243,6 @@ impl KvCacheState {
             },
         }
     }
-
 }
 
 fn tensor_bytes(t: Option<&Tensor>) -> usize {
@@ -265,10 +264,23 @@ impl KvCacheKind {
     /// Read from `CRANE_KV_QUANT` (`int8` → Int8, `int4` → Int4, else Fp).
     #[must_use]
     pub fn from_env() -> Self {
-        match std::env::var("CRANE_KV_QUANT").as_deref() {
-            Ok("int8") => Self::Int8,
-            Ok("int4") => Self::Int4,
-            _ => Self::Fp,
+        std::env::var("CRANE_KV_QUANT")
+            .ok()
+            .and_then(|s| Self::parse(&s))
+            .unwrap_or(Self::Fp)
+    }
+
+    /// Parse an explicit value (e.g. from a `--kv-quant` CLI flag),
+    /// trimmed and lowercased. `None` for anything other than
+    /// `"int8"`/`"int4"` — unlike [`Self::from_env`], which silently falls
+    /// back to `Fp` for an unset or unrecognized env var, an explicit CLI
+    /// value should fail loudly on a typo rather than silently do nothing.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "int8" => Some(Self::Int8),
+            "int4" => Some(Self::Int4),
+            _ => None,
         }
     }
 }
@@ -688,6 +700,24 @@ mod tests {
     fn rand_kv(b: usize, h: usize, s: usize, d: usize) -> Tensor {
         // Scaled up so quantization error isn't dominated by eps.
         (Tensor::randn(0f32, 1f32, (b, h, s, d), &Device::Cpu).unwrap() * 4.0).unwrap()
+    }
+
+    #[test]
+    fn kv_cache_kind_parse_recognizes_int8_and_int4() {
+        assert_eq!(KvCacheKind::parse("int8"), Some(KvCacheKind::Int8));
+        assert_eq!(KvCacheKind::parse("int4"), Some(KvCacheKind::Int4));
+    }
+
+    #[test]
+    fn kv_cache_kind_parse_rejects_unknown_values() {
+        assert_eq!(KvCacheKind::parse("fp"), None);
+        assert_eq!(KvCacheKind::parse(""), None);
+    }
+
+    #[test]
+    fn kv_cache_kind_parse_normalizes_case_and_whitespace() {
+        assert_eq!(KvCacheKind::parse("INT8"), Some(KvCacheKind::Int8));
+        assert_eq!(KvCacheKind::parse(" int4 "), Some(KvCacheKind::Int4));
     }
 
     // Per-token symmetric quantization guarantees |x/scale| <= qmax, so the
