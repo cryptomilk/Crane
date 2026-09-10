@@ -103,6 +103,14 @@ impl Model {
         self.inner.clear_kv_cache();
     }
 
+    /// Bytes of KV cache one sequence consumes per generated token. See
+    /// [`Config::kv_bytes_per_token`].
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        self.inner
+            .config()
+            .kv_bytes_per_token(self.dtype.size_in_bytes())
+    }
+
     fn from_pretrained(
         model_path: &str,
         devices: &DeviceAssignment,
