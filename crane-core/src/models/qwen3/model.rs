@@ -12,6 +12,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 // TODO(candle-transformers-removal): Generation helpers only; see CANDLE_TRANSFORMERS.md.
 use candle_transformers::generation::LogitsProcessor;
+use ribo::utils::log;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
@@ -143,8 +144,8 @@ impl Model {
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
         let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
 
-        eprintln!(
-            "GGUF loaded: {} tensors, {} metadata entries",
+        log::info!(
+            "GGUF header parsed: {} tensors, {} metadata entries",
             ct.tensor_infos.len(),
             ct.metadata.len(),
         );
