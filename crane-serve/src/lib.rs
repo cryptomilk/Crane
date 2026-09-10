@@ -1743,10 +1743,8 @@ mod config_tests {
         // headroom calculation use the inflated configured limit.
         let cfg_inflated = memory_config_for_test(0, 20 << 30, 1 << 30);
         let cfg_matching = memory_config_for_test(0, 10 << 30, 1 << 30);
-        let clamped =
-            derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
-        let unclamped =
-            derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
+        let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
+        let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
         assert_eq!(clamped, unclamped);
     }
 }

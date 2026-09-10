@@ -47,11 +47,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use candle_core::Tensor;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use backend::ModelBackend;
+use crane_core::models::modules::quant_kv_cache::KvCacheState;
 use crane_core::utils::token_output_stream::TokenOutputStream;
 use memory::{format_bytes_engine, query_gpu_memory_usage};
 use sampling::SamplingBuffers;
@@ -839,7 +839,7 @@ impl InferenceEngine {
         self.flush_active_kv_for_batch();
 
         // Collect KV caches and setup batched decode.
-        let kv_caches: Vec<Vec<Option<(Tensor, Tensor)>>> = batch
+        let kv_caches: Vec<Vec<Option<KvCacheState>>> = batch
             .iter()
             .map(|id| self.sequences.get(id).unwrap().kv_caches.clone())
             .collect();

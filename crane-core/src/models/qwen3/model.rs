@@ -19,6 +19,7 @@ use super::modeling::{BatchKvCache, Config, Qwen3Model};
 use crate::device::{DeviceAssignment, GpuBudget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
+use crate::models::modules::quant_kv_cache::{KvCacheKind, KvCacheState};
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::tokenizer_utils;
 use crate::utils::utils;
@@ -105,10 +106,19 @@ impl Model {
 
     /// Bytes of KV cache one sequence consumes per generated token. See
     /// [`Config::kv_bytes_per_token`].
+    ///
+    /// Conservative for a quantized cache: both `Int8` and `Int4` claim only
+    /// the confirmed ~2x saving (1 byte/element), not `Int4`'s real ~4x —
+    /// deliberately under-claiming rather than risk another over-optimistic
+    /// VRAM estimate (see git history for why that matters here).
     pub fn kv_bytes_per_token(&self) -> u64 {
+        let effective_dtype_bytes = match self.inner.kv_kind() {
+            KvCacheKind::Fp => self.dtype.size_in_bytes(),
+            KvCacheKind::Int8 | KvCacheKind::Int4 => 1,
+        };
         self.inner
             .config()
-            .kv_bytes_per_token(self.dtype.size_in_bytes())
+            .kv_bytes_per_token(effective_dtype_bytes)
     }
 
     fn from_pretrained(
@@ -204,11 +214,11 @@ impl Model {
         self.inner.num_layers()
     }
 
-    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    pub fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
         self.inner.get_kv_caches()
     }
 
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
         self.inner.set_kv_caches(caches);
     }
 
@@ -224,7 +234,7 @@ impl Model {
     /// Returns an error if the batch decode setup fails.
     pub fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         self.inner.setup_batch_decode(seq_kv_caches, extra_room)

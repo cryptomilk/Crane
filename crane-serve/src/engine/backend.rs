@@ -14,10 +14,12 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use crane_core::device::{DeviceAssignment, GpuBudget};
+use crane_core::models::modules::quant_kv_cache::KvCacheState;
+use tracing::error;
 
-/// Per-layer KV cache for one sequence: `(K, V)` per layer, or `None` for
-/// layers with no cached state yet.
-pub type SequenceKvCaches = Vec<Option<(Tensor, Tensor)>>;
+/// Per-layer KV cache for one sequence: a [`KvCacheState`] (plain or
+/// quantized) per layer, or `None` for layers with no cached state yet.
+pub type SequenceKvCaches = Vec<Option<KvCacheState>>;
 
 // ─────────────────────────────────────────────────────────────
 //  Trait
@@ -297,12 +299,33 @@ impl ModelBackend for HunyuanBackend {
         true
     }
 
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
-        self.model.get_kv_caches()
+    // Hunyuan has no `CRANE_KV_QUANT` support and never will produce a
+    // `Quant` state; these wrap/unwrap at the boundary so its own
+    // batch-decode/KV-swap code (which predates `KvCacheState`) never needs
+    // to know the type exists.
+    fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
+        self.model
+            .get_kv_caches()
+            .into_iter()
+            .map(|c| c.map(|(k, v)| KvCacheState::Fp(k, v)))
+            .collect()
     }
 
-    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
-        self.model.set_kv_caches(caches);
+    fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
+        let dtype = self.model.dtype;
+        let plain = caches
+            .into_iter()
+            .map(|c| {
+                c.and_then(|s| match s.to_fp_pair(dtype) {
+                    Ok(pair) => Some(pair),
+                    Err(e) => {
+                        error!("Hunyuan set_kv_caches: failed to convert layer state, dropping: {e}");
+                        None
+                    },
+                })
+            })
+            .collect();
+        self.model.set_kv_caches(plain);
     }
 
     fn active_kv_cache_bytes(&self) -> u64 {
@@ -317,10 +340,20 @@ impl ModelBackend for HunyuanBackend {
 
     fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
-        self.model.setup_batch_decode(seq_kv_caches, extra_room)
+        let dtype = self.model.dtype;
+        let plain = seq_kv_caches
+            .iter()
+            .map(|layers| {
+                layers
+                    .iter()
+                    .map(|c| c.clone().map(|s| s.to_fp_pair(dtype)).transpose())
+                    .collect::<candle_core::Result<Vec<_>>>()
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        self.model.setup_batch_decode(&plain, extra_room)
     }
 
     fn step_batch_decode(
@@ -343,9 +376,18 @@ impl ModelBackend for HunyuanBackend {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
-        self.model
-            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
+    ) -> candle_core::Result<Vec<Vec<Option<KvCacheState>>>> {
+        Ok(self
+            .model
+            .extract_batch_kv(kv_lens, original_max_kv, rounds_done)?
+            .into_iter()
+            .map(|layers| {
+                layers
+                    .into_iter()
+                    .map(|c| c.map(|(k, v)| KvCacheState::Fp(k, v)))
+                    .collect()
+            })
+            .collect())
     }
 
     fn build_batch_decode_mask(
@@ -698,11 +740,11 @@ impl ModelBackend for Qwen3Backend {
         true
     }
 
-    fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
         self.model.get_kv_caches()
     }
 
-    fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
         self.model.set_kv_caches(caches);
     }
 
@@ -722,7 +764,7 @@ impl ModelBackend for Qwen3Backend {
 
     fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> candle_core::Result<(Vec<usize>, usize)> {
         self.model.setup_batch_decode(seq_kv_caches, extra_room)
@@ -748,7 +790,7 @@ impl ModelBackend for Qwen3Backend {
         kv_lens: &[usize],
         original_max_kv: usize,
         rounds_done: usize,
-    ) -> candle_core::Result<Vec<Vec<Option<(Tensor, Tensor)>>>> {
+    ) -> candle_core::Result<Vec<Vec<Option<KvCacheState>>>> {
         self.model
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }

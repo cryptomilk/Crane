@@ -49,8 +49,8 @@ use crate::device::{
     DeviceAssignment, GpuBudget, WeightBudget, format_budget, greedy_fit_layers, query_gpu_memory,
 };
 use crate::models::modules::flash_attn::dispatch_flash_attn;
-use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
+use crate::models::modules::quant_kv_cache::{FpKvCache, KvCache, KvCacheKind, KvCacheState};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
 
@@ -82,7 +82,7 @@ impl EventTrackingGuard {
 
 /// Per-layer, per-sequence KV cache tensors, as returned by
 /// [`Qwen3Model::extract_batch_kv`].
-pub type BatchKvCache = Vec<Vec<Option<(Tensor, Tensor)>>>;
+pub type BatchKvCache = Vec<Vec<Option<KvCacheState>>>;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -190,10 +190,11 @@ struct Attention {
     head_dim: usize,
     q_dim: usize,
     kv_dim: usize,
-    /// Pre-allocated KV cache buffer (may be larger than `cache_seq_len`).
-    kv_cache: Option<(Tensor, Tensor)>,
-    /// Number of valid (filled) positions in the KV cache buffer.
-    cache_seq_len: usize,
+    /// Per-token K/V cache, plain or quantized depending on `CRANE_KV_QUANT`
+    /// (see [`KvCacheKind::from_env`]). `KvCache::default()` (the `Fp`
+    /// variant) behaves identically to the plain pre-allocated buffer this
+    /// replaced.
+    kv_cache: KvCache,
 }
 
 impl Attention {
@@ -201,7 +202,7 @@ impl Attention {
     // codebase (its `pp`/`device`/`dtype` accessors take `&self` and are
     // cheap to call repeatedly); matching that convention here.
     #[allow(clippy::needless_pass_by_value)]
-    fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &Config, vb: VarBuilder, kv_kind: KvCacheKind) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -277,8 +278,7 @@ impl Attention {
             head_dim,
             q_dim,
             kv_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(kv_kind),
         })
     }
 
@@ -287,6 +287,7 @@ impl Attention {
         config: &Config,
         gg: &mut Gguf<R>,
         layer_idx: usize,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
         let head_dim = config.head_dim();
         let num_heads = config.num_attention_heads;
@@ -320,22 +321,14 @@ impl Attention {
             head_dim,
             q_dim: num_heads * head_dim,
             kv_dim: num_kv_heads * head_dim,
-            kv_cache: None,
-            cache_seq_len: 0,
+            kv_cache: KvCache::new(kv_kind),
         })
     }
 
-    /// Update the pre-allocated KV cache with new K,V tensors.
-    ///
-    /// Uses `slice_set` for O(1) in-place writes when the buffer has room.
-    /// Falls back to cat + reallocate when the buffer is full.
+    /// Append this step's K/V to the cache and return the full cached K/V in
+    /// the compute dtype, ready for attention. See [`KvCache::append`].
     fn update_kv_cache(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let cache = self.kv_cache.take();
-        let prev_seq_len = std::mem::replace(&mut self.cache_seq_len, 0);
-        let update = kv_cache::update_kv_cache(cache, prev_seq_len, k, v)?;
-        self.kv_cache = Some(update.buffer);
-        self.cache_seq_len = update.seq_len;
-        Ok((update.k, update.v))
+        self.kv_cache.append(k, v)
     }
 
     // q/k/v/b/h/s/d are standard ML tensor-shape notation (query, key,
@@ -577,8 +570,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        self.kv_cache = None;
-        self.cache_seq_len = 0;
+        self.kv_cache.reset();
     }
 }
 
@@ -709,8 +701,9 @@ impl DecoderLayer {
         layer_idx: usize,
         vb: VarBuilder,
         expert_device: &Device,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
-        let self_attn = Attention::new(config, vb.pp("self_attn"))?;
+        let self_attn = Attention::new(config, vb.pp("self_attn"), kv_kind)?;
         let moe_config = config.moe_config();
         // HF's `mlp_only_layers` override (per-layer dense exceptions) isn't
         // modeled here; only the uniform `decoder_sparse_step` stride is.
@@ -750,8 +743,9 @@ impl DecoderLayer {
         gg: &mut Gguf<R>,
         layer_idx: usize,
         expert_device: &Device,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
-        let self_attn = Attention::new_from_gguf(config, gg, layer_idx)?;
+        let self_attn = Attention::new_from_gguf(config, gg, layer_idx, kv_kind)?;
         let is_moe = gg.contains_tensor(&format!("blk.{layer_idx}.ffn_gate_inp.weight"));
         let mlp = if is_moe {
             let moe_config = config.moe_config().ok_or_else(|| {
@@ -820,6 +814,10 @@ pub struct Qwen3Model {
     /// Full-sequence post-norm hidden states from the most recent forward
     /// call — see [`Self::last_hidden_states`].
     last_hidden_states: Option<Tensor>,
+    /// KV cache representation in use, read once from `CRANE_KV_QUANT` at
+    /// construction (see [`KvCacheKind::from_env`]). Needed by
+    /// [`Self::extract_batch_kv`] to decide whether to re-quantize.
+    kv_kind: KvCacheKind,
 }
 
 /// `MoE` expert metadata read from GGUF, all `None` for dense
@@ -987,7 +985,30 @@ impl Qwen3Model {
         model_vb: VarBuilder,
         root_vb: VarBuilder,
         expert_device: &Device,
+        gpu_budget: &GpuBudget,
+    ) -> Result<Self> {
+        Self::new_inner_with_kv_kind(
+            config,
+            model_vb,
+            root_vb,
+            expert_device,
+            gpu_budget,
+            KvCacheKind::from_env(),
+        )
+    }
+
+    /// Test-only entry point: like [`Self::new_inner`], but takes an
+    /// explicit `kv_kind` instead of reading `CRANE_KV_QUANT` — avoids
+    /// mutating process-wide env state from parallel tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_inner_with_kv_kind(
+        config: &Config,
+        model_vb: VarBuilder,
+        root_vb: VarBuilder,
+        expert_device: &Device,
         _gpu_budget: &GpuBudget,
+        kv_kind: KvCacheKind,
     ) -> Result<Self> {
         let dtype = model_vb.dtype();
         let embed_tokens = candle_nn::embedding(
@@ -1004,6 +1025,7 @@ impl Qwen3Model {
                 i,
                 layers_vb.pp(i),
                 expert_device,
+                kv_kind,
             )?);
         }
 
@@ -1052,6 +1074,7 @@ impl Qwen3Model {
             config: config.clone(),
             dtype,
             last_hidden_states: None,
+            kv_kind,
         })
     }
 
@@ -1201,6 +1224,7 @@ impl Qwen3Model {
                 ""
             },
         );
+        let kv_kind = KvCacheKind::from_env();
         let mut layers = Vec::with_capacity(num_hidden_layers);
         for i in 0..num_hidden_layers {
             layers.push(DecoderLayer::new_from_gguf(
@@ -1208,6 +1232,7 @@ impl Qwen3Model {
                 &mut gg,
                 i,
                 &expert_devices[i],
+                kv_kind,
             )?);
         }
 
@@ -1246,17 +1271,25 @@ impl Qwen3Model {
             config,
             dtype,
             last_hidden_states: None,
+            kv_kind,
         };
 
         if is_moe_checkpoint
             && !gpu_budget.offload_all_experts
             && let WeightBudget::Limited(total_vram) = gpu_budget.weight_budget
         {
+            // Conservative: both Int8 and Int4 claim only the confirmed ~2x
+            // saving (1 byte/element), not Int4's real ~4x — see
+            // `Model::kv_bytes_per_token`'s doc comment for why.
+            let effective_kv_dtype_bytes = match kv_kind {
+                KvCacheKind::Fp => dtype.size_in_bytes(),
+                KvCacheKind::Int8 | KvCacheKind::Int4 => 1,
+            };
             let runtime_reservation = gpu_budget.runtime_reservation_bytes(
                 num_hidden_layers,
                 num_kv_heads,
                 head_dim,
-                dtype.size_in_bytes(),
+                effective_kv_dtype_bytes,
             );
             model.promote_experts_after_probe(
                 devices,
@@ -1646,56 +1679,46 @@ impl Qwen3Model {
     /// rather than a separately-tracked running position counter.
     #[must_use]
     pub fn kv_cache_len(&self) -> usize {
-        self.layers.first().map_or(0, |l| l.self_attn.cache_seq_len)
+        self.layers
+            .first()
+            .map_or(0, |l| l.self_attn.kv_cache.len())
     }
 
-    /// Total bytes held by the model's KV caches (no GPU copies).
+    /// Total bytes held by the model's KV caches (no GPU copies). Reflects
+    /// the real, smaller footprint when `CRANE_KV_QUANT` is active, since
+    /// [`KvCacheBackend::byte_size`] accounts for whatever representation
+    /// each layer's cache actually stores.
     #[must_use]
     pub fn active_kv_cache_bytes(&self) -> u64 {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map_or(0, |(k, v)| {
-                    let k_bytes = k.elem_count() as u64 * k.dtype().size_in_bytes() as u64;
-                    let v_bytes = v.elem_count() as u64 * v.dtype().size_in_bytes() as u64;
-                    k_bytes + v_bytes
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.byte_size() as u64)
             .sum()
     }
 
-    /// Extract per-layer KV caches (valid portion only, zero-copy narrow views).
-    ///
-    /// The returned views still reference the pre-allocated buffer.  Callers
-    /// that need to free the buffer (e.g. batch-decode extract) should use
-    /// `Tensor::contiguous()` on their side, or clear `seq.kv_caches` after
-    /// consuming the views.
+    /// Extract per-layer KV cache state (valid portion only). Plain or
+    /// quantized depending on the active `CRANE_KV_QUANT` setting — see
+    /// [`KvCacheState`].
     #[must_use]
-    pub fn get_kv_caches(&self) -> Vec<Option<(Tensor, Tensor)>> {
+    pub fn get_kv_caches(&self) -> Vec<Option<KvCacheState>> {
         self.layers
             .iter()
-            .map(|l| {
-                l.self_attn.kv_cache.as_ref().map(|(k, v)| {
-                    let len = l.self_attn.cache_seq_len;
-                    if len > 0 && len < k.dim(2).unwrap_or(0) {
-                        (
-                            k.narrow(2, 0, len).unwrap_or_else(|_| k.clone()),
-                            v.narrow(2, 0, len).unwrap_or_else(|_| v.clone()),
-                        )
-                    } else {
-                        (k.clone(), v.clone())
-                    }
-                })
-            })
+            .map(|l| l.self_attn.kv_cache.extract().ok().flatten())
             .collect()
     }
 
-    /// Restore per-layer KV caches.
-    pub fn set_kv_caches(&mut self, caches: Vec<Option<(Tensor, Tensor)>>) {
+    /// Restore per-layer KV cache state extracted by [`Self::get_kv_caches`].
+    pub fn set_kv_caches(&mut self, caches: Vec<Option<KvCacheState>>) {
         for (layer, cache) in self.layers.iter_mut().zip(caches) {
-            let seq_len = cache.as_ref().map_or(0, |(k, _)| k.dim(2).unwrap_or(0));
-            layer.self_attn.kv_cache = cache;
-            layer.self_attn.cache_seq_len = seq_len;
+            match cache {
+                Some(state) => {
+                    if let Err(e) = layer.self_attn.kv_cache.install(state) {
+                        log::warn!("set_kv_caches: failed to install layer state, resetting: {e}");
+                        layer.self_attn.kv_cache.reset();
+                    }
+                },
+                None => layer.self_attn.kv_cache.reset(),
+            }
         }
     }
 
@@ -1713,12 +1736,13 @@ impl Qwen3Model {
     #[allow(clippy::many_single_char_names)]
     pub fn setup_batch_decode(
         &mut self,
-        seq_kv_caches: &[Vec<Option<(Tensor, Tensor)>>],
+        seq_kv_caches: &[Vec<Option<KvCacheState>>],
         extra_room: usize,
     ) -> Result<(Vec<usize>, usize)> {
         let kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim();
         let device = self.embed_tokens.embeddings().device();
+        let dtype = self.dtype;
 
         let kv_lens: Vec<usize> = seq_kv_caches
             .iter()
@@ -1726,24 +1750,37 @@ impl Qwen3Model {
                 caches
                     .first()
                     .and_then(|c| c.as_ref())
-                    .map_or(0, |(k, _)| k.dim(2).unwrap_or(0))
+                    .and_then(|s| s.seq_len().ok())
+                    .unwrap_or(0)
             })
             .collect();
         let max_kv_len = kv_lens.iter().copied().max().unwrap_or(0);
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let layer_caches: Vec<&Option<(Tensor, Tensor)>> =
-                seq_kv_caches.iter().map(|seq| &seq[layer_idx]).collect();
+            // The batch itself always runs in plain compute dtype regardless
+            // of each sequence's stored representation — dequantize here,
+            // re-quantize on extract (see `extract_batch_kv`).
+            let layer_caches: Vec<Option<(Tensor, Tensor)>> = seq_kv_caches
+                .iter()
+                .map(|seq| {
+                    seq[layer_idx]
+                        .as_ref()
+                        .map(|s| s.to_fp_pair(dtype))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let layer_caches_refs: Vec<&Option<(Tensor, Tensor)>> = layer_caches.iter().collect();
 
             let batched_kv = pad_and_stack_kv_caches(
-                &layer_caches,
+                &layer_caches_refs,
                 max_kv_len,
                 kv_heads,
                 head_dim,
                 device,
-                self.dtype,
+                dtype,
             )?;
 
+            let mut fp_cache = FpKvCache::new();
             if let Some((k, v)) = batched_kv {
                 let k = k.contiguous()?;
                 let v = v.contiguous()?;
@@ -1753,15 +1790,12 @@ impl Qwen3Model {
                     let buf_v = Tensor::zeros((b, h, s + extra_room, d), v.dtype(), v.device())?;
                     buf_k.slice_set(&k, 2, 0)?;
                     buf_v.slice_set(&v, 2, 0)?;
-                    layer.self_attn.kv_cache = Some((buf_k, buf_v));
+                    fp_cache.install_with_headroom(buf_k, buf_v, max_kv_len);
                 } else {
-                    layer.self_attn.kv_cache = Some((k, v));
+                    fp_cache.install_with_headroom(k, v, max_kv_len);
                 }
-                layer.self_attn.cache_seq_len = max_kv_len;
-            } else {
-                layer.self_attn.kv_cache = None;
-                layer.self_attn.cache_seq_len = 0;
             }
+            layer.self_attn.kv_cache = KvCache::Fp(fp_cache);
         }
 
         Ok((kv_lens, max_kv_len))
@@ -1819,31 +1853,44 @@ impl Qwen3Model {
     ) -> Result<BatchKvCache> {
         let n_seqs = kv_lens.len();
         let num_layers = self.layers.len();
-        let mut result: Vec<Vec<Option<(Tensor, Tensor)>>> = (0..n_seqs)
+        let mut result: Vec<Vec<Option<KvCacheState>>> = (0..n_seqs)
             .map(|_| Vec::with_capacity(num_layers))
             .collect();
+        let dtype = self.dtype;
+        let kv_kind = self.kv_kind;
 
+        // Extract every layer's batched state and reset it to a fresh cache
+        // of the correct kind up front, before any fallible per-sequence
+        // slicing below. Otherwise a failure partway through a combined
+        // loop would leave already-processed layers reset while later
+        // layers keep stale batched (Fp) state — a mixed-variant model.
+        let mut layer_states = Vec::with_capacity(num_layers);
         for layer in &mut self.layers {
-            if let Some((ref full_k, ref full_v)) = layer.self_attn.kv_cache {
+            layer_states.push(layer.self_attn.kv_cache.extract()?);
+            layer.self_attn.kv_cache = KvCache::new(kv_kind);
+        }
+
+        for state in layer_states {
+            if let Some(state) = state {
+                // The batch always runs in plain compute dtype (see
+                // `setup_batch_decode`); `to_fp_pair` is a no-op cast here.
+                let (full_k, full_v) = state.to_fp_pair(dtype)?;
                 for i in 0..n_seqs {
                     let row_k = full_k.narrow(0, i, 1)?;
                     let row_v = full_v.narrow(0, i, 1)?;
                     let total = kv_lens[i] + rounds_done;
                     let offset = original_max_kv - kv_lens[i];
                     // Contiguous copy — breaks ref to padded batch buffer.
-                    let clean = Some((
-                        row_k.narrow(2, offset, total)?.contiguous()?,
-                        row_v.narrow(2, offset, total)?.contiguous()?,
-                    ));
-                    result[i].push(clean);
+                    let k = row_k.narrow(2, offset, total)?.contiguous()?;
+                    let v = row_v.narrow(2, offset, total)?.contiguous()?;
+                    // Re-quantize into this sequence's stored representation.
+                    result[i].push(Some(KvCacheState::from_fp_pair(&k, &v, kv_kind)?));
                 }
             } else {
                 for row in &mut result {
                     row.push(None);
                 }
             }
-            layer.self_attn.kv_cache = None;
-            layer.self_attn.cache_seq_len = 0;
         }
 
         Ok(result)
@@ -1853,6 +1900,13 @@ impl Qwen3Model {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The KV cache representation this model was constructed with (read
+    /// once from `CRANE_KV_QUANT` at load time — see [`KvCacheKind::from_env`]).
+    #[must_use]
+    pub fn kv_kind(&self) -> KvCacheKind {
+        self.kv_kind
     }
 
     /// Access the model dtype.
@@ -1931,7 +1985,10 @@ fn pad_and_stack_kv_caches(
             let cur_len = k.dim(2)?;
             let pad_len = max_len - cur_len;
             if pad_len > 0 {
-                let pad = zero_pad.as_ref().unwrap().narrow(2, 0, pad_len)?;
+                let pad = zero_pad
+                    .as_ref()
+                    .expect("zero_pad is Some when pad_len > 0 because max_pad_needed > 0")
+                    .narrow(2, 0, pad_len)?;
                 padded_keys.push(Tensor::cat(&[&pad, k], 2)?);
                 padded_values.push(Tensor::cat(&[&pad, v], 2)?);
             } else {
@@ -2194,6 +2251,252 @@ mod tests {
 
         assert_eq!(out_forward.dims(), out_embeds.dims());
         assert!(max_abs_diff(&out_forward, &out_embeds) < 1e-5);
+    }
+
+    /// With identical weights (one `VarMap` reused across three models),
+    /// quantized KV cache's forward output must stay close to the lossless
+    /// `Fp` baseline through both prefill and a decode step — not just
+    /// structurally valid, but numerically sane. Precise error bounds on
+    /// the quantization math itself are covered in
+    /// `crate::models::modules::quant_kv_cache`'s own tests; this is an
+    /// integration check that the model wiring doesn't introduce its own
+    /// corruption (e.g. wrong dtype, wrong axis) on top of that.
+    #[test]
+    fn test_quantized_kv_forward_close_to_fp() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model_fp = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Fp,
+        )
+        .expect("fp model");
+        let mut model_int8 = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("int8 model");
+        let mut model_int4 = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int4,
+        )
+        .expect("int4 model");
+
+        let prompt = Tensor::new(&[[1u32, 2, 3, 4, 5]], &device).expect("prompt");
+        model_fp.forward(&prompt, 0).expect("fp prefill");
+        model_int8.forward(&prompt, 0).expect("int8 prefill");
+        model_int4.forward(&prompt, 0).expect("int4 prefill");
+
+        let next = Tensor::new(&[[6u32]], &device).expect("next token");
+        let out_fp = model_fp.forward(&next, 5).expect("fp decode");
+        let out_int8 = model_int8.forward(&next, 5).expect("int8 decode");
+        let out_int4 = model_int4.forward(&next, 5).expect("int4 decode");
+
+        assert_eq!(out_fp.dims(), out_int8.dims());
+        assert_eq!(out_fp.dims(), out_int4.dims());
+
+        let scale = max_abs_diff(&out_fp, &Tensor::zeros_like(&out_fp).expect("zeros")).max(1e-3);
+        let diff8 = max_abs_diff(&out_fp, &out_int8);
+        let diff4 = max_abs_diff(&out_fp, &out_int4);
+        assert!(
+            diff8 < scale,
+            "int8 diverged too far from fp: diff={diff8} scale={scale}"
+        );
+        assert!(
+            diff4 < scale,
+            "int4 diverged too far from fp: diff={diff4} scale={scale}"
+        );
+        assert!(!diff8.is_nan() && !diff4.is_nan());
+    }
+
+    /// The capability the KV-swap interface redesign exists for: a
+    /// quantized sequence's cache must survive being extracted (simulating
+    /// eviction), another sequence running in between, and reinstalling —
+    /// producing an *identical* continuation to an uninterrupted run, since
+    /// `get_kv_caches`/`set_kv_caches` only narrow/reinstall the existing
+    /// quantized tensors (no re-quantization happens on this path, unlike
+    /// the batch-decode path — see `setup_batch_decode`'s doc comment).
+    #[test]
+    fn test_kv_swap_round_trip_preserves_quantized_continuation() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut reference = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("reference model");
+        let prompt = Tensor::new(&[[1u32, 2, 3]], &device).expect("prompt");
+        reference.forward(&prompt, 0).expect("reference prefill");
+        let next = Tensor::new(&[[4u32]], &device).expect("next");
+        let reference_out = reference.forward(&next, 3).expect("reference decode");
+
+        let mut model = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("model");
+        model.forward(&prompt, 0).expect("prefill");
+        let saved = model.get_kv_caches();
+        assert!(saved.iter().all(Option::is_some));
+        assert_eq!(saved[0].as_ref().expect("state").kind(), KvCacheKind::Int8);
+
+        // Another sequence runs on the same model in between.
+        model.clear_kv_cache();
+        let other_prompt = Tensor::new(&[[9u32, 8]], &device).expect("other prompt");
+        model
+            .forward(&other_prompt, 0)
+            .expect("other sequence prefill");
+
+        model.clear_kv_cache();
+        model.set_kv_caches(saved);
+        let resumed_out = model.forward(&next, 3).expect("resumed decode");
+
+        assert_eq!(reference_out.dims(), resumed_out.dims());
+        let diff = max_abs_diff(&reference_out, &resumed_out);
+        assert!(
+            diff < 1e-4,
+            "KV swap round trip diverged from uninterrupted continuation: {diff}"
+        );
+    }
+
+    /// Quantized KV must also survive the batch-decode path (dequantize at
+    /// `setup_batch_decode`, re-quantize at `extract_batch_kv` — see that
+    /// pair's doc comments), used when multiple sequences decode together.
+    /// Also checks the batched logits stay numerically close to an
+    /// identical-weights `Fp` model run through the same batch sequence,
+    /// not just structurally valid.
+    #[test]
+    fn test_batch_decode_round_trips_quantized_kv() {
+        let cfg = tiny_config();
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+
+        let mut model = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Int8,
+        )
+        .expect("model");
+        // Same varmap (identical weights) at `Fp` — the numerical baseline
+        // the batch-decode logits must stay close to.
+        let mut model_fp = Qwen3Model::new_inner_with_kv_kind(
+            &cfg,
+            vb.clone(),
+            vb.clone(),
+            &device,
+            &GpuBudget::default(),
+            KvCacheKind::Fp,
+        )
+        .expect("fp model");
+
+        let prompt_a = Tensor::new(&[[1u32, 2, 3]], &device).expect("prompt a");
+        let prompt_b = Tensor::new(&[[4u32, 5]], &device).expect("prompt b");
+
+        model.forward(&prompt_a, 0).expect("prefill a");
+        let cache_a = model.get_kv_caches();
+        model.clear_kv_cache();
+
+        model.forward(&prompt_b, 0).expect("prefill b");
+        let cache_b = model.get_kv_caches();
+        model.clear_kv_cache();
+
+        model_fp.forward(&prompt_a, 0).expect("fp prefill a");
+        let cache_a_fp = model_fp.get_kv_caches();
+        model_fp.clear_kv_cache();
+
+        model_fp.forward(&prompt_b, 0).expect("fp prefill b");
+        let cache_b_fp = model_fp.get_kv_caches();
+        model_fp.clear_kv_cache();
+
+        assert_eq!(cache_a[0].as_ref().expect("a").kind(), KvCacheKind::Int8);
+        assert_eq!(cache_b[0].as_ref().expect("b").kind(), KvCacheKind::Int8);
+
+        let (kv_lens, max_kv_len) = model
+            .setup_batch_decode(&[vec![cache_a[0].clone()], vec![cache_b[0].clone()]], 4)
+            .expect("setup_batch_decode");
+        assert_eq!(kv_lens, vec![3, 2]);
+        assert_eq!(max_kv_len, 3);
+
+        let (kv_lens_fp, max_kv_len_fp) = model_fp
+            .setup_batch_decode(&[vec![cache_a_fp[0].clone()], vec![cache_b_fp[0].clone()]], 4)
+            .expect("fp setup_batch_decode");
+        assert_eq!(kv_lens_fp, kv_lens);
+        assert_eq!(max_kv_len_fp, max_kv_len);
+
+        // Width covers the K length *after* this round's append (kv_lens'
+        // max, plus the one new token each sequence appends this round) —
+        // matching `crane-serve/src/engine/mod.rs`'s `mask_width =
+        // original_max_kv + round + 1` for round 0.
+        let mask =
+            build_batch_decode_mask(&kv_lens, max_kv_len, max_kv_len + 1, &device, DType::F32)
+                .expect("mask");
+        let tokens = Tensor::new(&[6u32, 7], &device)
+            .expect("tokens")
+            .reshape((2, 1))
+            .expect("reshape");
+        let positions = [3usize, 2usize];
+        let logits = model
+            .step_batch_decode(&tokens, &positions, mask.as_ref(), None)
+            .expect("step_batch_decode");
+        assert_eq!(logits.dims()[0], 2);
+        let flat = logits
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("to_vec1");
+        assert!(!flat.iter().any(|v| v.is_nan() || v.is_infinite()));
+
+        let logits_fp = model_fp
+            .step_batch_decode(&tokens, &positions, mask.as_ref(), None)
+            .expect("fp step_batch_decode");
+        assert_eq!(logits.dims(), logits_fp.dims());
+        let scale = max_abs_diff(&logits_fp, &Tensor::zeros_like(&logits_fp).expect("zeros"))
+            .max(1e-3);
+        let diff = max_abs_diff(&logits, &logits_fp);
+        assert!(
+            diff < scale,
+            "batch-decode int8 diverged too far from fp: diff={diff} scale={scale}"
+        );
+
+        let extracted = model
+            .extract_batch_kv(&kv_lens, max_kv_len, 1)
+            .expect("extract_batch_kv");
+        assert_eq!(extracted.len(), 2);
+        let state_a = extracted[0][0].as_ref().expect("extracted a");
+        let state_b = extracted[1][0].as_ref().expect("extracted b");
+        assert_eq!(state_a.kind(), KvCacheKind::Int8);
+        assert_eq!(state_b.kind(), KvCacheKind::Int8);
+        assert_eq!(state_a.seq_len().expect("seq_len"), 4); // 3 + 1 round
+        assert_eq!(state_b.seq_len().expect("seq_len"), 3); // 2 + 1 round
     }
 
     /// The CPU `flash_attn` decode path must compute the same attention

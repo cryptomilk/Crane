@@ -244,35 +244,6 @@ impl KvCacheState {
         }
     }
 
-    /// Narrow every constituent tensor along the time dim (2) to
-    /// `[start, start+len)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the range is out of bounds for any buffer.
-    pub fn narrow_seq(&self, start: usize, len: usize) -> Result<Self> {
-        let narrowed = self
-            .buffers()
-            .into_iter()
-            .map(|t| t.narrow(2, start, len))
-            .collect::<Result<Vec<_>>>()?;
-        Self::from_buffers(narrowed, self.kind())
-    }
-
-    /// Make every constituent tensor contiguous (detaching it from whatever
-    /// shared buffer it was a view into).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the underlying tensor operations fail.
-    pub fn contiguous(&self) -> Result<Self> {
-        let made = self
-            .buffers()
-            .into_iter()
-            .map(Tensor::contiguous)
-            .collect::<Result<Vec<_>>>()?;
-        Self::from_buffers(made, self.kind())
-    }
 }
 
 fn tensor_bytes(t: Option<&Tensor>) -> usize {
@@ -955,13 +926,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rebuilt.seq_len().unwrap(), 3);
-    }
-
-    #[test]
-    fn kv_cache_state_narrow_seq() {
-        let fp = KvCacheState::Fp(rand_kv(1, 2, 10, 8), rand_kv(1, 2, 10, 8));
-        let narrowed = fp.narrow_seq(2, 4).unwrap();
-        assert_eq!(narrowed.seq_len().unwrap(), 4);
     }
 
     #[test]
