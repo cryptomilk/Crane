@@ -283,6 +283,19 @@ impl KvCacheKind {
             _ => None,
         }
     }
+
+    /// Human-readable description for startup logging, so it's always
+    /// possible to tell which mode actually ended up active (an explicit
+    /// `--kv-quant`/`new_with_kv_kind` request vs. the `CRANE_KV_QUANT` env
+    /// var vs. neither) without re-deriving it from the request itself.
+    #[must_use]
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Fp => "fp16/bf16 (unquantized)",
+            Self::Int8 => "int8 (quantized, ~2x smaller)",
+            Self::Int4 => "int4 (quantized, ~4x smaller)",
+        }
+    }
 }
 
 /// Per-layer K/V cache. A thin enum dispatcher over the concrete backends so

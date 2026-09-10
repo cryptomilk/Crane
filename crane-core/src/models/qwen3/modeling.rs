@@ -1037,6 +1037,7 @@ impl Qwen3Model {
         _gpu_budget: &GpuBudget,
         kv_kind: KvCacheKind,
     ) -> Result<Self> {
+        log::info!("KV cache: {}", kv_kind.describe());
         let dtype = model_vb.dtype();
         let embed_tokens = EmbeddingLayer::Dense(candle_nn::embedding(
             config.vocab_size,
@@ -1257,6 +1258,7 @@ impl Qwen3Model {
             }
         };
 
+        log::info!("KV cache: {}", kv_kind.describe());
         log::info!(
             "Loading {num_hidden_layers} layers from GGUF (attention{} weights stay quantized)...",
             if is_moe_checkpoint {
