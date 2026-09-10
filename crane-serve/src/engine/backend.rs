@@ -83,6 +83,15 @@ pub trait ModelBackend: Send + 'static {
         0
     }
 
+    /// Bytes of KV cache one sequence consumes per generated token, if this
+    /// backend's cache layout is a simple per-layer rate. `None` for
+    /// architectures where a generic formula would be wrong (hybrid
+    /// recurrent/linear-attention layers, cross-layer KV sharing) or not yet
+    /// computed for this backend.
+    fn kv_bytes_per_token(&self) -> Option<u64> {
+        None
+    }
+
     // ── Batch decode (GPU-efficient concurrent serving) ───────
 
     /// Whether this backend supports batched decoding.
@@ -699,6 +708,10 @@ impl ModelBackend for Qwen3Backend {
 
     fn active_kv_cache_bytes(&self) -> u64 {
         self.model.active_kv_cache_bytes()
+    }
+
+    fn kv_bytes_per_token(&self) -> Option<u64> {
+        Some(self.model.kv_bytes_per_token())
     }
 
     // ── Batch decode ──
