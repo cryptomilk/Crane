@@ -251,12 +251,12 @@ impl Attention {
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("q_norm"),
                 )?),
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -746,12 +746,12 @@ impl DecoderLayer {
             )?),
             _ => MlpOrMoe::Dense(Mlp::new(config, vb.pp("mlp"))?),
         };
-        let input_layernorm = candle_nn::rms_norm(
+        let input_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
+        let post_attention_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -1081,8 +1081,11 @@ impl Qwen3Model {
             )?);
         }
 
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
         // Pre-stored in F32 only when the compute dtype is F16: raw logits
         // over a 100k+ vocab routinely exceed F16's 65504 max, and
