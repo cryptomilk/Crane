@@ -106,13 +106,14 @@ impl GpuBudget {
     /// a plain tensor-size calculation.
     ///
     /// `num_layers`, `num_kv_heads`, and `head_dim` come from the model's
-    /// own config; `dtype_bytes` is the KV cache's own per-element byte
-    /// cost (the compute dtype's `size_in_bytes()` today; a future
-    /// quantized KV cache would pass its own smaller per-element size
-    /// here instead — this function's overhead accounting is unaffected
-    /// either way). [`Self::max_concurrent`] defaults to `1` and
-    /// [`Self::max_seq_len`] defaults to `4096` when unset, since the real
-    /// values may not be known yet at the point this is called.
+    /// own config; `dtype_bytes` should always be the compute dtype's
+    /// `size_in_bytes()`, even for a quantized KV cache — batch decode,
+    /// KV-swap/preemption, and prefill all fully dequantize to the compute
+    /// dtype, so reserving at the smaller quantized storage size would
+    /// under-claim VRAM against that worst case.
+    /// [`Self::max_concurrent`] defaults to `1` and [`Self::max_seq_len`]
+    /// defaults to `4096` when unset, since the real values may not be
+    /// known yet at the point this is called.
     #[must_use]
     pub fn runtime_reservation_bytes(
         &self,
