@@ -44,6 +44,7 @@ pub use types::{EngineHandle, EngineRequest, EngineResponse, GenerationParams};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -63,6 +64,20 @@ use sequence::{Sequence, SequenceStatus};
 /// step's intermediate state (causal-mask allocation, attention logits, GDN
 /// recurrent scratch) stays bounded. See [`InferenceEngine::step_prefill`].
 const PREFILL_CHUNK_SIZE: usize = 2048;
+
+/// Whether to log real/tracked VRAM usage on every engine step
+/// (`CRANE_VRAM_TRACE=1`).
+///
+/// Diagnostic for confirming or ruling out a real-VRAM leak over a long
+/// decode run (e.g. a caching allocator never reusing buffers for a
+/// strictly growing KV length) — unlike [`InferenceEngine::log_stats`],
+/// which only logs every 50 steps, this fires every step so a leak can be
+/// seen trending well before a crash a few hundred tokens in.
+#[must_use]
+fn vram_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRANE_VRAM_TRACE").as_deref() == Ok("1"))
+}
 
 // ─────────────────────────────────────────────────────────────
 //  InferenceEngine
@@ -306,6 +321,17 @@ impl InferenceEngine {
 
                         if self.step_counter.is_multiple_of(50) {
                             self.log_stats();
+                        }
+
+                        if vram_trace_enabled() {
+                            let (gpu_used, gpu_total) = query_gpu_memory_usage(self.model.device());
+                            debug!(
+                                step = self.step_counter,
+                                tracked_kv = %format_bytes_engine(self.tracked_kv_bytes),
+                                gpu_used = %format_bytes_engine(gpu_used),
+                                gpu_total = %format_bytes_engine(gpu_total),
+                                "CRANE_VRAM_TRACE",
+                            );
                         }
                     },
                     None => {
