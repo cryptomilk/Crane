@@ -166,6 +166,38 @@ pub(super) fn query_gpu_memory_usage(_device: &Device) -> (u64, u64) {
     (0, 0)
 }
 
+/// Raise a KV budget to fit at least one full `max_seq_len` sequence.
+///
+/// A configured `max_seq_len` must be satisfiable by at least one sequence,
+/// or eviction has nothing else to blame and loops forever evicting the only
+/// sequence, re-prefilling it, and evicting it again. Floors at only one
+/// sequence's worth, not `max_concurrent` of them — a bigger floor would
+/// blunt eviction's whole purpose of triggering under real multi-sequence
+/// contention.
+///
+/// Returns `budget` unchanged when `kv_bytes_per_token` is `None` (the
+/// backend's cache layout doesn't support a simple per-token rate).
+/// `max_seq_len == 0` (unlimited) falls back to `DEFAULT_SEQ_LEN`, mirroring
+/// `GpuBudget::runtime_reservation_bytes`'s default.
+pub(super) fn floor_kv_budget(
+    budget: u64,
+    kv_bytes_per_token: Option<u64>,
+    max_seq_len: usize,
+) -> u64 {
+    const DEFAULT_SEQ_LEN: u64 = 4096;
+
+    let Some(kv_bytes_per_token) = kv_bytes_per_token else {
+        return budget;
+    };
+    let seq_len = if max_seq_len > 0 {
+        max_seq_len as u64
+    } else {
+        DEFAULT_SEQ_LEN
+    };
+    let min_required = kv_bytes_per_token.saturating_mul(seq_len);
+    budget.max(min_required)
+}
+
 /// Format a byte count as a human-readable string (used in engine log messages).
 pub(super) fn format_bytes_engine(bytes: u64) -> String {
     if bytes >= 1 << 30 {
@@ -274,5 +306,30 @@ mod tests {
         assert_eq!(format_bytes_engine(1u64 << 30), "1.0G");
         assert_eq!(format_bytes_engine(1u64 << 20), "1M");
         assert_eq!(format_bytes_engine(512), "512B");
+    }
+
+    #[test]
+    fn floor_kv_budget_leaves_sufficient_budget_untouched() {
+        assert_eq!(floor_kv_budget(1_000_000, Some(100), 4096), 1_000_000);
+    }
+
+    #[test]
+    fn floor_kv_budget_raises_insufficient_budget() {
+        assert_eq!(floor_kv_budget(100, Some(1000), 4096), 1000 * 4096);
+    }
+
+    #[test]
+    fn floor_kv_budget_passes_through_when_backend_has_no_rate() {
+        assert_eq!(floor_kv_budget(100, None, 4096), 100);
+    }
+
+    #[test]
+    fn floor_kv_budget_unlimited_max_seq_len_uses_default() {
+        assert_eq!(floor_kv_budget(0, Some(1000), 0), 1000 * 4096);
+    }
+
+    #[test]
+    fn floor_kv_budget_saturates_on_overflow() {
+        assert_eq!(floor_kv_budget(0, Some(u64::MAX), 4096), u64::MAX);
     }
 }
