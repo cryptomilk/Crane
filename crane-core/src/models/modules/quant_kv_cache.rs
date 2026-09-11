@@ -4,9 +4,12 @@
 //! linear-attention (GDN) blocks carry a constant-size recurrent state instead
 //! (see [`crate::ops::gdn::GdnLayerCache`]), so the context-growing part of the
 //! cache lives in just these layers. On plain Qwen 3, every layer will use
-//! this cache. At long context that K/V dominates memory, which is why quantizing
-//! it lets a single agent hold much more context locally (e.g. Ornith-9B's
-//! full 262K window on a 24 GB GPU).
+//! this cache. At long context that K/V dominates memory, which is why
+//! quantizing shrinks the *stored* K/V codes. [`QuantKvCache`] currently also
+//! keeps a full-size dequantized scratch buffer alongside those codes (see
+//! its struct doc), so today this does not reduce peak memory. A fused
+//! dequantize-in-attention kernel that drops the scratch buffer is the
+//! planned follow-up to actually shrink peak memory.
 //!
 //! # Backends behind one contract
 //!
@@ -133,9 +136,10 @@ impl KvCacheState {
     }
 
     /// Dequantize to a plain `(K, V)` pair in `dtype`. A no-op cast for
-    /// `Fp` (already plain); for `Quant`, this is the same
-    /// [`dequantize_per_token`] full-cache dequantization
-    /// [`QuantKvCache::append`] does on every step.
+    /// `Fp` (already plain); for `Quant`, this applies
+    /// [`dequantize_per_token`] to the full cache in one call — unlike
+    /// [`QuantKvCache::append`], which dequantizes only newly appended
+    /// tokens and keeps the rest in a persistent scratch buffer.
     ///
     /// # Errors
     ///
@@ -292,8 +296,8 @@ impl KvCacheKind {
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Fp => "fp16/bf16 (unquantized)",
-            Self::Int8 => "int8 (quantized, ~2x smaller)",
-            Self::Int4 => "int4 (quantized, ~4x smaller)",
+            Self::Int8 => "int8 (quantized, stored codes ~2x smaller than fp16)",
+            Self::Int4 => "int4 (quantized, stored codes ~4x smaller than fp16)",
         }
     }
 }
@@ -516,9 +520,14 @@ impl KvCacheBackend for FpKvCache {
 /// - 4-bit: two nibbles packed per byte (`[B,H,S,head_dim/2]`), ~4x smaller.
 ///
 /// On read the filled span is dequantized to the compute dtype, so attention is
-/// unchanged. Read dequantizes the whole filled cache each step — trading
-/// decode bandwidth for the memory win that lets long context fit; a fused
-/// dequantize-in-attention kernel is the perf follow-up.
+/// unchanged. Only newly appended tokens are dequantized each step — the
+/// result is kept in a persistent scratch buffer alongside the quantized
+/// codes, so a step costs O(new tokens), not O(total cached); a fused
+/// dequantize-in-attention kernel that drops the scratch buffer entirely is
+/// the perf follow-up. Until that kernel lands, the scratch buffer holds the
+/// full dequantized history, so peak memory is not reduced versus
+/// [`FpKvCache`] — quantization only shrinks the stored codes, not what
+/// attention actually reads from.
 #[derive(Debug)]
 pub struct QuantKvCache {
     bits: u32,
@@ -526,6 +535,12 @@ pub struct QuantKvCache {
     k_scale: Option<Tensor>,
     v_codes: Option<Tensor>,
     v_scale: Option<Tensor>,
+    /// Persistent dequantized key scratch, grown the same way as the codes —
+    /// avoids re-dequantizing already-cached positions on every step.
+    k_dequant: Option<Tensor>,
+    /// Persistent dequantized value scratch, grown the same way as the codes —
+    /// avoids re-dequantizing already-cached positions on every step.
+    v_dequant: Option<Tensor>,
     seq_len: usize,
     /// Compute/return dtype (set on first append).
     dtype: Option<DType>,
@@ -544,6 +559,8 @@ impl QuantKvCache {
             k_scale: None,
             v_codes: None,
             v_scale: None,
+            k_dequant: None,
+            v_dequant: None,
             seq_len: 0,
             dtype: None,
         }
@@ -609,9 +626,9 @@ fn unpack_nibbles(codes: &Tensor) -> Result<Tensor> {
 }
 
 impl KvCacheBackend for QuantKvCache {
-    // kc_full/ks_full/vc_full/vs_full/k_full/v_full are the natural names for
-    // the six code/scale/dequantized buffers this function threads through,
-    // not a typo risk.
+    // kc/ks/vc/vs/kd_new/vd_new are the natural names for the code/scale/
+    // dequantized-new-token buffers this function threads through, not a
+    // typo risk.
     #[allow(clippy::similar_names)]
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let dtype = *self.dtype.get_or_insert(k.dtype());
@@ -621,14 +638,45 @@ impl KvCacheBackend for QuantKvCache {
         let (kc, ks) = quantize_per_token(k, self.bits)?;
         let (vc, vs) = quantize_per_token(v, self.bits)?;
 
-        let kc_full = grow_append(&mut self.k_codes, &kc, filled)?;
-        let ks_full = grow_append(&mut self.k_scale, &ks, filled)?;
-        let vc_full = grow_append(&mut self.v_codes, &vc, filled)?;
-        let vs_full = grow_append(&mut self.v_scale, &vs, filled)?;
+        grow_append(&mut self.k_codes, &kc, filled)?;
+        grow_append(&mut self.k_scale, &ks, filled)?;
+        grow_append(&mut self.v_codes, &vc, filled)?;
+        grow_append(&mut self.v_scale, &vs, filled)?;
+
+        // Scratch is absent right after `install` (which can't build it
+        // without knowing the compute dtype) — seed it once from the
+        // installed codes/scales before appending the new tokens below.
+        if self.k_dequant.is_none() && filled > 0 {
+            let (Some(kc_buf), Some(ks_buf), Some(vc_buf), Some(vs_buf)) = (
+                self.k_codes.as_ref(),
+                self.k_scale.as_ref(),
+                self.v_codes.as_ref(),
+                self.v_scale.as_ref(),
+            ) else {
+                candle_core::bail!("QuantKvCache::append: filled cache missing codes/scales");
+            };
+            let k_old = dequantize_per_token(
+                &kc_buf.narrow(2, 0, filled)?,
+                &ks_buf.narrow(2, 0, filled)?,
+                self.bits,
+                dtype,
+            )?;
+            let v_old = dequantize_per_token(
+                &vc_buf.narrow(2, 0, filled)?,
+                &vs_buf.narrow(2, 0, filled)?,
+                self.bits,
+                dtype,
+            )?;
+            grow_append(&mut self.k_dequant, &k_old, 0)?;
+            grow_append(&mut self.v_dequant, &v_old, 0)?;
+        }
+
+        let kd_new = dequantize_per_token(&kc, &ks, self.bits, dtype)?;
+        let vd_new = dequantize_per_token(&vc, &vs, self.bits, dtype)?;
+        let k_full = grow_append(&mut self.k_dequant, &kd_new, filled)?;
+        let v_full = grow_append(&mut self.v_dequant, &vd_new, filled)?;
         self.seq_len += add;
 
-        let k_full = dequantize_per_token(&kc_full, &ks_full, self.bits, dtype)?;
-        let v_full = dequantize_per_token(&vc_full, &vs_full, self.bits, dtype)?;
         Ok((k_full, v_full))
     }
 
@@ -637,6 +685,8 @@ impl KvCacheBackend for QuantKvCache {
         self.k_scale = None;
         self.v_codes = None;
         self.v_scale = None;
+        self.k_dequant = None;
+        self.v_dequant = None;
         self.seq_len = 0;
         self.dtype = None;
     }
@@ -650,6 +700,8 @@ impl KvCacheBackend for QuantKvCache {
             + tensor_bytes(self.k_scale.as_ref())
             + tensor_bytes(self.v_codes.as_ref())
             + tensor_bytes(self.v_scale.as_ref())
+            + tensor_bytes(self.k_dequant.as_ref())
+            + tensor_bytes(self.v_dequant.as_ref())
     }
 
     // k_codes/k_scale/v_codes/v_scale are the natural names for the four
@@ -678,6 +730,11 @@ impl KvCacheBackend for QuantKvCache {
 
     // k_codes/k_scale/v_codes/v_scale are the natural names for the four
     // buffers this function installs, not a typo risk.
+    //
+    // Clears the dequantized scratch buffers (rebuilt lazily on the next
+    // `append`, once the compute dtype is known again) — that next `append`
+    // pays a one-time O(filled) reseed cost before returning to the usual
+    // O(new tokens) steady state.
     #[allow(clippy::similar_names)]
     fn install(&mut self, state: KvCacheState) -> Result<()> {
         let KvCacheState::Quant {
@@ -701,6 +758,9 @@ impl KvCacheBackend for QuantKvCache {
         self.k_scale = Some(k_scale);
         self.v_codes = Some(v_codes);
         self.v_scale = Some(v_scale);
+        // Rebuilt lazily on the next `append`, once the compute dtype is known.
+        self.k_dequant = None;
+        self.v_dequant = None;
         Ok(())
     }
 }
@@ -839,6 +899,65 @@ mod tests {
         );
     }
 
+    // Appending many small batches that together cross the ROOM=256 headroom
+    // boundary must still match a single bulk append — exercises the
+    // grow_append reallocation branch for k_dequant/v_dequant that the
+    // single-digit-token tests above never reach.
+    #[test]
+    fn quant_scratch_buffer_growth_across_room_boundary() {
+        let chunk_s = 4;
+        let num_chunks = 66; // 66 * 4 = 264 tokens, past the initial 4+ROOM=260 capacity.
+        let ks: Vec<Tensor> = (0..num_chunks).map(|_| rand_kv(1, 2, chunk_s, 8)).collect();
+        let vs: Vec<Tensor> = (0..num_chunks).map(|_| rand_kv(1, 2, chunk_s, 8)).collect();
+
+        let mut incremental = QuantKvCache::new(8);
+        let (mut k_incremental, mut v_incremental) = (None, None);
+        for (k, v) in ks.iter().zip(vs.iter()) {
+            let (k_full, v_full) = incremental.append(k, v).unwrap();
+            k_incremental = Some(k_full);
+            v_incremental = Some(v_full);
+        }
+        let k_incremental = k_incremental.unwrap();
+        let v_incremental = v_incremental.unwrap();
+        assert_eq!(
+            k_incremental.dim(2).unwrap(),
+            chunk_s * num_chunks,
+            "seq len must reflect all appended chunks after growth"
+        );
+
+        let mut bulk = QuantKvCache::new(8);
+        let k_refs: Vec<&Tensor> = ks.iter().collect();
+        let v_refs: Vec<&Tensor> = vs.iter().collect();
+        let k_all = Tensor::cat(&k_refs, 2).unwrap();
+        let v_all = Tensor::cat(&v_refs, 2).unwrap();
+        let (k_bulk, v_bulk) = bulk.append(&k_all, &v_all).unwrap();
+
+        let diff_k = (&k_incremental - &k_bulk)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let diff_v = (&v_incremental - &v_bulk)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff_k < 1e-4,
+            "K diverged after growth across ROOM boundary: {diff_k}"
+        );
+        assert!(
+            diff_v < 1e-4,
+            "V diverged after growth across ROOM boundary: {diff_v}"
+        );
+    }
+
     #[test]
     fn reset_clears_state() {
         let mut cache = QuantKvCache::new(8);
@@ -921,6 +1040,51 @@ mod tests {
                 .unwrap();
             assert_eq!(orig, got);
         }
+    }
+
+    // Appending after install must exercise the lazy scratch-buffer seed
+    // (dequantized-from-install path) and still match an uninterrupted
+    // append sequence over the same tokens.
+    #[test]
+    fn quant_install_then_append_matches_uninterrupted() {
+        let k0 = rand_kv(1, 2, 3, 8);
+        let v0 = rand_kv(1, 2, 3, 8);
+        let k1 = rand_kv(1, 2, 1, 8);
+        let v1 = rand_kv(1, 2, 1, 8);
+
+        let mut reference = QuantKvCache::new(8);
+        reference.append(&k0, &v0).unwrap();
+        let (ref_k, ref_v) = reference.append(&k1, &v1).unwrap();
+
+        let mut a = QuantKvCache::new(8);
+        a.append(&k0, &v0).unwrap();
+        let state = a.extract().unwrap().expect("non-empty cache");
+
+        let mut b = QuantKvCache::new(8);
+        b.install(state).unwrap();
+        assert_eq!(b.len(), 3);
+        let (got_k, got_v) = b.append(&k1, &v1).unwrap();
+
+        assert_eq!(got_k.dims(), ref_k.dims());
+        assert_eq!(got_v.dims(), ref_v.dims());
+        let diff_k = (got_k - ref_k)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let diff_v = (got_v - ref_v)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff_k < 1e-4, "K diverged after install+append: {diff_k}");
+        assert!(diff_v < 1e-4, "V diverged after install+append: {diff_v}");
     }
 
     #[test]
