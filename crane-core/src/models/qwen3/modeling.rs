@@ -207,12 +207,12 @@ impl Attention {
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("q_norm"),
                 )?),
-                Some(candle_nn::rms_norm(
+                Some(crate::models::with_tracing::rms_norm(
                     head_dim,
                     config.rms_norm_eps,
                     vb.pp("k_norm"),
@@ -659,12 +659,12 @@ impl DecoderLayer {
     fn new(config: &Config, vb: VarBuilder) -> Result<Self> {
         let self_attn = Attention::new(config, vb.pp("self_attn"))?;
         let mlp = Mlp::new(config, vb.pp("mlp"))?;
-        let input_layernorm = candle_nn::rms_norm(
+        let input_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("input_layernorm"),
         )?;
-        let post_attention_layernorm = candle_nn::rms_norm(
+        let post_attention_layernorm = crate::models::with_tracing::rms_norm(
             config.hidden_size,
             config.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
@@ -782,8 +782,11 @@ impl Qwen3Model {
             layers.push(DecoderLayer::new(config, layers_vb.pp(i))?);
         }
 
-        let norm =
-            candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
+        let norm = crate::models::with_tracing::rms_norm(
+            config.hidden_size,
+            config.rms_norm_eps,
+            model_vb.pp("norm"),
+        )?;
 
         let lm_head = if config.tie_word_embeddings {
             embed_tokens.tied_output()?
