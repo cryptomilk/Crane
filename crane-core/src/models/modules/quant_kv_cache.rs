@@ -29,6 +29,8 @@
 
 use candle_core::{D, DType, Result, Tensor};
 
+use crate::utils::DeviceExt;
+
 /// Headroom (in positions) added when (re)allocating, to amortize growth.
 const ROOM: usize = 256;
 
@@ -253,6 +255,49 @@ fn tensor_bytes(t: Option<&Tensor>) -> usize {
     t.map_or(0, |x| x.elem_count() * x.dtype().size_in_bytes())
 }
 
+/// Zero-copy borrow of a [`QuantKvCache`]'s raw codes/scales for the current
+/// valid region, for fused-kernel attention
+/// (`crate::ops::fused_ops::quant_attn`) that dequantizes on the fly instead
+/// of reading a persistent dequantized scratch buffer. Returned by
+/// [`QuantKvCache::quantized_append`]/[`KvCache::try_quantized_append`].
+pub struct QuantizedKvRef {
+    /// Quantized K codes, `[B, num_kv_heads, S, head_dim]` (8-bit) or
+    /// `[B, num_kv_heads, S, head_dim/2]` (4-bit, nibble-packed).
+    pub k_codes: Tensor,
+    /// Per-token f32 dequantization scale for `k_codes`.
+    pub k_scale: Tensor,
+    /// Quantized V codes, same layout as `k_codes`.
+    pub v_codes: Tensor,
+    /// Per-token f32 dequantization scale for `v_codes`.
+    pub v_scale: Tensor,
+    /// Bit width `k_codes`/`v_codes` were quantized at: 4 or 8.
+    pub bits: u32,
+    /// Number of valid cached positions (dim 2 of the code tensors).
+    pub seq_len: usize,
+}
+
+impl QuantizedKvRef {
+    /// Dequantize `k_codes`/`k_scale` to `dtype`. CPU-only fallback path for
+    /// callers that can't run the fused kernel (see
+    /// `crate::ops::fused_ops::quant_attn`'s module doc).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    pub fn dequantize_k(&self, dtype: DType) -> Result<Tensor> {
+        dequantize_per_token(&self.k_codes, &self.k_scale, self.bits, dtype)
+    }
+
+    /// Dequantize `v_codes`/`v_scale` to `dtype`. See [`Self::dequantize_k`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    pub fn dequantize_v(&self, dtype: DType) -> Result<Tensor> {
+        dequantize_per_token(&self.v_codes, &self.v_scale, self.bits, dtype)
+    }
+}
+
 /// Which cache representation to use. Selected once per model load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvCacheKind {
@@ -332,6 +377,40 @@ impl KvCache {
         match self {
             Self::Fp(c) => c.append(k, v),
             Self::Quant(c) => c.append(k, v),
+        }
+    }
+
+    /// Try the fused-kernel append path: quantize and store `k`/`v` without
+    /// maintaining the dequantized scratch buffer, for GPU decode attention
+    /// that dequantizes on the fly (`crate::ops::fused_ops::quant_attn`).
+    ///
+    /// Returns `Ok(None)` — meaning the caller should fall back to
+    /// [`Self::append`] instead — when this cache is [`Self::Fp`] (nothing to
+    /// fuse), `k` is on a device without a fused kernel (only CUDA and `ROCm`
+    /// have one — notably not Metal, which would otherwise silently hit the
+    /// `quant_attn` module's O(total cached) CPU fallback), `k`'s dtype isn't
+    /// one the fused kernels support, or the `CRANE_QUANT_ATTN_FUSED` env var
+    /// is set to `"0"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    pub fn try_quantized_append(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<Option<QuantizedKvRef>> {
+        let has_fused_kernel = k.device().is_cuda() || k.device().is_rocm();
+        let dtype_supported = crate::ops::fused_ops::quant_attn::supports_compute_dtype(k.dtype());
+        if !has_fused_kernel
+            || !dtype_supported
+            || crate::ops::fused_ops::quant_attn::fused_disabled()
+        {
+            return Ok(None);
+        }
+        match self {
+            Self::Fp(_) => Ok(None),
+            Self::Quant(c) => c.quantized_append(k, v).map(Some),
         }
     }
 
@@ -565,6 +644,47 @@ impl QuantKvCache {
             dtype: None,
         }
     }
+
+    /// Quantize and store `k`/`v`, without maintaining the dequantized
+    /// scratch buffer — for GPU decode attention that dequantizes on the fly
+    /// (`crate::ops::fused_ops::quant_attn`) instead of reading it back.
+    ///
+    /// Invalidates the scratch buffer (`k_dequant`/`v_dequant` become
+    /// `None`); a subsequent [`KvCacheBackend::append`] call lazily rebuilds
+    /// it from the stored codes/scales, the same way it already does after
+    /// [`KvCacheBackend::install`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    // k_codes/k_scale/v_codes/v_scale are the natural names for the four
+    // buffers this function threads through, not a typo risk.
+    #[allow(clippy::similar_names)]
+    pub fn quantized_append(&mut self, k: &Tensor, v: &Tensor) -> Result<QuantizedKvRef> {
+        let add = k.dim(2)?;
+        let filled = self.seq_len;
+
+        let (kc, ks) = quantize_per_token(k, self.bits)?;
+        let (vc, vs) = quantize_per_token(v, self.bits)?;
+
+        let k_codes = grow_append(&mut self.k_codes, &kc, filled)?;
+        let k_scale = grow_append(&mut self.k_scale, &ks, filled)?;
+        let v_codes = grow_append(&mut self.v_codes, &vc, filled)?;
+        let v_scale = grow_append(&mut self.v_scale, &vs, filled)?;
+
+        self.k_dequant = None;
+        self.v_dequant = None;
+        self.seq_len += add;
+
+        Ok(QuantizedKvRef {
+            k_codes,
+            k_scale,
+            v_codes,
+            v_scale,
+            bits: self.bits,
+            seq_len: self.seq_len,
+        })
+    }
 }
 
 /// Quantize `[B,H,S,D]` per-token (symmetric) to unsigned codes in
@@ -586,8 +706,14 @@ fn quantize_per_token(x: &Tensor, bits: u32) -> Result<(Tensor, Tensor)> {
     Ok((codes, scale))
 }
 
-/// Inverse of [`quantize_per_token`] into `dtype`.
-fn dequantize_per_token(codes: &Tensor, scale: &Tensor, bits: u32, dtype: DType) -> Result<Tensor> {
+/// Inverse of [`quantize_per_token`] into `dtype`. `pub(crate)` so
+/// `crate::ops::fused_ops::quant_attn`'s CPU fallback can reuse it directly.
+pub(crate) fn dequantize_per_token(
+    codes: &Tensor,
+    scale: &Tensor,
+    bits: u32,
+    dtype: DType,
+) -> Result<Tensor> {
     let offset = f64::from(1u32 << (bits - 1));
     let q = if bits == 8 {
         codes.to_dtype(DType::F32)?
@@ -956,6 +1082,113 @@ mod tests {
             diff_v < 1e-4,
             "V diverged after growth across ROOM boundary: {diff_v}"
         );
+    }
+
+    // `quantized_append` must store the same codes/scales `append` would
+    // (both call `quantize_per_token`), just without maintaining the
+    // dequantized scratch buffer.
+    #[test]
+    fn quantized_append_returns_correct_shapes() {
+        for bits in [8u32, 4] {
+            let k = rand_kv(1, 2, 3, 8);
+            let v = rand_kv(1, 2, 3, 8);
+            let mut cache = QuantKvCache::new(bits);
+            let kv_ref = cache.quantized_append(&k, &v).unwrap();
+
+            assert_eq!(kv_ref.bits, bits);
+            assert_eq!(kv_ref.seq_len, 3);
+            let expected_code_dim = if bits == 8 { 8 } else { 4 };
+            assert_eq!(kv_ref.k_codes.dims(), &[1, 2, 3, expected_code_dim]);
+            assert_eq!(kv_ref.k_scale.dims(), &[1, 2, 3, 1]);
+            assert_eq!(kv_ref.v_codes.dims(), &[1, 2, 3, expected_code_dim]);
+            assert_eq!(kv_ref.v_scale.dims(), &[1, 2, 3, 1]);
+        }
+    }
+
+    // `seq_len` on the returned ref, and the cache's own `len()`, must both
+    // advance across repeated `quantized_append` calls.
+    #[test]
+    fn quantized_append_advances_seq_len() {
+        let mut cache = QuantKvCache::new(8);
+        let kv_ref = cache
+            .quantized_append(&rand_kv(1, 2, 3, 8), &rand_kv(1, 2, 3, 8))
+            .unwrap();
+        assert_eq!(kv_ref.seq_len, 3);
+        assert_eq!(cache.len(), 3);
+
+        let kv_ref = cache
+            .quantized_append(&rand_kv(1, 2, 2, 8), &rand_kv(1, 2, 2, 8))
+            .unwrap();
+        assert_eq!(kv_ref.seq_len, 5);
+        assert_eq!(cache.len(), 5);
+    }
+
+    // After `quantized_append` (which skips the scratch buffer), a
+    // subsequent regular `append` must lazily rebuild the scratch from the
+    // stored codes/scales — same rebuild path `install` already relies on —
+    // and produce the same result as an uninterrupted `append`-only sequence.
+    #[test]
+    fn quantized_append_then_regular_append_matches_uninterrupted() {
+        let k0 = rand_kv(1, 2, 3, 8);
+        let v0 = rand_kv(1, 2, 3, 8);
+        let k1 = rand_kv(1, 2, 1, 8);
+        let v1 = rand_kv(1, 2, 1, 8);
+
+        let mut reference = QuantKvCache::new(8);
+        reference.append(&k0, &v0).unwrap();
+        let (ref_k, ref_v) = reference.append(&k1, &v1).unwrap();
+
+        let mut cache = QuantKvCache::new(8);
+        cache.quantized_append(&k0, &v0).unwrap();
+        let (got_k, got_v) = cache.append(&k1, &v1).unwrap();
+
+        assert_eq!(got_k.dims(), ref_k.dims());
+        let diff_k = (&got_k - &ref_k)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        let diff_v = (&got_v - &ref_v)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff_k < 1e-4,
+            "K diverged after quantized_append + append: {diff_k}"
+        );
+        assert!(
+            diff_v < 1e-4,
+            "V diverged after quantized_append + append: {diff_v}"
+        );
+    }
+
+    // `try_quantized_append` must decline (return `None`) for an `Fp` cache
+    // and for a CPU device, since the fused kernels are GPU-only and there's
+    // nothing to fuse for an unquantized cache.
+    #[test]
+    fn try_quantized_append_declines_fp_cache() {
+        let mut cache = KvCache::new(KvCacheKind::Fp);
+        let got = cache
+            .try_quantized_append(&rand_kv(1, 2, 3, 8), &rand_kv(1, 2, 3, 8))
+            .unwrap();
+        assert!(got.is_none());
+    }
+
+    // See [`try_quantized_append_declines_fp_cache`]: CPU device case.
+    #[test]
+    fn try_quantized_append_declines_cpu_device() {
+        let mut cache = KvCache::new(KvCacheKind::Int8);
+        let got = cache
+            .try_quantized_append(&rand_kv(1, 2, 3, 8), &rand_kv(1, 2, 3, 8))
+            .unwrap();
+        assert!(got.is_none(), "CPU tensors must not take the fused path");
     }
 
     #[test]

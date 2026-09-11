@@ -52,6 +52,7 @@ use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
 use crate::models::modules::quant_kv_cache::{FpKvCache, KvCache, KvCacheKind, KvCacheState};
 use crate::models::modules::rotary::RotaryEmbedding;
+use crate::ops::fused_ops::quant_attn;
 use crate::utils::DeviceExt;
 
 // Reuse the polymorphic linear layer and GGUF loader from the shared Hunyuan module.
@@ -399,9 +400,6 @@ impl Attention {
         let q = q.transpose(1, 2)?;
         let k = k.transpose(1, 2)?;
 
-        // Update KV cache (pre-allocated with slice_set)
-        let (k, v) = self.update_kv_cache(&k, &v)?;
-
         // ── SDPA ──
         let n_rep = self.num_heads / self.num_kv_heads;
         // head_dim is a small model hyperparameter (e.g. <= a few hundred),
@@ -413,6 +411,34 @@ impl Attention {
         // discard anyway.
         #[allow(clippy::cast_possible_truncation)]
         let scale_f32 = scale as f32;
+
+        if n_rep > 1 && seq_len == 1 {
+            // ── Fused dequantize-in-attention for decode, GPU + quantized
+            // cache only (Phase 5.6b) ──
+            // Reads int8/int4 codes + scales directly and dequantizes inside
+            // the QK/SV matmuls instead of reading a fully-dequantized K/V
+            // back from `QuantKvCache`'s scratch buffer, so this step never
+            // materializes a full-context-length compute-dtype K/V tensor.
+            // `try_quantized_append` returns `None` (falling through below)
+            // for an `Fp` cache, a CPU device, or `CRANE_QUANT_ATTN_FUSED=0`.
+            if let Some(kv_ref) = self.kv_cache.try_quantized_append(&k, &v)? {
+                let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+                let scores = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
+                let scores = match attention_mask {
+                    Some(mask) => scores.broadcast_add(mask)?,
+                    None => scores,
+                };
+                let scores = candle_nn::ops::softmax_last_dim(&scores)?;
+                let attn_output = quant_attn::quant_sv_dot(&scores, &kv_ref)?;
+                let attn_output = attn_output
+                    .reshape((b_sz, self.num_heads, self.head_dim))?
+                    .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
+                return self.o_proj.forward(&attn_output);
+            }
+        }
+
+        // Update KV cache (pre-allocated with slice_set)
+        let (k, v) = self.update_kv_cache(&k, &v)?;
 
         if seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
             // ── Fused flash attention for decode (seq_len=1), CPU only ──

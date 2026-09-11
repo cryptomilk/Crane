@@ -20,6 +20,7 @@ use candle_nn::VarBuilder;
 use std::io::{Read, Seek};
 
 use crate::models::hunyuan_dense::modeling::Gguf;
+use crate::ops::fused_ops::quant_attn;
 use crate::ops::linear::{LinearLayer, linear_layer};
 
 // ── Qwen 3.5 RMSNorm (unit-offset) ───────────────────────────────────────
@@ -455,12 +456,18 @@ impl FullAttention {
     // batch, heads, seq_len, head_dim), matching the terminology used
     // throughout this function's comments.
     #[allow(clippy::many_single_char_names)]
+    // This function's length comes from three densely-commented attention
+    // paths (fused quantized decode, GQA-grouped SDPA decode, standard
+    // SDPA); splitting it up further would scatter that rationale across
+    // several small functions without simplifying the control flow itself —
+    // same rationale as `qwen3::modeling::Attention::forward`'s own allow.
+    #[allow(clippy::too_many_lines)]
     pub fn forward(
         &self,
         x: &Tensor,
         rope: RopeSlice<'_>,
         attention_mask: Option<&Tensor>,
-        kv_cache: Option<&mut KvCache>,
+        mut kv_cache: Option<&mut KvCache>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -512,6 +519,29 @@ impl FullAttention {
         let q = apply_mrope(&q, rope.cos, rope.sin, rope.rot_dim)?;
         let k = apply_mrope(&k, rope.cos, rope.sin, rope.rot_dim)?;
 
+        let n_rep = self.num_heads / self.num_kv_heads;
+        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+        if n_rep > 1
+            && seq_len == 1
+            && !legacy_attn_expand()
+            && let Some(y) = self.try_fused_decode(
+                &q,
+                &k,
+                &v,
+                b_sz,
+                seq_len,
+                n_rep,
+                scale,
+                gate.as_ref(),
+                attention_mask,
+                kv_cache.as_deref_mut(),
+            )?
+        {
+            return Ok(y);
+        }
+
         // Append this step's K/V to the cache (post-RoPE, pre-GQA-expand) and
         // continue with the full cached K/V. During incremental decode this is
         // what lets the attention see the whole context from a single token.
@@ -519,10 +549,6 @@ impl FullAttention {
             Some(cache) => cache.append(&k, &v)?,
             None => (k, v),
         };
-
-        let n_rep = self.num_heads / self.num_kv_heads;
-        #[allow(clippy::cast_precision_loss)] // head_dim is small (<=512 in practice)
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
 
         if n_rep > 1 && seq_len == 1 && !legacy_attn_expand() {
             // ── GQA-grouped SDPA for decode ──
@@ -607,6 +633,62 @@ impl FullAttention {
         };
 
         self.o_proj.forward(&y)
+    }
+
+    /// Fused dequantize-in-attention for decode (Phase 5.6b): GPU + quantized
+    /// cache only. Reads int8/int4 codes + scales directly instead of a
+    /// fully-dequantized K/V from `QuantKvCache`'s scratch buffer. Returns
+    /// `Ok(None)` when the fused path doesn't apply — no cache, an `Fp`
+    /// cache, a CPU device, or `CRANE_QUANT_ATTN_FUSED=0` — so the caller
+    /// falls back to the regular append + GQA-grouped SDPA path below.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying tensor operations fail.
+    // q/k/v/y/g are standard ML tensor-shape notation (query, key, value,
+    // output, gate), matching [`Self::forward`]'s own allow for the same.
+    #[allow(clippy::many_single_char_names)]
+    #[allow(clippy::too_many_arguments)]
+    fn try_fused_decode(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        b_sz: usize,
+        seq_len: usize,
+        n_rep: usize,
+        scale: f64,
+        gate: Option<&Tensor>,
+        attention_mask: Option<&Tensor>,
+        kv_cache: Option<&mut KvCache>,
+    ) -> Result<Option<Tensor>> {
+        let Some(cache) = kv_cache else {
+            return Ok(None);
+        };
+        let Some(kv_ref) = cache.try_quantized_append(k, v)? else {
+            return Ok(None);
+        };
+
+        let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
+        let attn_weights = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
+        let attn_weights = match attention_mask {
+            Some(mask) => attn_weights.broadcast_add(mask)?,
+            None => attn_weights,
+        };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let y = quant_attn::quant_sv_dot(&attn_weights, &kv_ref)?;
+        let y = y.reshape((b_sz, seq_len, self.num_heads * self.head_dim))?;
+
+        // Qwen 3.5 gates the attention output before `o_proj` — same
+        // adaptation the unfused GQA path below needs.
+        let y = match gate {
+            Some(g) => {
+                let gate = candle_nn::ops::sigmoid(&g.to_dtype(y.dtype())?)?;
+                y.broadcast_mul(&gate)?
+            },
+            None => y,
+        };
+        Ok(Some(self.o_proj.forward(&y)?))
     }
 }
 
