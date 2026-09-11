@@ -1347,13 +1347,10 @@ impl Qwen3Model {
             && !gpu_budget.offload_all_experts
             && let WeightBudget::Limited(total_vram) = gpu_budget.weight_budget
         {
-            // Conservative: both Int8 and Int4 claim only the confirmed ~2x
-            // saving (1 byte/element), not Int4's real ~4x — see
-            // `Model::kv_bytes_per_token`'s doc comment for why.
-            let effective_kv_dtype_bytes = match kv_kind {
-                KvCacheKind::Fp => dtype.size_in_bytes(),
-                KvCacheKind::Int8 | KvCacheKind::Int4 => 1,
-            };
+            // Always prices at the compute dtype's size regardless of
+            // kv_kind — see `Model::kv_bytes_per_token`'s doc comment for
+            // why an Int8/Int4 storage size would under-claim VRAM here.
+            let effective_kv_dtype_bytes = dtype.size_in_bytes();
             let runtime_reservation = gpu_budget.runtime_reservation_bytes(
                 num_hidden_layers,
                 num_kv_heads,

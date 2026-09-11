@@ -132,18 +132,15 @@ impl Model {
     /// Bytes of KV cache one sequence consumes per generated token. See
     /// [`Config::kv_bytes_per_token`].
     ///
-    /// Conservative for a quantized cache: both `Int8` and `Int4` claim only
-    /// the confirmed ~2x saving (1 byte/element), not `Int4`'s real ~4x —
-    /// deliberately under-claiming rather than risk another over-optimistic
-    /// VRAM estimate (see git history for why that matters here).
+    /// Always prices at the compute dtype's size, regardless of KV cache
+    /// kind: batch decode, KV-swap/preemption, and prefill all fully
+    /// dequantize `Int8`/`Int4` caches to the compute dtype, so a reservation
+    /// based on the smaller quantized storage size would under-claim VRAM
+    /// against that worst case (see git history for why that matters here).
     pub fn kv_bytes_per_token(&self) -> u64 {
-        let effective_dtype_bytes = match self.inner.kv_kind() {
-            KvCacheKind::Fp => self.dtype.size_in_bytes(),
-            KvCacheKind::Int8 | KvCacheKind::Int4 => 1,
-        };
         self.inner
             .config()
-            .kv_bytes_per_token(effective_dtype_bytes)
+            .kv_bytes_per_token(self.dtype.size_in_bytes())
     }
 
     fn from_pretrained(
