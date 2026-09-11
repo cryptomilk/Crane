@@ -53,7 +53,7 @@ use tracing::{debug, error, info, warn};
 use backend::ModelBackend;
 use crane_core::models::modules::quant_kv_cache::KvCacheState;
 use crane_core::utils::token_output_stream::TokenOutputStream;
-use memory::{format_bytes_engine, query_gpu_memory_usage};
+use memory::{floor_kv_budget, format_bytes_engine, query_gpu_memory_usage};
 use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
@@ -174,6 +174,11 @@ impl InferenceEngine {
         // Log effective memory budget.
         let baseline = self.memory_config.baseline_gpu_bytes;
         let limit = self.memory_config.gpu_memory_limit_bytes;
+        let max_seq_len_str = if self.memory_config.max_seq_len == 0 {
+            "unlimited".to_string()
+        } else {
+            self.memory_config.max_seq_len.to_string()
+        };
         if limit > 0 {
             let kv_budget = self.kv_budget_bytes();
             if kv_budget == 0 || limit <= baseline {
@@ -192,16 +197,31 @@ impl InferenceEngine {
                     KV_GPU_OVERHEAD_FACTOR,
                 );
             }
+
+            // These two warnings are mutually exclusive: floor_kv_budget only
+            // raises the budget when kv_bytes_per_token() is Some, so a raise
+            // is only observable when the backend does report a rate.
+            let raw_budget = limit.saturating_sub(baseline) / KV_GPU_OVERHEAD_FACTOR;
+            if kv_budget > raw_budget {
+                warn!(
+                    "KV budget {} raised to {} to fit one full sequence (max_seq_len={}) \
+                     (gpu_memory_limit may be too low for this context length)",
+                    format_bytes_engine(raw_budget),
+                    format_bytes_engine(kv_budget),
+                    max_seq_len_str,
+                );
+            } else if self.model.kv_bytes_per_token().is_none() {
+                warn!(
+                    "Model backend does not report kv_bytes_per_token; cannot verify \
+                     the KV budget can fit one full max_seq_len={} sequence \
+                     (gpu_memory_limit may be too low for this context length)",
+                    max_seq_len_str,
+                );
+            }
         }
         info!(
             "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
-            self.scheduler.max_running,
-            self.decode_tokens_per_seq,
-            if self.memory_config.max_seq_len == 0 {
-                "unlimited".to_string()
-            } else {
-                self.memory_config.max_seq_len.to_string()
-            },
+            self.scheduler.max_running, self.decode_tokens_per_seq, max_seq_len_str,
         );
 
         // Install candle's private, affinity-pinned rayon pool for the
@@ -380,6 +400,16 @@ impl InferenceEngine {
     /// kv_budget = (gpu_limit - baseline) / KV_GPU_OVERHEAD_FACTOR
     /// ```
     ///
+    /// Floored at what one full `max_seq_len` sequence needs — a configured
+    /// `max_seq_len` must be satisfiable by at least one sequence, or
+    /// eviction has nothing else to blame and loops forever evicting the
+    /// only sequence, re-prefilling it, and evicting it again (observed in
+    /// the field: a single request whose own KV footprint alone exceeded
+    /// this budget never completed). The floor only applies when the backend
+    /// reports `kv_bytes_per_token`; backends that return `None`
+    /// (hybrid/shared KV architectures) get the un-floored budget, and
+    /// `run()`'s startup log warns that satisfiability couldn't be verified.
+    ///
     /// Returns `u64::MAX` when no limit is configured.
     fn kv_budget_bytes(&self) -> u64 {
         let limit = self.memory_config.gpu_memory_limit_bytes;
@@ -387,7 +417,12 @@ impl InferenceEngine {
             return u64::MAX;
         }
         let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
-        raw / KV_GPU_OVERHEAD_FACTOR
+        let budget = raw / KV_GPU_OVERHEAD_FACTOR;
+        floor_kv_budget(
+            budget,
+            self.model.kv_bytes_per_token(),
+            self.memory_config.max_seq_len,
+        )
     }
 
     /// Check whether the engine should block new prefills due to memory
@@ -483,11 +518,17 @@ impl InferenceEngine {
                 break;
             };
 
-            // Compute bytes being freed.
-            let freed = self
-                .sequences
-                .get(&victim_id)
-                .map_or(0, |seq| sequence::kv_cache_bytes(&seq.kv_caches));
+            // Compute bytes being freed. If active, bytes are in the model
+            // (not in seq.kv_caches) — mirrors cleanup_sequence's branch.
+            // Must run before clear_kv_cache() below while the cache is
+            // still live.
+            let freed = if self.active_seq_id.as_deref() == Some(&victim_id) {
+                self.model.active_kv_cache_bytes()
+            } else {
+                self.sequences
+                    .get(&victim_id)
+                    .map_or(0, |seq| sequence::kv_cache_bytes(&seq.kv_caches))
+            };
 
             info!(
                 id = %victim_id,
