@@ -251,8 +251,36 @@ impl InferenceEngine {
                                 // Budget OK after eviction (or nothing running) — proceed.
                                 self.execute_step(output);
                             }
-                        } else {
+                        } else if output.is_prefill {
                             self.execute_step(output);
+                        } else {
+                            // Decode step — re-check the KV budget, since KV
+                            // usage grows every decode step and a lone
+                            // session's own growth is never checked at
+                            // prefill time (there is no new prefill here).
+                            if self.is_over_kv_budget() {
+                                self.evict_if_needed();
+                                while self.is_over_kv_budget() && !self.scheduler.running.is_empty()
+                                {
+                                    self.abort_largest_running(
+                                        "KV cache budget exceeded during decode",
+                                    );
+                                }
+                            }
+                            // Eviction/abort may have removed sequences from
+                            // `running` since `output` was scheduled — only
+                            // decode survivors.
+                            let surviving: Vec<String> = output
+                                .batch
+                                .into_iter()
+                                .filter(|id| self.scheduler.running.contains(id))
+                                .collect();
+                            if !surviving.is_empty() {
+                                self.execute_step(SchedulerOutput {
+                                    batch: surviving,
+                                    is_prefill: false,
+                                });
+                            }
                         }
                         self.step_counter += 1;
 
@@ -505,6 +533,37 @@ impl InferenceEngine {
         // Grant a cooldown period so the cuMemGetInfo hard-safety check
         // doesn't immediately re-trigger (CUDA pool retains freed blocks).
         self.eviction_cooldown = 5;
+    }
+
+    /// Aborts the running sequence with the most generated tokens (largest
+    /// KV cache) with an error, for when eviction alone cannot bring KV
+    /// usage under budget — e.g. a single session whose own KV cache
+    /// already exceeds the budget, which `evict_if_needed` cannot shrink
+    /// by moving other sequences back to waiting.
+    fn abort_largest_running(&mut self, reason: &str) {
+        let victim_id = self
+            .scheduler
+            .running
+            .iter()
+            .filter_map(|id| {
+                self.sequences
+                    .get(id)
+                    .map(|seq| (id.clone(), seq.tokens.len()))
+            })
+            .max_by_key(|(_, len)| *len)
+            .map(|(id, _)| id);
+
+        let Some(victim_id) = victim_id else {
+            return;
+        };
+
+        warn!(
+            id = %victim_id,
+            kv_used = %format_bytes_engine(self.tracked_kv_bytes),
+            kv_budget = %format_bytes_engine(self.kv_budget_bytes()),
+            "{reason}",
+        );
+        self.send_error(&victim_id, reason);
     }
 
     /// Effective `max_tokens` for a request, taking server-level `max_seq_len` into account.
