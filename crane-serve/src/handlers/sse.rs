@@ -165,7 +165,14 @@ pub fn make_chat_sse_stream(
                     break;
                 }
                 EngineResponse::Error(e) => {
-                    yield Ok(Event::default().data(format!("error: {e}")));
+                    let error_response = ErrorResponse {
+                        error: ErrorDetail {
+                            message: e,
+                            r#type: "server_error".into(),
+                            code: None,
+                        },
+                    };
+                    yield Ok(Event::default().json_data(&error_response).unwrap());
                     break;
                 }
             }
@@ -250,7 +257,14 @@ pub fn make_completion_sse_stream(
                     break;
                 }
                 EngineResponse::Error(e) => {
-                    yield Ok(Event::default().data(format!("error: {e}")));
+                    let error_response = ErrorResponse {
+                        error: ErrorDetail {
+                            message: e,
+                            r#type: "server_error".into(),
+                            code: None,
+                        },
+                    };
+                    yield Ok(Event::default().json_data(&error_response).unwrap());
                     break;
                 }
             }
@@ -296,7 +310,14 @@ pub fn make_generate_sse_stream(
                     break;
                 }
                 EngineResponse::Error(e) => {
-                    yield Ok(Event::default().data(format!("error: {e}")));
+                    let error_response = ErrorResponse {
+                        error: ErrorDetail {
+                            message: e,
+                            r#type: "server_error".into(),
+                            code: None,
+                        },
+                    };
+                    yield Ok(Event::default().json_data(&error_response).unwrap());
                     break;
                 }
             }
