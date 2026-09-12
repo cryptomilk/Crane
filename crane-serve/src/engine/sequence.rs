@@ -1,6 +1,7 @@
 use candle_transformers::generation::LogitsProcessor;
 use crane_core::models::modules::quant_kv_cache::KvCacheState;
 use tokio::sync::mpsc;
+use tracing::{debug, trace};
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
 /// Reflects the real, smaller footprint for quantized state.
@@ -79,15 +80,27 @@ impl Sequence {
     /// Whether generation should stop.
     #[must_use]
     pub fn should_stop(&self) -> bool {
-        if self.num_generated() >= self.max_tokens {
+        let generated = self.num_generated();
+        if generated >= self.max_tokens {
+            debug!(
+                id = %self.id,
+                generated,
+                max_tokens = self.max_tokens,
+                "Stop: max tokens reached",
+            );
             return true;
         }
         if let Some(&last) = self.tokens.last()
             && self.eos_token_id.contains(&last)
         {
+            debug!(id = %self.id, token_id = last, "Stop: EOS token");
             return true;
         }
-        self.stop_sequence_match().is_some()
+        if let Some(matched) = self.stop_sequence_match() {
+            debug!(id = %self.id, matched, "Stop: stop sequence matched");
+            return true;
+        }
+        false
     }
 
     /// The first stop sequence that `unsent_text` currently ends with, if any.
@@ -131,7 +144,16 @@ impl Sequence {
         if self.stop_sequences.is_empty() {
             return (!self.unsent_text.is_empty()).then(|| std::mem::take(&mut self.unsent_text));
         }
-        let safe_len = self.unsent_text.len() - self.stop_prefix_overlap();
+        let overlap = self.stop_prefix_overlap();
+        if overlap > 0 {
+            trace!(
+                id = %self.id,
+                overlap,
+                unsent = %self.unsent_text,
+                "Withholding possible stop-sequence prefix",
+            );
+        }
+        let safe_len = self.unsent_text.len() - overlap;
         if safe_len == 0 {
             return None;
         }
