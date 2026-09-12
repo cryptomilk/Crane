@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use candle_transformers::generation::LogitsProcessor;
 use crane_core::models::modules::quant_kv_cache::KvCacheState;
 use tokio::sync::mpsc;
@@ -64,6 +66,21 @@ pub struct Sequence {
     /// `take_safe_text`, to withhold text that could still extend into a
     /// stop sequence from being streamed to the client.
     pub unsent_text: String,
+
+    // ── timing ──
+    /// Set to `Instant::now()` the moment the first generated token exists
+    /// (end of prefill). Used to compute [`Self::decode_tokens_per_sec`];
+    /// `None` before prefill has produced that first token. Reset on every
+    /// prefill completion, including a re-prefill after KV-cache eviction,
+    /// so `decode_tokens_per_sec` reflects only the most recent decode
+    /// stint rather than cumulative throughput across preemptions.
+    pub decode_start: Option<Instant>,
+    /// Set at request arrival (sequence construction). Used with
+    /// `first_token_at` to compute [`Self::ttft_ms`].
+    pub created_at: Instant,
+    /// Set once, the first time a generated-text chunk is sent to the
+    /// client via `EngineResponse::Token`. `None` until then.
+    pub first_token_at: Option<Instant>,
 
     // ── response channel ──
     /// Sends `EngineResponse` chunks back to the API handler.
@@ -214,6 +231,42 @@ impl Sequence {
         }
         "length"
     }
+
+    /// Decode-phase token rate since [`Self::decode_start`]. Excludes the
+    /// first generated token, since it was produced by prefill rather than
+    /// decode and attributing it here would inflate short generations.
+    /// Returns `0.0` before decode has started or fewer than two tokens
+    /// have been generated.
+    #[must_use]
+    pub fn decode_tokens_per_sec(&self) -> f64 {
+        let Some(start) = self.decode_start else {
+            return 0.0;
+        };
+        let decoded = self.num_generated().saturating_sub(1);
+        if decoded == 0 {
+            return 0.0;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed <= 0.0 {
+            return 0.0;
+        }
+        // decoded is bounded by max_tokens, far below 2^53, so f64 precision loss is not a concern.
+        #[allow(clippy::cast_precision_loss)]
+        let tok_s = decoded as f64 / elapsed;
+        tok_s
+    }
+
+    /// Time-to-first-token in milliseconds: the delay between request
+    /// arrival ([`Self::created_at`]) and the first generated-text chunk
+    /// being sent to the client. Returns `None` until a token has been sent.
+    #[must_use]
+    pub fn ttft_ms(&self) -> Option<u64> {
+        let first = self.first_token_at?;
+        let duration = first.duration_since(self.created_at);
+        // TTFT is bounded by request timeouts (seconds), far below u64::MAX ms.
+        #[allow(clippy::cast_possible_truncation)]
+        Some(duration.as_millis() as u64)
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +299,9 @@ mod tests {
             eos_token_id: vec![eos_token_id],
             stop_sequences: vec![],
             unsent_text: String::new(),
+            decode_start: None,
+            created_at: Instant::now(),
+            first_token_at: None,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
@@ -472,5 +528,64 @@ mod tests {
 
         assert_eq!(streamed, "hi\n");
         assert_eq!(seq.take_pre_stop_text(), None);
+    }
+
+    // ── decode_tokens_per_sec ────────────────────────────────────────────
+
+    #[test]
+    fn decode_tokens_per_sec_zero_before_decode_start() {
+        let seq = make_seq(&[1, 2, 3], &[10, 11], 10, 0, SequenceStatus::Running);
+        assert_eq!(seq.decode_start, None);
+        assert_eq!(seq.decode_tokens_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn decode_tokens_per_sec_zero_with_fewer_than_two_generated() {
+        let mut seq = make_seq(&[1, 2, 3], &[10], 10, 0, SequenceStatus::Running);
+        seq.decode_start = Some(Instant::now() - std::time::Duration::from_secs(1));
+        assert_eq!(seq.decode_tokens_per_sec(), 0.0);
+    }
+
+    #[test]
+    fn decode_tokens_per_sec_computes_rate_since_decode_start() {
+        // 5 tokens generated, first one attributed to prefill, so 4 tokens
+        // over a backdated 2-second window should read as ~2.0 tok/s.
+        let mut seq = make_seq(
+            &[1, 2, 3],
+            &[10, 11, 12, 13, 14],
+            10,
+            0,
+            SequenceStatus::Running,
+        );
+        seq.decode_start = Some(Instant::now() - std::time::Duration::from_secs(2));
+        let tok_s = seq.decode_tokens_per_sec();
+        assert!((tok_s - 2.0).abs() < 0.1, "expected ~2.0, got {tok_s}");
+    }
+
+    #[test]
+    fn decode_tokens_per_sec_zero_when_decode_start_in_future() {
+        // Instant::elapsed() saturates to zero when the reference instant is
+        // in the future, which must not divide-by-zero.
+        let mut seq = make_seq(&[1, 2, 3], &[10, 11], 10, 0, SequenceStatus::Running);
+        seq.decode_start = Some(Instant::now() + std::time::Duration::from_secs(100));
+        assert_eq!(seq.decode_tokens_per_sec(), 0.0);
+    }
+
+    // ── ttft_ms ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ttft_ms_none_before_first_token() {
+        let seq = make_seq(&[1, 2, 3], &[], 10, 0, SequenceStatus::Waiting);
+        assert_eq!(seq.first_token_at, None);
+        assert_eq!(seq.ttft_ms(), None);
+    }
+
+    #[test]
+    fn ttft_ms_computes_duration_since_created_at() {
+        let mut seq = make_seq(&[1, 2, 3], &[10], 10, 0, SequenceStatus::Running);
+        seq.created_at = Instant::now() - std::time::Duration::from_millis(250);
+        seq.first_token_at = Some(Instant::now());
+        let ttft = seq.ttft_ms().expect("ttft should be set");
+        assert!((200..=400).contains(&ttft), "expected ~250ms, got {ttft}");
     }
 }
