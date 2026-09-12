@@ -705,6 +705,7 @@ impl InferenceEngine {
             repeat_last_n: 64,
             stop_sequences: req.stop,
             unsent_text: String::new(),
+            decode_start: None,
             response_tx: req.response_tx,
         };
 
@@ -833,6 +834,7 @@ impl InferenceEngine {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.tokens.push(next_token);
             seq.status = SequenceStatus::Running;
+            seq.decode_start = Some(Instant::now());
         }
 
         info!(
@@ -1513,12 +1515,14 @@ impl InferenceEngine {
             } else {
                 seq.finish_reason().to_string()
             };
+            let decode_tok_s = seq.decode_tokens_per_sec();
 
             info!(
                 id = %seq_id,
                 prompt_tokens = seq.prompt_len,
                 completion_tokens,
                 finish_reason = %finish_reason,
+                decode_tok_s = format!("{:.1}", decode_tok_s),
                 "Sequence finished",
             );
 
