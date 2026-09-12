@@ -159,7 +159,11 @@ impl<R: Read + Seek> Gguf<R> {
     /// # Errors
     /// Returns an error if the tensor is missing from the GGUF file, the
     /// quantization type is unsupported, or dequantization fails.
-    pub fn dequant_tensor_on(&mut self, name: &str, device: &Device) -> Result<candle_core::Tensor> {
+    pub fn dequant_tensor_on(
+        &mut self,
+        name: &str,
+        device: &Device,
+    ) -> Result<candle_core::Tensor> {
         let ws = self.ct.tensor(&mut self.reader, name, device)?;
         ws.dequantize(device)?.to_dtype(self.dtype)
     }

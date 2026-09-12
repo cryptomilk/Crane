@@ -671,6 +671,8 @@ impl InferenceEngine {
             rep_penalty = req.repetition_penalty,
             freq_penalty = req.frequency_penalty,
             pres_penalty = req.presence_penalty,
+            stop_sequences = ?req.stop,
+            eos_token_ids = ?req.eos_token_id,
             "New request accepted (queue: waiting={} running={})",
             self.scheduler.waiting.len() + 1,
             self.scheduler.running.len(),
@@ -723,6 +725,10 @@ impl InferenceEngine {
             .filter(|(_, seq)| seq.response_tx.is_closed())
             .map(|(id, _)| id.clone())
             .collect();
+
+        if !cancelled.is_empty() {
+            debug!(count = cancelled.len(), "Detected cancelled sequences");
+        }
 
         for id in cancelled {
             warn!(id = %id, "Client disconnected, cancelling sequence");
@@ -1442,6 +1448,13 @@ impl InferenceEngine {
             .get(seq_id)
             .is_some_and(|s| s.stop_sequence_match().is_some());
 
+        if stopped_by_stop_sequence
+            && let Some(seq) = self.sequences.get(seq_id)
+            && let Some(matched) = seq.stop_sequence_match()
+        {
+            debug!(id = %seq_id, matched, "Finishing sequence on stop-sequence match");
+        }
+
         let remaining = if stopped_by_stop_sequence {
             self.sequences
                 .get_mut(seq_id)
@@ -1483,8 +1496,8 @@ impl InferenceEngine {
                 .decode(generated_ids, true)
                 .unwrap_or_default();
 
-            if let Some(stop_seq) = seq.stop_sequence_match() {
-                if let Some(pos) = full_text.rfind(stop_seq) {
+            if stopped_by_stop_sequence {
+                if let Some(pos) = full_text.rfind(seq.unsent_text.as_str()) {
                     full_text.truncate(pos);
                 } else {
                     warn!(
@@ -1495,7 +1508,11 @@ impl InferenceEngine {
                 }
             }
 
-            let finish_reason = seq.finish_reason().to_string();
+            let finish_reason = if stopped_by_stop_sequence {
+                "stop".to_string()
+            } else {
+                seq.finish_reason().to_string()
+            };
 
             info!(
                 id = %seq_id,
