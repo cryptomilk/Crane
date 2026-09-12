@@ -627,6 +627,18 @@ impl InferenceEngine {
     }
 
     fn accept_request(&mut self, req: EngineRequest) {
+        // Reject requests that were already queued when the engine hit a
+        // fatal GPU error. `EngineHandle::submit` rejects new requests once
+        // this flag is set, but a request enqueued just before the flag was
+        // set can still reach here.
+        if let Some(err) = self.stats.get_fatal_error() {
+            let _ = req.response_tx.send(EngineResponse::Error(format!(
+                "Engine is unavailable due to a fatal GPU error: {err}"
+            )));
+            self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         let prompt_len = req.tokens.len();
         let tokenizer = self.model.tokenizer().clone();
 
@@ -917,6 +929,24 @@ impl InferenceEngine {
         }
     }
 
+    /// Finalize sequences that completed or were cancelled during a decode
+    /// round before the round loop itself exited (normally or via an error
+    /// return). Must be called on every exit path out of
+    /// `step_decode_batch`'s round loop, not just the success path, or these
+    /// sequences leak: their client never gets a terminal response and their
+    /// `seq_id` is never freed from the scheduler.
+    fn drain_pending_completions(&mut self, pending_finish: &[String], pending_cancel: &[String]) {
+        for id in pending_finish {
+            self.finish_sequence(id);
+        }
+        for id in pending_cancel {
+            self.stats
+                .cancelled_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.cleanup_sequence(id);
+        }
+    }
+
     /// Decode step for all running sequences — TRUE BATCHED forward.
     ///
     /// Uses **lazy eviction**: when a sequence completes or is cancelled
@@ -981,7 +1011,9 @@ impl InferenceEngine {
             {
                 Ok(m) => m,
                 Err(e) => {
-                    error!("Mask build failed: {e}");
+                    for seq_id in &batch {
+                        self.send_error(seq_id, &format!("Mask build failed: {e}"));
+                    }
                     self.model.clear_kv_cache();
                     return;
                 },
@@ -1030,8 +1062,16 @@ impl InferenceEngine {
             {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("Decode input_ids upload failed: {e}");
+                    for (i, seq_id) in batch.iter().enumerate() {
+                        if alive[i] {
+                            self.send_error(
+                                seq_id,
+                                &format!("Decode input_ids upload failed: {e}"),
+                            );
+                        }
+                    }
                     self.model.clear_kv_cache();
+                    self.drain_pending_completions(&pending_finish, &pending_cancel);
                     return;
                 },
             };
@@ -1057,6 +1097,7 @@ impl InferenceEngine {
                         }
                     }
                     self.model.clear_kv_cache();
+                    self.drain_pending_completions(&pending_finish, &pending_cancel);
                     return;
                 },
             };
@@ -1124,15 +1165,7 @@ impl InferenceEngine {
 
         self.save_extracted_batch_kv(&batch, &alive, &kv_lens, original_max_kv, rounds_done);
 
-        for id in &pending_finish {
-            self.finish_sequence(id);
-        }
-        for id in &pending_cancel {
-            self.stats
-                .cancelled_requests
-                .fetch_add(1, Ordering::Relaxed);
-            self.cleanup_sequence(id);
-        }
+        self.drain_pending_completions(&pending_finish, &pending_cancel);
 
         #[allow(clippy::cast_possible_truncation)]
         let decode_us = t0.elapsed().as_micros() as u64;
@@ -1393,6 +1426,9 @@ impl InferenceEngine {
             let _ = seq.response_tx.send(EngineResponse::Error(msg.to_string()));
         }
         self.stats.failed_requests.fetch_add(1, Ordering::Relaxed);
+        if stats::is_fatal_gpu_error(msg) {
+            self.stats.set_fatal_error(msg);
+        }
         self.cleanup_sequence(seq_id);
     }
 

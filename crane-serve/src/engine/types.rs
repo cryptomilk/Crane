@@ -80,13 +80,19 @@ impl EngineHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the engine thread has shut down.
+    /// Returns an error if the engine thread has shut down, or if the engine
+    /// has recorded a fatal GPU error and is no longer accepting requests.
     pub fn submit(
         &self,
         id: String,
         tokens: Vec<u32>,
         params: GenerationParams,
     ) -> anyhow::Result<mpsc::UnboundedReceiver<EngineResponse>> {
+        if let Some(err) = self.stats.get_fatal_error() {
+            return Err(anyhow::anyhow!(
+                "Engine is unavailable due to a fatal GPU error: {err}"
+            ));
+        }
         let (response_tx, response_rx) = mpsc::unbounded_channel();
         self.request_tx
             .send(EngineRequest {
@@ -177,6 +183,31 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("shut down"));
+    }
+
+    #[test]
+    fn submit_rejects_after_fatal_error() {
+        let (handle, _rx) = make_handle();
+        handle
+            .stats
+            .set_fatal_error("CUDA error: an illegal memory access was encountered");
+        let result = handle.submit(
+            "test-3".into(),
+            vec![1],
+            GenerationParams {
+                max_tokens: 10,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                repetition_penalty: 1.0,
+                frequency_penalty: 0.0,
+                presence_penalty: 0.0,
+                eos_token_id: vec![0],
+                stop: vec![],
+            },
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fatal GPU error"));
     }
 
     #[test]
