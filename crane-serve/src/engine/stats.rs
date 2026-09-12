@@ -17,6 +17,11 @@ pub struct EngineStats {
     pub total_kv_swap_count: AtomicU64,
     pub active_sequences: AtomicU64,
     pub waiting_sequences: AtomicU64,
+    /// Cumulative time-to-first-token across all completed requests, in
+    /// microseconds. Paired with `ttft_count` to compute `avg_ttft_ms`.
+    pub total_ttft_us: AtomicU64,
+    /// Number of requests that have contributed a TTFT sample.
+    pub ttft_count: AtomicU64,
     /// Set once a fatal, device-context-poisoning error occurs (e.g. an
     /// illegal GPU memory access). Unset means the engine is healthy.
     /// First occurrence wins; later errors don't overwrite it.
@@ -45,6 +50,8 @@ impl EngineStats {
             total_kv_swap_count: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             waiting_sequences: AtomicU64::new(0),
+            total_ttft_us: AtomicU64::new(0),
+            ttft_count: AtomicU64::new(0),
             fatal_error: OnceLock::new(),
         }
     }
@@ -81,6 +88,14 @@ impl EngineStats {
         } else {
             0.0
         };
+        let ttft_count = self.ttft_count.load(Ordering::Relaxed);
+        let total_ttft_us = self.total_ttft_us.load(Ordering::Relaxed);
+        #[allow(clippy::cast_precision_loss)]
+        let avg_ttft_ms = if ttft_count > 0 {
+            (total_ttft_us as f64 / 1000.0) / ttft_count as f64
+        } else {
+            0.0
+        };
         StatsSnapshot {
             total_requests: self.total_requests.load(Ordering::Relaxed),
             completed_requests: self.completed_requests.load(Ordering::Relaxed),
@@ -93,6 +108,7 @@ impl EngineStats {
             total_kv_swaps: self.total_kv_swap_count.load(Ordering::Relaxed),
             avg_decode_tokens_per_sec: avg_decode_tok_s,
             avg_prefill_tokens_per_sec: avg_prefill_tok_s,
+            avg_ttft_ms,
             fatal_error: self.get_fatal_error(),
         }
     }
@@ -111,6 +127,9 @@ pub struct StatsSnapshot {
     pub total_kv_swaps: u64,
     pub avg_decode_tokens_per_sec: f64,
     pub avg_prefill_tokens_per_sec: f64,
+    /// Average time-to-first-token across completed requests, in
+    /// milliseconds. `0.0` until at least one request has completed.
+    pub avg_ttft_ms: f64,
     /// Recorded fatal GPU error message, if the engine has hit one. Omitted
     /// from the JSON response entirely when the engine is healthy.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +175,8 @@ mod tests {
         assert_eq!(s.total_kv_swap_count.load(Ordering::Relaxed), 0);
         assert_eq!(s.active_sequences.load(Ordering::Relaxed), 0);
         assert_eq!(s.waiting_sequences.load(Ordering::Relaxed), 0);
+        assert_eq!(s.total_ttft_us.load(Ordering::Relaxed), 0);
+        assert_eq!(s.ttft_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -216,6 +237,28 @@ mod tests {
         {
             assert_eq!(snap.avg_decode_tokens_per_sec, 0.0);
             assert_eq!(snap.avg_prefill_tokens_per_sec, 0.0);
+        }
+    }
+
+    #[test]
+    fn snapshot_avg_ttft_ms_calculation() {
+        let s = EngineStats::new();
+        // 3 requests totaling 900_000 microseconds => avg 300ms.
+        s.total_ttft_us.store(900_000, Ordering::Relaxed);
+        s.ttft_count.store(3, Ordering::Relaxed);
+
+        let snap = s.snapshot();
+        assert!((snap.avg_ttft_ms - 300.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn snapshot_avg_ttft_ms_zero_when_no_samples() {
+        let s = EngineStats::new();
+        let snap = s.snapshot();
+        // The zero-count branch returns the literal 0.0, so exact comparison is correct here.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(snap.avg_ttft_ms, 0.0);
         }
     }
 
