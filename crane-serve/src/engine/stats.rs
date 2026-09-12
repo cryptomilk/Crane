@@ -1,5 +1,6 @@
 //! Engine statistics — lock-free counters shared with API handlers.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Lock-free engine statistics counters.
@@ -16,6 +17,10 @@ pub struct EngineStats {
     pub total_kv_swap_count: AtomicU64,
     pub active_sequences: AtomicU64,
     pub waiting_sequences: AtomicU64,
+    /// Set once a fatal, device-context-poisoning error occurs (e.g. an
+    /// illegal GPU memory access). Unset means the engine is healthy.
+    /// First occurrence wins; later errors don't overwrite it.
+    pub fatal_error: OnceLock<String>,
 }
 
 impl Default for EngineStats {
@@ -40,7 +45,22 @@ impl EngineStats {
             total_kv_swap_count: AtomicU64::new(0),
             active_sequences: AtomicU64::new(0),
             waiting_sequences: AtomicU64::new(0),
+            fatal_error: OnceLock::new(),
         }
+    }
+
+    /// Record a fatal, device-context-poisoning error. Only the first
+    /// occurrence is kept; subsequent calls are no-ops.
+    pub fn set_fatal_error(&self, msg: &str) {
+        if self.fatal_error.get().is_none() {
+            let _ = self.fatal_error.set(msg.to_string());
+        }
+    }
+
+    /// Returns the recorded fatal error message, if any.
+    #[must_use]
+    pub fn get_fatal_error(&self) -> Option<String> {
+        self.fatal_error.get().cloned()
     }
 
     /// Snapshot for JSON serialization.
@@ -73,6 +93,7 @@ impl EngineStats {
             total_kv_swaps: self.total_kv_swap_count.load(Ordering::Relaxed),
             avg_decode_tokens_per_sec: avg_decode_tok_s,
             avg_prefill_tokens_per_sec: avg_prefill_tok_s,
+            fatal_error: self.get_fatal_error(),
         }
     }
 }
@@ -90,6 +111,29 @@ pub struct StatsSnapshot {
     pub total_kv_swaps: u64,
     pub avg_decode_tokens_per_sec: f64,
     pub avg_prefill_tokens_per_sec: f64,
+    /// Recorded fatal GPU error message, if the engine has hit one. Omitted
+    /// from the JSON response entirely when the engine is healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fatal_error: Option<String>,
+}
+
+/// Narrow allowlist of error-message signatures that indicate the GPU
+/// device context itself is poisoned (not just a single request failing).
+/// Deliberately conservative: a per-request OOM or bad-input error must
+/// not trip this, since that would incorrectly fail the whole engine.
+#[must_use]
+pub(crate) fn is_fatal_gpu_error(msg: &str) -> bool {
+    const FATAL_SIGNATURES: &[&str] = &[
+        "rocrand",
+        "illegal memory access",
+        "launch failed",
+        "launch failure",
+        "an illegal instruction",
+        "device-side assert",
+        "context is destroyed",
+    ];
+    let lower = msg.to_lowercase();
+    FATAL_SIGNATURES.iter().any(|sig| lower.contains(sig))
 }
 
 #[cfg(test)]
@@ -193,5 +237,105 @@ mod tests {
         s.total_requests.fetch_add(1, Ordering::Relaxed);
         s.total_requests.fetch_add(1, Ordering::Relaxed);
         assert_eq!(s.snapshot().total_requests, 3);
+    }
+
+    #[test]
+    fn fatal_error_is_none_when_healthy() {
+        let s = EngineStats::new();
+        assert_eq!(s.get_fatal_error(), None);
+    }
+
+    #[test]
+    fn set_fatal_error_records_message() {
+        let s = EngineStats::new();
+        s.set_fatal_error(
+            "Batched decode failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \
+             \"an illegal memory access was encountered\")",
+        );
+        assert_eq!(
+            s.get_fatal_error(),
+            Some(
+                "Batched decode failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \
+                 \"an illegal memory access was encountered\")"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn set_fatal_error_first_occurrence_wins() {
+        let s = EngineStats::new();
+        s.set_fatal_error("first fatal error");
+        s.set_fatal_error("second fatal error");
+        assert_eq!(s.get_fatal_error(), Some("first fatal error".to_string()));
+    }
+
+    #[test]
+    fn snapshot_includes_fatal_error() {
+        let s = EngineStats::new();
+        s.set_fatal_error("rocrand generate_uniform failed with status 107");
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.fatal_error,
+            Some("rocrand generate_uniform failed with status 107".to_string())
+        );
+    }
+
+    #[test]
+    fn snapshot_json_omits_fatal_error_when_healthy() {
+        let s = EngineStats::new();
+        let snap = s.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("fatal_error"));
+    }
+
+    #[test]
+    fn snapshot_json_includes_fatal_error_when_set() {
+        let s = EngineStats::new();
+        s.set_fatal_error("CUDA error: launch failed");
+        let snap = s.snapshot();
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"fatal_error\":\"CUDA error: launch failed\""));
+    }
+
+    #[test]
+    fn is_fatal_gpu_error_matches_known_signatures() {
+        assert!(is_fatal_gpu_error(
+            "rocrand generate_uniform failed with status 107"
+        ));
+        assert!(is_fatal_gpu_error(
+            "Batched decode failed: DriverError(CUDA_ERROR_ILLEGAL_ADDRESS, \
+             \"an illegal memory access was encountered\")"
+        ));
+        assert!(is_fatal_gpu_error("an illegal instruction was encountered"));
+        assert!(is_fatal_gpu_error(
+            "fused_rms_norm launch failed: some hip error"
+        ));
+        assert!(is_fatal_gpu_error(
+            "Batched decode failed: DriverError(CUDA_ERROR_LAUNCH_FAILED, \
+             \"unspecified launch failure\")"
+        ));
+        assert!(is_fatal_gpu_error("device-side assert triggered"));
+        assert!(is_fatal_gpu_error(
+            "Batched decode failed: DriverError(CUDA_ERROR_CONTEXT_IS_DESTROYED, \
+             \"context is destroyed\")"
+        ));
+    }
+
+    #[test]
+    fn is_fatal_gpu_error_is_case_insensitive() {
+        assert!(is_fatal_gpu_error("ROCRAND status failure"));
+        assert!(is_fatal_gpu_error("Illegal Memory Access detected"));
+    }
+
+    #[test]
+    fn is_fatal_gpu_error_rejects_ordinary_errors() {
+        assert!(!is_fatal_gpu_error("Sampling failed: invalid probability"));
+        assert!(!is_fatal_gpu_error("out of memory"));
+        assert!(!is_fatal_gpu_error("Empty prefill"));
+        assert!(!is_fatal_gpu_error("invalid argument"));
+        assert!(!is_fatal_gpu_error(
+            "KV cache budget exceeded during decode"
+        ));
     }
 }
