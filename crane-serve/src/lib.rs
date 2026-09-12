@@ -72,6 +72,11 @@ pub struct Args {
     pub dtype: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub max_seq_len: usize,
+    /// Maximum context length as a human-readable token count. Accepts K
+    /// (x1024) and M (x1024^2) suffixes, e.g. `128K` = 131072 tokens.
+    /// Mutually exclusive with `--max-seq-len`.
+    #[arg(long, conflicts_with = "max_seq_len")]
+    pub context: Option<String>,
     /// GPU memory budget: either a fraction of total VRAM (`0.9`), an absolute
     /// size (`8G`, `8GB`, `8GiB`, `5120M`, `5120MiB` — all binary units), or a
     /// plain byte count. Unset or `0` means unlimited. Only enforced for LLM
@@ -610,6 +615,33 @@ fn resolve_gpu_budget(
     }
 }
 
+/// Parse a human-readable context size into a raw token count.
+///
+/// Accepts an optional `K` (x1024) or `M` (x1024^2) suffix (case-insensitive).
+/// A plain integer is passed through unchanged. No fractional suffixes
+/// (`1.5M`) — token counts are integers.
+fn parse_context_size(s: &str) -> Result<usize> {
+    let s = s.trim();
+    anyhow::ensure!(!s.is_empty(), "context size must not be empty");
+
+    let upper = s.to_ascii_uppercase();
+    let (digits, multiplier) = if let Some(d) = upper.strip_suffix('M') {
+        (d, 1024 * 1024)
+    } else if let Some(d) = upper.strip_suffix('K') {
+        (d, 1024)
+    } else {
+        (upper.as_str(), 1)
+    };
+
+    let n: usize = digits
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid context size '{s}': {e}"))?;
+    anyhow::ensure!(n > 0, "context size must be greater than zero, got '{s}'");
+    n.checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("context size '{s}' overflows"))
+}
+
 /// Auto-derives a safe `--max-seq-len` when the caller left it at `0`
 /// (unlimited) while `--gpu-memory-limit` is set. Without this, a single
 /// long-running session's own KV cache can grow past physical VRAM with
@@ -660,6 +692,14 @@ fn derive_safe_max_seq_len(
 
 pub async fn run(mut args: Args) -> Result<()> {
     info!("Loading model from: {}", args.model_path);
+
+    if let Some(ref ctx) = args.context {
+        args.max_seq_len = parse_context_size(ctx)?;
+        info!(
+            "--context {ctx} resolved to max_seq_len={}",
+            args.max_seq_len
+        );
+    }
 
     let device = if args.cpu {
         crane_core::models::Device::Cpu
@@ -1753,5 +1793,78 @@ mod config_tests {
         let clamped = derive_safe_max_seq_len(&cfg_inflated, 10 << 30, 1024, 1).expect("derived");
         let unclamped = derive_safe_max_seq_len(&cfg_matching, 10 << 30, 1024, 1).expect("derived");
         assert_eq!(clamped, unclamped);
+    }
+
+    // ── parse_context_size ──
+
+    #[test]
+    fn context_parses_bare_number() {
+        assert_eq!(parse_context_size("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn context_parses_k_suffix() {
+        assert_eq!(parse_context_size("128K").unwrap(), 131_072);
+    }
+
+    #[test]
+    fn context_parses_m_suffix() {
+        assert_eq!(parse_context_size("1M").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn context_parses_case_insensitively() {
+        assert_eq!(parse_context_size("128k").unwrap(), 131_072);
+        assert_eq!(parse_context_size("1m").unwrap(), 1_048_576);
+    }
+
+    #[test]
+    fn context_rejects_empty_string() {
+        assert!(parse_context_size("").is_err());
+    }
+
+    #[test]
+    fn context_rejects_invalid_suffix() {
+        assert!(parse_context_size("128G").is_err());
+    }
+
+    #[test]
+    fn context_rejects_non_numeric() {
+        assert!(parse_context_size("abc").is_err());
+    }
+
+    #[test]
+    fn context_trims_whitespace() {
+        assert_eq!(parse_context_size("  128K  ").unwrap(), 131_072);
+    }
+
+    #[test]
+    fn context_rejects_zero() {
+        assert!(parse_context_size("0").is_err());
+        assert!(parse_context_size("0K").is_err());
+    }
+
+    #[test]
+    fn context_rejects_overflow() {
+        assert!(parse_context_size("99999999999999999999M").is_err());
+    }
+
+    #[test]
+    fn context_rejects_negative() {
+        assert!(parse_context_size("-128K").is_err());
+    }
+
+    #[test]
+    fn context_cli_rejects_context_and_max_seq_len_together() {
+        let result = Args::try_parse_from([
+            "crane-serve",
+            "-m",
+            "/tmp/model",
+            "--context",
+            "128K",
+            "--max-seq-len",
+            "4096",
+        ]);
+        assert!(result.is_err());
     }
 }
