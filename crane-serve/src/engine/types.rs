@@ -63,6 +63,12 @@ pub enum EngineResponse {
         prompt_tokens: usize,
         completion_tokens: usize,
         finish_reason: String,
+        /// Time-to-first-token in milliseconds. `None` if no token was ever
+        /// sent (e.g. the request failed before producing output).
+        ttft_ms: Option<u64>,
+        /// Decode-phase token rate for this request. See
+        /// [`super::sequence::Sequence::decode_tokens_per_sec`].
+        decode_tokens_per_sec: f64,
     },
     /// An error occurred.
     Error(String),
@@ -238,6 +244,8 @@ mod tests {
             prompt_tokens: 5,
             completion_tokens: 2,
             finish_reason: "stop".into(),
+            ttft_ms: Some(42),
+            decode_tokens_per_sec: 12.5,
         };
         if let EngineResponse::Finished {
             prompt_tokens,

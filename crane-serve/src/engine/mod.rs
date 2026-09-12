@@ -705,6 +705,9 @@ impl InferenceEngine {
             repeat_last_n: 64,
             stop_sequences: req.stop,
             unsent_text: String::new(),
+            decode_start: None,
+            created_at: Instant::now(),
+            first_token_at: None,
             response_tx: req.response_tx,
         };
 
@@ -833,6 +836,7 @@ impl InferenceEngine {
             let seq = self.sequences.get_mut(&seq_id).unwrap();
             seq.tokens.push(next_token);
             seq.status = SequenceStatus::Running;
+            seq.decode_start = Some(Instant::now());
         }
 
         info!(
@@ -1416,13 +1420,17 @@ impl InferenceEngine {
             return;
         };
 
-        if let Some(seq) = self.sequences.get(seq_id)
-            && seq
+        if let Some(seq) = self.sequences.get_mut(seq_id) {
+            if seq.first_token_at.is_none() {
+                seq.first_token_at = Some(Instant::now());
+            }
+            if seq
                 .response_tx
                 .send(EngineResponse::Token { text, token_id: 0 })
                 .is_err()
-        {
-            debug!(id = %seq_id, "Response channel closed (client disconnected)");
+            {
+                debug!(id = %seq_id, "Response channel closed (client disconnected)");
+            }
         }
     }
 
@@ -1479,8 +1487,11 @@ impl InferenceEngine {
         };
 
         if !remaining.is_empty()
-            && let Some(seq) = self.sequences.get(seq_id)
+            && let Some(seq) = self.sequences.get_mut(seq_id)
         {
+            if seq.first_token_at.is_none() {
+                seq.first_token_at = Some(Instant::now());
+            }
             let _ = seq.response_tx.send(EngineResponse::Token {
                 text: remaining,
                 token_id: 0,
@@ -1513,12 +1524,16 @@ impl InferenceEngine {
             } else {
                 seq.finish_reason().to_string()
             };
+            let decode_tok_s = seq.decode_tokens_per_sec();
+            let ttft_ms = seq.ttft_ms();
 
             info!(
                 id = %seq_id,
                 prompt_tokens = seq.prompt_len,
                 completion_tokens,
                 finish_reason = %finish_reason,
+                decode_tok_s = format!("{:.1}", decode_tok_s),
+                ttft_ms = ?ttft_ms,
                 "Sequence finished",
             );
 
@@ -1527,6 +1542,8 @@ impl InferenceEngine {
                 prompt_tokens: seq.prompt_len,
                 completion_tokens,
                 finish_reason,
+                ttft_ms,
+                decode_tokens_per_sec: decode_tok_s,
             });
 
             self.stats
@@ -1535,6 +1552,12 @@ impl InferenceEngine {
             self.stats
                 .completed_requests
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(ttft) = ttft_ms {
+                self.stats
+                    .total_ttft_us
+                    .fetch_add(ttft * 1000, Ordering::Relaxed);
+                self.stats.ttft_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         self.cleanup_sequence(seq_id);

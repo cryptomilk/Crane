@@ -363,6 +363,7 @@ async fn collect_response(
                 prompt_tokens: pt,
                 completion_tokens: ct,
                 finish_reason: fr,
+                ..
             } => {
                 full_text = ft;
                 prompt_tokens = pt;
