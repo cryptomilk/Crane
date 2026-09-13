@@ -35,7 +35,7 @@ candle-transformers = { workspace = true }
 reqwest = { version = "0.13", features = ["stream"] }
 tempfile = "3"
 image = "0.25"
-base64 = "0.22"
+base64 = "0.23"
 
 [features]
 metal = [
@@ -62,4 +62,3 @@ mkl = ["crane-core/mkl", "crane/mkl"]
 tempfile = "3"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 serde_json = "1"
-base64 = "0.22"
