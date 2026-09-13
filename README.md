@@ -345,43 +345,9 @@ Supported endpoints:
 ## Using with opencode
 
 [opencode](https://opencode.ai/) can talk to crane-serve as a custom
-OpenAI-compatible provider. crane-serve has no auth layer and ignores the
-`model` field in requests (it always serves whatever was loaded via
-`--model-path`/`--model-name` at startup), so any placeholder API key and
-model ID work.
-
-Start crane-serve:
-
-```bash
-cargo run -p crane-serve --release --features cuda -- \
-  --model-path /path/to/your/model \
-  --model-name my-crane-model \
-  --port 8080
-```
-
-Add a custom provider in `opencode.json` (project root) or
-`~/.config/opencode/opencode.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "crane": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Crane",
-      "options": {
-        "baseURL": "http://localhost:8080/v1",
-        "apiKey": "not-needed"
-      },
-      "models": {
-        "my-crane-model": { "name": "My Crane Model" }
-      }
-    }
-  }
-}
-```
-
-Restart opencode and select the `Crane` provider via `/models`.
+OpenAI-compatible provider. See
+[crane-serve/README.md#using-with-opencode](crane-serve/README.md#using-with-opencode)
+for the config, including a ready-to-use Qwen3-Coder setup.
 
 ### TTS Examples
 
