@@ -5,19 +5,61 @@
 
 use candle_core::Device;
 
-/// Overhead multiplier applied to raw KV-tensor bytes to approximate real
-/// GPU memory growth (padded batch-decode copies, allocator block
-/// retention, forward-pass intermediates that scale with batch and context
-/// size during prefill). Raw KV-tensor bytes are only ~15-20% of real GPU
-/// growth in production, i.e. real growth is 5-8x raw tracked bytes; `6` is
-/// a conservative point estimate within that range.
+/// Fixed margin for allocator fragmentation and small runtime allocations,
+/// on top of KV-tensor storage. Does not scale with batch size or hidden
+/// dim, so it does not cover prefill/decode activation memory.
 ///
 /// Defined here (rather than in `crane-serve`, which owns the runtime
-/// KV-eviction budget that also uses this factor) because `crane-core`
+/// KV-eviction budget that also uses this margin) because `crane-core`
 /// cannot depend on `crane-serve` but `crane-serve` can and does depend on
 /// `crane-core` — this is the only direction that lets both sides share a
 /// single constant instead of drifting copies.
-pub const KV_GPU_OVERHEAD_FACTOR: u64 = 6;
+pub const KV_SAFETY_MARGIN_BYTES: u64 = 256 * (1 << 20);
+
+/// Multiplier applied to raw per-sequence KV storage to account for the
+/// transient overlap during batched-decode setup, where old per-sequence
+/// KV caches and the newly built padded batch buffer coexist in VRAM
+/// simultaneously before the old caches are dropped (see
+/// `InferenceEngine::step_decode_batch`'s call into
+/// `ModelBackend::setup_batch_decode`). With a single concurrent sequence
+/// there is nothing to pad against, so the real cost is close to 1x raw
+/// storage; with more than one, doubling covers the overlap when
+/// concurrent sequences have roughly similar lengths.
+///
+/// This is a heuristic for the common case, not a worst-case bound: with
+/// heavily skewed sequence lengths (one near `max_seq_len`, several much
+/// shorter ones sharing the same decode step), the padded buffer can
+/// approach `max_concurrent` times the longest sequence, exceeding this
+/// factor. Scaling the factor with `max_concurrent` to cover that case
+/// would reintroduce the over-reservation this function's callers exist
+/// to avoid (see git history — the flat `6x` factor this replaced).
+/// `InferenceEngine::is_over_kv_budget`'s `cuMemGetInfo` hard-safety
+/// check is the backstop for skewed-length cases where this heuristic
+/// underestimates.
+#[must_use]
+pub const fn kv_batch_factor(max_concurrent: usize) -> u64 {
+    if max_concurrent > 1 { 2 } else { 1 }
+}
+
+/// Estimate total VRAM consumed by KV caches from raw KV-tensor bytes:
+/// `raw_kv_bytes` scaled by [`kv_batch_factor`] for batched-decode
+/// overlap, plus [`KV_SAFETY_MARGIN_BYTES`] for allocator fragmentation.
+///
+/// The single source of truth for this formula — [`GpuBudget::runtime_reservation_bytes`]
+/// and `crane-serve`'s KV-eviction budget both call this instead of each
+/// keeping their own copy. Inverse: [`kv_budget_from_headroom`].
+#[must_use]
+pub const fn kv_vram_overhead(raw_kv_bytes: u64, max_concurrent: usize) -> u64 {
+    raw_kv_bytes * kv_batch_factor(max_concurrent) + KV_SAFETY_MARGIN_BYTES
+}
+
+/// Inverse of [`kv_vram_overhead`]: given available VRAM headroom, compute
+/// how many raw KV-cache bytes can be stored within it. Subtracts
+/// [`KV_SAFETY_MARGIN_BYTES`] and divides by [`kv_batch_factor`].
+#[must_use]
+pub const fn kv_budget_from_headroom(headroom_bytes: u64, max_concurrent: usize) -> u64 {
+    headroom_bytes.saturating_sub(KV_SAFETY_MARGIN_BYTES) / kv_batch_factor(max_concurrent)
+}
 
 /// Bundles the primary inference device with the device MoE expert weights
 /// load onto.
@@ -101,9 +143,9 @@ impl GpuBudget {
     /// [`WeightBudget::Unlimited`], since there is no weight budget to
     /// subtract from.
     ///
-    /// The returned value already includes [`KV_GPU_OVERHEAD_FACTOR`] over
-    /// raw KV-tensor bytes to approximate real GPU memory growth; it is not
-    /// a plain tensor-size calculation.
+    /// Computes raw per-sequence KV storage, then calls [`kv_vram_overhead`]
+    /// to account for batched-decode overlap and the safety margin; it is
+    /// not a plain tensor-size calculation.
     ///
     /// `num_layers`, `num_kv_heads`, and `head_dim` come from the model's
     /// own config; `dtype_bytes` should always be the compute dtype's
@@ -128,28 +170,23 @@ impl GpuBudget {
         ) {
             return 0;
         }
-        // Fixed 256 MiB margin for allocator fragmentation and small
-        // runtime allocations; it does not scale with batch size or hidden
-        // dim, so it does not cover prefill/decode activation memory.
-        const SAFETY_MARGIN_BYTES: u64 = 256 * (1 << 20);
         const DEFAULT_SEQ_LEN: usize = 4096;
 
-        let max_concurrent = self.max_concurrent.unwrap_or(1) as u64;
+        let max_concurrent = self.max_concurrent.unwrap_or(1);
         let effective_seq_len = self
             .max_seq_len
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_SEQ_LEN) as u64;
 
-        let kv_bytes = max_concurrent
+        let kv_storage = max_concurrent as u64
             * effective_seq_len
             * 2
             * num_layers as u64
             * num_kv_heads as u64
             * head_dim as u64
-            * dtype_bytes as u64
-            * KV_GPU_OVERHEAD_FACTOR;
+            * dtype_bytes as u64;
 
-        kv_bytes + SAFETY_MARGIN_BYTES
+        kv_vram_overhead(kv_storage, max_concurrent)
     }
 }
 
@@ -285,7 +322,8 @@ mod tests {
     }
 
     // Verifies the KV-cache + safety-margin formula with explicit
-    // max_concurrent/max_seq_len values.
+    // max_concurrent/max_seq_len values. max_concurrent=8 > 1, so the
+    // batch-padding factor of 2 applies.
     #[test]
     fn runtime_reservation_bytes_with_explicit_values() {
         let budget = GpuBudget {
@@ -294,17 +332,15 @@ mod tests {
             max_concurrent: Some(8),
             max_seq_len: Some(2048),
         };
-        // kv_bytes = 8 * 2048 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR.
-        // The `6` is hardcoded (not `KV_GPU_OVERHEAD_FACTOR`) so a change to
-        // the constant's value itself is caught by this test.
-        let expected_kv_bytes: u64 = 8 * 2048 * 2 * 48 * 4 * 128 * 2 * 6;
-        let expected = expected_kv_bytes + (256 << 20);
+        let kv_storage: u64 = 8 * 2048 * 2 * 48 * 4 * 128 * 2;
+        let expected = kv_storage * 2 + KV_SAFETY_MARGIN_BYTES;
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
 
     // Verifies unset max_concurrent/max_seq_len fall back to conservative
     // defaults (1 concurrent sequence, 4096-token horizon) rather than
-    // underestimating the reservation as zero.
+    // underestimating the reservation as zero. max_concurrent defaults to
+    // 1, so no batch-padding factor applies.
     #[test]
     fn runtime_reservation_bytes_defaults_when_unset() {
         let budget = GpuBudget {
@@ -313,8 +349,8 @@ mod tests {
             max_concurrent: None,
             max_seq_len: None,
         };
-        let expected_kv_bytes: u64 = 1 * 4096 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR;
-        let expected = expected_kv_bytes + (256 << 20);
+        let kv_storage: u64 = 1 * 4096 * 2 * 48 * 4 * 128 * 2;
+        let expected = kv_storage + KV_SAFETY_MARGIN_BYTES;
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
 
@@ -332,6 +368,7 @@ mod tests {
     // Verifies a large explicit max_seq_len (e.g. a long-context deployment)
     // is not silently capped at the 4096 unset-fallback default, which
     // would under-reserve KV-cache VRAM and risk a runtime GPU OOM.
+    // max_concurrent=1, so no batch-padding factor applies.
     #[test]
     fn runtime_reservation_bytes_respects_large_seq_len() {
         let budget = GpuBudget {
@@ -340,8 +377,48 @@ mod tests {
             max_concurrent: Some(1),
             max_seq_len: Some(32768),
         };
-        let expected_kv_bytes: u64 = 1 * 32768 * 2 * 48 * 4 * 128 * 2 * KV_GPU_OVERHEAD_FACTOR;
-        let expected = expected_kv_bytes + (256 << 20);
+        let expected_kv_bytes: u64 = 1 * 32768 * 2 * 48 * 4 * 128 * 2;
+        let expected = expected_kv_bytes + KV_SAFETY_MARGIN_BYTES;
+        assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
+    }
+
+    // Verifies the batch-padding factor: 1 for max_concurrent in {0, 1}
+    // (nothing to pad against), 2 for anything greater (worst case: every
+    // slot padded to the longest).
+    #[test]
+    fn kv_batch_factor_thresholds_at_one() {
+        assert_eq!(kv_batch_factor(0), 1);
+        assert_eq!(kv_batch_factor(1), 1);
+        assert_eq!(kv_batch_factor(2), 2);
+        assert_eq!(kv_batch_factor(16), 2);
+    }
+
+    // Verifies kv_budget_from_headroom is the exact inverse of
+    // kv_vram_overhead across the batch-factor threshold, so the two
+    // formulas used by crane-core (load-time reservation) and
+    // crane-serve (runtime KV budget) cannot silently drift apart.
+    #[test]
+    fn kv_overhead_round_trip() {
+        for &n in &[0usize, 1, 2, 8, 16] {
+            let raw: u64 = 1_000_000;
+            let overhead = kv_vram_overhead(raw, n);
+            assert_eq!(kv_budget_from_headroom(overhead, n), raw);
+        }
+    }
+
+    // Verifies the safety margin is fully present even when raw KV
+    // storage is negligible (max_concurrent=1, max_seq_len=1) rather than
+    // being silently absorbed or truncated.
+    #[test]
+    fn runtime_reservation_bytes_includes_full_margin_with_minimal_kv() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(1 << 30),
+            offload_all_experts: false,
+            max_concurrent: Some(1),
+            max_seq_len: Some(1),
+        };
+        let kv_storage: u64 = 1 * 1 * 2 * 48 * 4 * 128 * 2;
+        let expected = kv_storage + KV_SAFETY_MARGIN_BYTES;
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
     }
 

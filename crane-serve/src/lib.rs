@@ -25,7 +25,7 @@ use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
+use engine::{EngineHandle, InferenceEngine, MemoryConfig, kv_budget_from_headroom};
 use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, MinicpmVVlmRequest, Qwen3_5VlmRequest, VlmRequest};
@@ -593,6 +593,15 @@ fn apply_text_only_override(
 /// therefore treated the same as an absent flag, both falling back to the
 /// full VRAM total, unlike `MemoryConfig::parse` where `"0"` means
 /// unlimited.
+///
+/// `max_concurrent` is the raw CLI value, not yet clamped by
+/// `InferenceEngine::new` based on `supports_kv_swap()`. If the engine
+/// later clamps it down (e.g. to 1 for a model without KV-swap support),
+/// the load-time reservation computed from this budget will have used a
+/// larger `kv_batch_factor` than the runtime KV budget does — harmless
+/// (it only over-reserves, never under-reserves), but worth knowing if
+/// this function is ever reused by a model whose effective concurrency
+/// can differ from the CLI flag.
 fn resolve_gpu_budget(
     gpu_memory_limit: Option<&str>,
     offload_experts: bool,
@@ -675,16 +684,17 @@ fn derive_safe_max_seq_len(
         .gpu_memory_limit_bytes
         .min(physical_total_bytes);
     let headroom = ceiling.saturating_sub(memory_config.baseline_gpu_bytes);
-    // Raw KV-tensor bytes are only ~15-20% of real GPU growth (padded
+    // Raw KV-tensor bytes alone understate real GPU growth (padded
     // batch-decode copies, allocator retention, forward-pass intermediates
     // like chunked-prefill attention scores that scale with chunk_size ×
-    // kv_len) — see `KV_GPU_OVERHEAD_FACTOR`'s doc comment. Reuse the same
-    // empirically-measured factor here instead of a separate guess: an
-    // earlier version of this function used an arbitrary 80% margin, which
-    // was ~6x too generous and let a single session's own prefill blow
-    // past physical VRAM in production.
-    let safe_headroom = headroom / KV_GPU_OVERHEAD_FACTOR;
-    let per_seq_budget = safe_headroom / max_concurrent.max(1) as u64;
+    // kv_len) — see `kv_batch_factor`'s doc comment. Reuse the same
+    // empirically-grounded formula (`kv_budget_from_headroom`, shared with
+    // `InferenceEngine::raw_kv_budget` and `GpuBudget::runtime_reservation_bytes`)
+    // here instead of a separate guess: an earlier version of this function
+    // used an arbitrary 80% margin, which was far too generous and let a
+    // single session's own prefill blow past physical VRAM in production.
+    let total_kv_budget = kv_budget_from_headroom(headroom, max_concurrent);
+    let per_seq_budget = total_kv_budget / max_concurrent.max(1) as u64;
     let derived = per_seq_budget / kv_bytes_per_token;
     if derived == 0 {
         return None;
@@ -734,6 +744,9 @@ pub async fn run(mut args: Args) -> Result<()> {
         }
     };
 
+    // args.max_concurrent is the raw CLI value; the engine may clamp it
+    // later based on supports_kv_swap(). See resolve_gpu_budget's doc
+    // comment.
     let gpu_budget = resolve_gpu_budget(
         args.gpu_memory_limit.as_deref(),
         args.offload_experts,
@@ -1641,6 +1654,7 @@ pub fn build_router_with_ui(state: Arc<AppState>, ui_enabled: bool) -> Router {
 mod config_tests {
     use super::*;
     use crane_core::models::{DType, Device};
+    use engine::KV_SAFETY_MARGIN_BYTES;
 
     #[test]
     fn explicit_flag_wins() {
@@ -1822,32 +1836,41 @@ mod config_tests {
     }
 
     #[test]
+    fn derive_max_seq_len_none_when_margin_exceeds_headroom() {
+        // Headroom exists (limit > baseline) but is smaller than
+        // KV_SAFETY_MARGIN_BYTES, so safe_headroom saturates to 0 and the
+        // derived sequence length is 0 => None.
+        let baseline: u64 = 8 << 30;
+        let limit = baseline + KV_SAFETY_MARGIN_BYTES / 2;
+        let cfg = memory_config_for_test(0, limit, baseline);
+        assert!(derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).is_none());
+    }
+
+    #[test]
     fn derive_max_seq_len_computes_expected_value() {
-        // Mirrors this session's real numbers: 16 GiB card, 10 GiB limit,
-        // 4 GiB baseline, 96 KiB/token, max_concurrent=1,
-        // KV_GPU_OVERHEAD_FACTOR=6. headroom=6 GiB, /6 -> 1 GiB safe budget
-        // -> 1 GiB / 96 KiB = 10922 tokens (integer division).
-        //
-        // Notably this is well *below* the 47080-token real workload this
-        // session debugged — with the correct overhead factor applied,
-        // that workload genuinely does not fit safely in a 10G limit on
-        // this card, it isn't just a smaller-than-expected safe cap. An
-        // earlier, buggy version of this function used an 80% margin
-        // instead of dividing by `KV_GPU_OVERHEAD_FACTOR`, which computed
-        // 49152 — 4.5x too generous — and that value OOM'd in production.
+        // 16 GiB card, 10 GiB limit, 4 GiB baseline, 96 KiB/token,
+        // max_concurrent=1 (batch_factor=1, no padding overhead).
+        // headroom=6 GiB, minus 256 MiB safety margin -> 5888 MiB safe
+        // budget -> 5888 MiB / 96 KiB = 62805 tokens (integer division).
         let cfg = memory_config_for_test(0, 10 << 30, 4 << 30);
         let kv_bytes_per_token = 96 * 1024;
         let derived =
             derive_safe_max_seq_len(&cfg, 16 << 30, kv_bytes_per_token, 1).expect("derived");
-        assert_eq!(derived, 10_922);
+        assert_eq!(derived, 62_805);
     }
 
     #[test]
     fn derive_max_seq_len_divides_budget_across_max_concurrent() {
-        let cfg = memory_config_for_test(0, 10 << 30, 1 << 30);
-        let single = derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 1).expect("derived");
-        let quad = derive_safe_max_seq_len(&cfg, 16 << 30, 1024, 4).expect("derived");
-        assert_eq!(single / 4, quad);
+        // Numbers chosen so every intermediate division is exact: safe
+        // headroom is 8,000,000 bytes (divisible by the 8x total scaling
+        // from batch_factor=2 * max_concurrent=4), kv_bytes_per_token=1
+        // removes any final-division rounding.
+        let safe_headroom: u64 = 8_000_000;
+        let limit = safe_headroom + KV_SAFETY_MARGIN_BYTES;
+        let cfg = memory_config_for_test(0, limit, 0);
+        let single = derive_safe_max_seq_len(&cfg, 1 << 32, 1, 1).expect("derived");
+        let quad = derive_safe_max_seq_len(&cfg, 1 << 32, 1, 4).expect("derived");
+        assert_eq!(single / 8, quad);
     }
 
     #[test]
