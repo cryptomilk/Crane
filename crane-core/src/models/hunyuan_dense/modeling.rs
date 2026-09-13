@@ -10,6 +10,27 @@ use std::sync::Arc;
 
 // ── GGUF loading helper ──
 
+/// Opens and memory-maps a GGUF file for zero-syscall tensor reads.
+///
+/// The returned `Mmap` can be wrapped in a `std::io::Cursor` and passed
+/// anywhere a `Read + Seek` reader is expected (e.g. [`Gguf::new`]), letting
+/// tensor loads page data in from disk on demand instead of going through
+/// per-tensor `seek`/`read_exact` syscalls.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened or memory-mapped.
+pub fn mmap_gguf_file(path: impl AsRef<std::path::Path>) -> std::io::Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)?;
+    // SAFETY: the caller must not truncate or replace this file on disk while
+    // the returned mapping is alive. Doing so raises SIGBUS on a later page-in
+    // (e.g. during tensor loading), which is unrecoverable and not something a
+    // `Result` can catch. Crane itself never writes to model files it has
+    // loaded; this only holds if external tooling (re-downloads, redeploys)
+    // avoids replacing a model file path while a server process has it mapped.
+    unsafe { memmap2::Mmap::map(&file) }
+}
+
 /// Wraps a parsed GGUF file + reader for convenient tensor loading.
 pub struct Gguf<R: Read + Seek> {
     pub ct: gguf_file::Content,

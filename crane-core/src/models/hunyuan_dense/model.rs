@@ -146,8 +146,9 @@ impl Model {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?;
 
         // Open and parse GGUF
-        let mut file = std::fs::File::open(gguf_path)?;
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        let mmap = crate::models::hunyuan_dense::modeling::mmap_gguf_file(gguf_path)?;
+        let mut cursor = std::io::Cursor::new(mmap.as_ref());
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
 
         eprintln!(
             "GGUF loaded: {} tensors, {} metadata entries",
@@ -155,7 +156,7 @@ impl Model {
             ct.metadata.len(),
         );
 
-        let inner = HunYuanDenseV1::from_gguf(ct, &mut file, device)?;
+        let inner = HunYuanDenseV1::from_gguf(ct, &mut cursor, device)?;
         let dtype = inner.model_dtype();
 
         Ok(Self {

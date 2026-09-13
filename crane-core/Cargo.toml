@@ -45,6 +45,7 @@ fancy-regex = "0.18"
 tekken = { version = "0.2.0", default-features = false }
 zip = "8"
 fst = { workspace = true }
+memmap2 = "0.9"
 lru = { version = "0.12", optional = true }
 aho-corasick = { version = "1", optional = true }
 unicode-normalization = { version = "0.1", optional = true }

@@ -18,11 +18,13 @@ pub struct VarBuilder {
 
 impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
-        let mut file = std::fs::File::open(p)?;
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+        let mmap = crate::models::hunyuan_dense::modeling::mmap_gguf_file(p)
+            .map_err(candle_core::Error::wrap)?;
+        let mut cursor = std::io::Cursor::new(mmap.as_ref());
+        let content = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
         let mut data = std::collections::HashMap::new();
         for tensor_name in content.tensor_infos.keys() {
-            let tensor = content.tensor(&mut file, tensor_name, device)?;
+            let tensor = content.tensor(&mut cursor, tensor_name, device)?;
             data.insert(tensor_name.to_string(), Arc::new(tensor));
         }
         Ok(Self {
