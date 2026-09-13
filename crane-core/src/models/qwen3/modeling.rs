@@ -1014,12 +1014,7 @@ impl Qwen3Model {
             dtype
         };
         let lm_head = if config.tie_word_embeddings {
-            match embed_tokens.tied_output()? {
-                LinearLayer::Standard(l) if dtype == DType::F16 => {
-                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
-                },
-                other => other,
-            }
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             LinearLayer::Standard(Linear::new(
                 linear_no_bias(config.hidden_size, config.vocab_size, root_vb.pp("lm_head"))?
@@ -1206,16 +1201,8 @@ impl Qwen3Model {
 
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
-        // Tied path pre-stored in F32 only for F16, same reasoning as the
-        // safetensors path above. The untied `Quantized` path already
-        // computes in F32 internally, so it needs no change here.
         let lm_head = if tie_word_embeddings {
-            match embed_tokens.tied_output()? {
-                LinearLayer::Standard(l) if dtype == DType::F16 => {
-                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
-                },
-                other => other,
-            }
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             gg.linear("output.weight")?
         };
