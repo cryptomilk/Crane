@@ -309,8 +309,15 @@ impl Vad {
         self.reset()?;
         let model_file = model_file.as_ref();
         let model = if model_file.is_empty() {
-            let model_file = hf_hub::api::sync::Api::new()
-                .and_then(|api| api.model(DEFAULT_MODEL_NAME.into()).get(DEFAULT_MODEL_FILE))
+            let model_file = hf_hub::HFClientSync::new()
+                .and_then(|client| {
+                    let (owner, name) = hf_hub::split_id(DEFAULT_MODEL_NAME);
+                    client
+                        .model(owner, name)
+                        .download_file()
+                        .filename(DEFAULT_MODEL_FILE)
+                        .send()
+                })
                 .map_err(Error::wrap)?;
             onnx::read_file(model_file)?
         } else {

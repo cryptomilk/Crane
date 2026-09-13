@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{HFClientSync, split_id};
 
 /// Name of the environment variable pointing at a local checkout of the
 /// `crane-local-ai/test-data` dataset, bypassing the `HuggingFace` download.
@@ -45,8 +45,12 @@ pub fn get_test_data_file(path: &str) -> Result<PathBuf> {
         return Ok(file);
     }
 
-    let repo = Repo::new(CRANE_TEST_DATA_REPO.to_string(), RepoType::Dataset);
-    let file = Api::new()?.repo(repo).get(path)?;
+    let (owner, name) = split_id(CRANE_TEST_DATA_REPO);
+    let file = HFClientSync::new()?
+        .dataset(owner, name)
+        .download_file()
+        .filename(path)
+        .send()?;
     Ok(file)
 }
 

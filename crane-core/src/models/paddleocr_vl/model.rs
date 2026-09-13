@@ -4,7 +4,7 @@ use candle_nn::VarBuilder;
 // TODO(candle-transformers-removal): Full PaddleOCR-VL model dependency; see
 // CANDLE_TRANSFORMERS.md.
 use candle_transformers::models::paddleocr_vl::{Config, PaddleOCRVLModel};
-use hf_hub::{Repo, RepoType, api::sync::Api};
+use hf_hub::{HFClientSync, split_id};
 use std::path::Path;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -138,21 +138,36 @@ impl PaddleOcrVL {
             DType::F32
         };
 
-        let api = Api::new()?;
-        let repo = api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            revision.unwrap_or("main").to_string(),
-        ));
+        let client = HFClientSync::new()?;
+        let (owner, name) = split_id(model_id);
+        let repo = client.model(owner, name);
+        let revision = revision.unwrap_or("main");
 
-        let config: Config =
-            serde_json::from_str(&std::fs::read_to_string(repo.get("config.json")?)?)?;
+        let config_file = repo
+            .download_file()
+            .filename("config.json")
+            .revision(revision)
+            .send()?;
+        let config: Config = serde_json::from_str(&std::fs::read_to_string(config_file)?)?;
 
-        let tokenizer = Tokenizer::from_file(repo.get("tokenizer.json")?).map_err(E::msg)?;
+        let tokenizer_file = repo
+            .download_file()
+            .filename("tokenizer.json")
+            .revision(revision)
+            .send()?;
+        let tokenizer = Tokenizer::from_file(tokenizer_file).map_err(E::msg)?;
 
         let model_file = repo
-            .get("model.safetensors")
-            .or_else(|_| repo.get("pytorch_model.bin"))?;
+            .download_file()
+            .filename("model.safetensors")
+            .revision(revision)
+            .send()
+            .or_else(|_| {
+                repo.download_file()
+                    .filename("pytorch_model.bin")
+                    .revision(revision)
+                    .send()
+            })?;
 
         let vb = if model_file.extension().map_or(false, |e| e == "bin") {
             VarBuilder::from_pth(&model_file, dtype, &device)?

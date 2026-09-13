@@ -1,4 +1,4 @@
-use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
+use hf_hub::{HFClientBuilder, split_id};
 use minijinja_contrib::add_to_environment;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,14 +60,18 @@ pub fn from_pretrained<S: AsRef<str>>(
         .into());
     }
 
-    let mut builder = ApiBuilder::new();
+    let mut builder = HFClientBuilder::new();
     if let Some(token) = params.token {
-        builder = builder.with_token(Some(token));
+        builder = builder.token(token);
     }
-    let api = builder.build()?;
-    let repo = Repo::with_revision(identifier, RepoType::Model, params.revision);
-    let api = api.repo(repo);
-    Ok(api.get("tokenizer_config.json")?)
+    let client = builder.build_sync()?;
+    let (owner, name) = split_id(&identifier);
+    let repo = client.model(owner, name);
+    Ok(repo
+        .download_file()
+        .filename("tokenizer_config.json")
+        .revision(params.revision)
+        .send()?)
 }
 
 use minijinja::context;

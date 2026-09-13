@@ -159,12 +159,15 @@ fn resolve_audiovae_safetensors(model_path: &str) -> Result<std::path::PathBuf> 
          pre-converted file from https://huggingface.co/{AUDIOVAE_HF_REPO} \
          (cached under HF_HOME; set it alongside the checkpoint to skip this)"
     );
-    let api = hf_hub::api::sync::Api::new().context("initialise hf-hub API")?;
-    let repo = api.model(AUDIOVAE_HF_REPO.to_string());
+    let client = hf_hub::HFClientSync::new().context("initialise hf-hub API")?;
+    let (owner, name) = hf_hub::split_id(AUDIOVAE_HF_REPO);
+    let repo = client.model(owner, name);
     // `audiovae.safetensors` is the canonical name; `model.safetensors` is
     // the fallback in case the Hub repo used the default export filename.
-    repo.get(AUDIOVAE_FILENAME)
-        .or_else(|_| repo.get("model.safetensors"))
+    repo.download_file()
+        .filename(AUDIOVAE_FILENAME)
+        .send()
+        .or_else(|_| repo.download_file().filename("model.safetensors").send())
         .with_context(|| {
             format!(
                 "download {AUDIOVAE_FILENAME} from {AUDIOVAE_HF_REPO} \

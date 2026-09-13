@@ -31,7 +31,7 @@ candle-nn = { workspace = true }
 # remaining model/component and generation-helper call sites.
 candle-transformers = { workspace = true }
 clap = { version = "4.5.32", features = ["derive"] }
-hf-hub = "0.5.0"
+hf-hub = { version = "1.0", features = ["blocking"] }
 minijinja = { version = "2.21", features = ["builtins", "preserve_order"] }
 minijinja-contrib = { version = "2.21", features = ["pycompat"] }
 serde = "1.0"
