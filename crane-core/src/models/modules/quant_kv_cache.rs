@@ -337,12 +337,24 @@ impl KvCacheKind {
     /// possible to tell which mode actually ended up active (an explicit
     /// `--kv-quant`/`new_with_kv_kind` request vs. the `CRANE_KV_QUANT` env
     /// var vs. neither) without re-deriving it from the request itself.
+    ///
+    /// The quantized variants deliberately don't claim a peak-VRAM
+    /// reduction: until the fused dequantize-in-attention kernel described
+    /// in [`QuantKvCache`]'s doc lands, the persistent dequant scratch
+    /// buffer makes prefill (and any decode step that can't use the fused
+    /// single-token kernel) cost as much as `Fp`, not less.
     #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Fp => "fp16/bf16 (unquantized)",
-            Self::Int8 => "int8 (quantized, stored codes ~2x smaller than fp16)",
-            Self::Int4 => "int4 (quantized, stored codes ~4x smaller than fp16)",
+            Self::Int8 => {
+                "int8 (quantized; stored codes ~2x smaller than fp16, but peak VRAM during \
+                 prefill is not reduced yet)"
+            },
+            Self::Int4 => {
+                "int4 (quantized; stored codes ~4x smaller than fp16, but peak VRAM during \
+                 prefill is not reduced yet)"
+            },
         }
     }
 }

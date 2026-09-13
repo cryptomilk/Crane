@@ -83,22 +83,27 @@ fn vram_trace_enabled() -> bool {
 //  InferenceEngine
 // ─────────────────────────────────────────────────────────────
 
-/// KV-to-GPU overhead factor.
+/// KV-cache batch-padding factor, safety margin, and the shared
+/// `kv_budget_from_headroom` inverse-overhead formula, all defined in
+/// `crane_core::device` (not here) so the model-load-time reservation in
+/// `GpuBudget::runtime_reservation_bytes` and this engine's runtime
+/// KV-eviction budget share one formula instead of separate copies that
+/// can drift apart.
 ///
-/// Used here so that `kv_budget = (limit - baseline) / KV_GPU_OVERHEAD_FACTOR`
-/// (see [`InferenceEngine::kv_budget_bytes`]), giving the engine a realistic
-/// estimate of how much KV it can afford before the GPU runs out of memory.
-/// Also reused by `crate::derive_safe_max_seq_len` for the same reason: a
-/// naive raw-KV-bytes budget (no overhead factor) undercounts real usage and
-/// lets a single long-running session's own prefill blow past physical VRAM
-/// (verified in production — see git history).
-///
-/// Defined in `crane_core::device` (not here) so the model-load-time
-/// reservation in `GpuBudget::runtime_reservation_bytes` and this engine's
-/// runtime KV-eviction budget share one constant instead of two copies that
-/// can drift apart; see that constant's doc comment for why the factor's
-/// value is what it is.
-pub(crate) use crane_core::device::KV_GPU_OVERHEAD_FACTOR;
+/// [`InferenceEngine::raw_kv_budget`] calls `kv_budget_from_headroom`
+/// directly rather than re-deriving `(raw - KV_SAFETY_MARGIN_BYTES) /
+/// kv_batch_factor(max_running)` inline; `KV_SAFETY_MARGIN_BYTES` and
+/// `kv_batch_factor` are still imported here for diagnostic logging (see
+/// `run()`'s startup log and `is_over_kv_budget`'s warning). Also reused
+/// by `crate::derive_safe_max_seq_len` for the same reason: a naive
+/// raw-KV-bytes budget (no batch-padding factor) undercounts real usage
+/// under concurrent load and lets a single long-running session's own
+/// prefill blow past physical VRAM (verified in production — see git
+/// history). See `kv_batch_factor`'s doc comment for the reasoning behind
+/// the factor's value.
+pub(crate) use crane_core::device::{
+    KV_SAFETY_MARGIN_BYTES, kv_batch_factor, kv_budget_from_headroom,
+};
 
 /// Continuous-batching inference engine.
 ///
@@ -196,27 +201,36 @@ impl InferenceEngine {
         };
         if limit > 0 {
             let kv_budget = self.kv_budget_bytes();
-            if kv_budget == 0 || limit <= baseline {
+            if limit <= baseline {
                 warn!(
                     "gpu_memory_limit ({}) <= model baseline ({}). \
                      KV-cache budget is 0 — all sequences will be immediately preempted.",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                 );
+            } else if kv_budget == 0 {
+                warn!(
+                    "gpu_memory_limit ({}) leaves less than {} after subtracting model \
+                     baseline ({}). KV-cache budget is 0 — all sequences will be \
+                     immediately preempted.",
+                    format_bytes_engine(limit),
+                    format_bytes_engine(KV_SAFETY_MARGIN_BYTES),
+                    format_bytes_engine(baseline),
+                );
             } else {
                 info!(
-                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (overhead={}x, also checked by cuMemGetInfo)",
+                    "Memory budget: total_limit={}, model_baseline={}, kv_budget={} (batch_factor={}, also checked by cuMemGetInfo)",
                     format_bytes_engine(limit),
                     format_bytes_engine(baseline),
                     format_bytes_engine(kv_budget),
-                    KV_GPU_OVERHEAD_FACTOR,
+                    kv_batch_factor(self.scheduler.max_running),
                 );
             }
 
             // These two warnings are mutually exclusive: floor_kv_budget only
             // raises the budget when kv_bytes_per_token() is Some, so a raise
             // is only observable when the backend does report a rate.
-            let raw_budget = limit.saturating_sub(baseline) / KV_GPU_OVERHEAD_FACTOR;
+            let raw_budget = self.raw_kv_budget();
             if kv_budget > raw_budget {
                 warn!(
                     "KV budget {} raised to {} to fit one full sequence (max_seq_len={}) \
@@ -416,34 +430,43 @@ impl InferenceEngine {
         self.tracked_kv_bytes = total;
     }
 
-    /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
-    ///
-    /// Each byte of live KV cache costs roughly `KV_GPU_OVERHEAD_FACTOR` bytes
-    /// of real GPU memory (due to padded batch copies, CUDA pool bloat, and
-    /// forward-pass intermediates).  The budget is therefore:
-    ///
-    /// ```text
-    /// kv_budget = (gpu_limit - baseline) / KV_GPU_OVERHEAD_FACTOR
-    /// ```
-    ///
-    /// Floored at what one full `max_seq_len` sequence needs — a configured
-    /// `max_seq_len` must be satisfiable by at least one sequence, or
-    /// eviction has nothing else to blame and loops forever evicting the
-    /// only sequence, re-prefilling it, and evicting it again (observed in
-    /// the field: a single request whose own KV footprint alone exceeded
-    /// this budget never completed). The floor only applies when the backend
-    /// reports `kv_bytes_per_token`; backends that return `None`
-    /// (hybrid/shared KV architectures) get the un-floored budget, and
-    /// `run()`'s startup log warns that satisfiability couldn't be verified.
+    /// Un-floored KV cache budget in KV-cache bytes: `gpu_limit - baseline`,
+    /// run through [`kv_budget_from_headroom`] — the exact inverse of
+    /// `GpuBudget::runtime_reservation_bytes`'s `kv_vram_overhead` call, so
+    /// the two ends of the formula can't drift apart. Shared by
+    /// [`Self::kv_budget_bytes`] (which floors it) and `run()`'s startup
+    /// log (which compares the floored and un-floored values to decide
+    /// whether to warn).
     ///
     /// Returns `u64::MAX` when no limit is configured.
-    fn kv_budget_bytes(&self) -> u64 {
+    fn raw_kv_budget(&self) -> u64 {
         let limit = self.memory_config.gpu_memory_limit_bytes;
         if limit == 0 {
             return u64::MAX;
         }
-        let raw = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
-        let budget = raw / KV_GPU_OVERHEAD_FACTOR;
+        let headroom = limit.saturating_sub(self.memory_config.baseline_gpu_bytes);
+        kv_budget_from_headroom(headroom, self.scheduler.max_running)
+    }
+
+    /// KV cache budget **in KV-cache bytes** (not raw GPU bytes).
+    ///
+    /// [`Self::raw_kv_budget`], floored at what one full `max_seq_len`
+    /// sequence needs — a configured `max_seq_len` must be satisfiable by
+    /// at least one sequence, or eviction has nothing else to blame and
+    /// loops forever evicting the only sequence, re-prefilling it, and
+    /// evicting it again (observed in the field: a single request whose
+    /// own KV footprint alone exceeded this budget never completed). The
+    /// floor only applies when the backend reports `kv_bytes_per_token`;
+    /// backends that return `None` (hybrid/shared KV architectures) get
+    /// the un-floored budget, and `run()`'s startup log warns that
+    /// satisfiability couldn't be verified.
+    ///
+    /// Returns `u64::MAX` when no limit is configured.
+    fn kv_budget_bytes(&self) -> u64 {
+        let budget = self.raw_kv_budget();
+        if budget == u64::MAX {
+            return u64::MAX;
+        }
         floor_kv_budget(
             budget,
             self.model.kv_bytes_per_token(),
@@ -471,21 +494,21 @@ impl InferenceEngine {
 
         let budget = self.kv_budget_bytes();
         if budget == 0 {
-            return true; // limit <= baseline
+            return true; // limit <= baseline, or headroom consumed by safety margin
         }
 
-        // Check 1: tracked KV bytes vs overhead-adjusted budget.
+        // Check 1: tracked KV bytes vs batch-padding-adjusted budget.
         if self.tracked_kv_bytes > budget {
             let now = Instant::now();
             if now.duration_since(self.last_mem_warn).as_secs() >= 5 {
                 self.last_mem_warn = now;
                 warn!(
-                    "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} overhead={}x)",
+                    "KV budget exceeded: kv_used={} > kv_budget={} (limit={} baseline={} batch_factor={})",
                     format_bytes_engine(self.tracked_kv_bytes),
                     format_bytes_engine(budget),
                     format_bytes_engine(limit),
                     format_bytes_engine(self.memory_config.baseline_gpu_bytes),
-                    KV_GPU_OVERHEAD_FACTOR,
+                    kv_batch_factor(self.scheduler.max_running),
                 );
             }
             return true;
