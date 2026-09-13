@@ -725,17 +725,8 @@ impl HunYuanDenseV1 {
             model_vb.pp("norm"),
         )?;
 
-        // Tied embeddings are pre-stored in F32 only when the compute dtype
-        // is F16, to avoid overflowing F16's 65504 max on the vocab-sized
-        // `lm_head` projection (see `forward_logits`). BF16/F32 stay native
-        // since they share F32's exponent range and can't overflow.
         let lm_head = if config.tie_word_embeddings {
-            match embed_tokens.tied_output()? {
-                LinearLayer::Standard(l) if dtype == DType::F16 => {
-                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
-                },
-                other => other,
-            }
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -883,16 +874,9 @@ impl HunYuanDenseV1 {
         // Final norm
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
-        // LM head (may be tied to embeddings). Tied path pre-stored in F32
-        // only for F16, same reasoning as the safetensors path above. The
-        // untied `Quantized` path already computes in F32 internally.
+        // LM head (may be tied to embeddings).
         let lm_head = if tie_word_embeddings {
-            match embed_tokens.tied_output()? {
-                LinearLayer::Standard(l) if dtype == DType::F16 => {
-                    LinearLayer::Standard(Linear::new(l.weight().to_dtype(DType::F32)?, None))
-                },
-                other => other,
-            }
+            embed_tokens.tied_output_upcast_f16(dtype)?
         } else {
             gg.linear("output.weight")?
         };
