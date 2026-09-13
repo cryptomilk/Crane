@@ -1,3 +1,4 @@
+use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
 use candle_core::quantized::{QTensor, gguf_file};
@@ -816,7 +817,7 @@ impl DecoderLayer {
 }
 
 pub struct HunYuanDenseV1 {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: EmbeddingLayer,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: LinearLayer,
@@ -833,11 +834,11 @@ impl HunYuanDenseV1 {
     pub fn new(config: &Config, vb: &VarBuilder) -> Result<Self> {
         let dtype = vb.dtype();
         let model_vb = vb.pp("model");
-        let embed_tokens = candle_nn::embedding(
+        let embed_tokens = EmbeddingLayer::Dense(candle_nn::embedding(
             config.vocab_size,
             config.hidden_size,
             model_vb.pp("embed_tokens"),
-        )?;
+        )?);
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
@@ -849,7 +850,7 @@ impl HunYuanDenseV1 {
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
         let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            embed_tokens.tied_output()?
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -889,8 +890,8 @@ impl HunYuanDenseV1 {
     }
 
     /// Construct from a GGUF file. Reads config from GGUF metadata and loads
-    /// all weights as quantized tensors (`QMatMul` for linear layers, dequantized
-    /// for embeddings and norms).
+    /// all weights as quantized tensors (`QMatMul` for linear layers, norms
+    /// dequantized, embeddings kept quantized and gathered lazily per row).
     ///
     /// # Errors
     ///
@@ -979,8 +980,8 @@ impl HunYuanDenseV1 {
         };
 
         // Load embedding
-        let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
-        let actual_vocab_size = embed_tokens.embeddings().dim(0)?;
+        let embed_tokens = gg.quantized_embedding("token_embd.weight", hidden_size)?;
+        let actual_vocab_size = embed_tokens.vocab_size();
 
         // Update config with actual vocab size
         let config = Config {
@@ -999,7 +1000,7 @@ impl HunYuanDenseV1 {
 
         // LM head (may be tied to embeddings)
         let lm_head = if tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            embed_tokens.tied_output()?
         } else {
             gg.linear("output.weight")?
         };
@@ -1197,7 +1198,7 @@ impl HunYuanDenseV1 {
     ) -> Result<(Vec<usize>, usize)> {
         let kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim();
-        let device = self.embed_tokens.embeddings().device();
+        let device = self.embed_tokens.device();
 
         // Compute per-sequence KV lengths from the first layer's cache.
         let kv_lens: Vec<usize> = seq_kv_caches
@@ -1221,7 +1222,7 @@ impl HunYuanDenseV1 {
                 max_kv_len,
                 kv_heads,
                 head_dim,
-                device,
+                &device,
                 self.dtype,
             )?;
 

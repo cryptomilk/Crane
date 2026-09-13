@@ -129,6 +129,31 @@ impl EmbeddingLayer {
         }
     }
 
+    /// The device this table's weight is resident on.
+    #[must_use]
+    pub fn device(&self) -> Device {
+        match self {
+            Self::Dense(e) => e.embeddings().device().clone(),
+            Self::Quantized { weight, .. } => weight.device(),
+        }
+    }
+
+    /// Vocabulary size, i.e. the table's row count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying weight tensor is 0-dimensional. All
+    /// construction paths ([`Self::from_qtensor`], [`Self::dense`],
+    /// [`Self::dense_from_tensor`]) produce a 2-D `(vocab, hidden)` table, so
+    /// this cannot happen in practice.
+    #[must_use]
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            Self::Dense(e) => e.embeddings().dims()[0],
+            Self::Quantized { weight, .. } => weight.shape().dims()[0],
+        }
+    }
+
     /// Resident size of the table in bytes.
     pub fn size_in_bytes(&self) -> usize {
         match self {

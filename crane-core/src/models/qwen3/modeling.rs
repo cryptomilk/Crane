@@ -44,6 +44,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
+use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::rotary::RotaryEmbedding;
@@ -723,7 +724,7 @@ impl DecoderLayer {
 // ── Full Model ──────────────────────────────────────────────────────────
 
 pub struct Qwen3Model {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: EmbeddingLayer,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: LinearLayer,
@@ -768,11 +769,11 @@ impl Qwen3Model {
     #[allow(clippy::needless_pass_by_value)]
     fn new_inner(config: &Config, model_vb: VarBuilder, root_vb: VarBuilder) -> Result<Self> {
         let dtype = model_vb.dtype();
-        let embed_tokens = candle_nn::embedding(
+        let embed_tokens = EmbeddingLayer::Dense(candle_nn::embedding(
             config.vocab_size,
             config.hidden_size,
             model_vb.pp("embed_tokens"),
-        )?;
+        )?);
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let layers_vb = model_vb.pp("layers");
@@ -784,7 +785,7 @@ impl Qwen3Model {
             candle_nn::rms_norm(config.hidden_size, config.rms_norm_eps, model_vb.pp("norm"))?;
 
         let lm_head = if config.tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            embed_tokens.tied_output()?
         } else {
             LinearLayer::Standard(linear_no_bias(
                 config.hidden_size,
@@ -895,8 +896,8 @@ impl Qwen3Model {
             eos_token_id: None,
         };
 
-        let embed_tokens = gg.embedding("token_embd.weight", hidden_size)?;
-        let actual_vocab_size = embed_tokens.embeddings().dim(0)?;
+        let embed_tokens = gg.quantized_embedding("token_embd.weight", hidden_size)?;
+        let actual_vocab_size = embed_tokens.vocab_size();
         let config = Config {
             vocab_size: actual_vocab_size,
             ..config
@@ -910,7 +911,7 @@ impl Qwen3Model {
         let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
 
         let lm_head = if tie_word_embeddings {
-            LinearLayer::Standard(Linear::new(embed_tokens.embeddings().clone(), None))
+            embed_tokens.tied_output()?
         } else {
             gg.linear("output.weight")?
         };
@@ -1048,7 +1049,7 @@ impl Qwen3Model {
     /// text tokens themselves before splicing in other embeddings (e.g.
     /// Qwen3-ASR's audio/text embedding merge).
     #[must_use]
-    pub fn embed_tokens(&self) -> &candle_nn::Embedding {
+    pub fn embed_tokens(&self) -> &EmbeddingLayer {
         &self.embed_tokens
     }
 
@@ -1145,7 +1146,8 @@ impl Qwen3Model {
     ) -> Result<(Vec<usize>, usize)> {
         let kv_heads = self.config.num_key_value_heads;
         let head_dim = self.config.head_dim();
-        let device = self.embed_tokens.embeddings().device();
+        let device = self.embed_tokens.device();
+        let dtype = self.dtype;
 
         let kv_lens: Vec<usize> = seq_kv_caches
             .iter()
@@ -1167,8 +1169,8 @@ impl Qwen3Model {
                 max_kv_len,
                 kv_heads,
                 head_dim,
-                device,
-                self.dtype,
+                &device,
+                dtype,
             )?;
 
             if let Some((k, v)) = batched_kv {
