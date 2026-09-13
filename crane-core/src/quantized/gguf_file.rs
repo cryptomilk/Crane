@@ -137,6 +137,20 @@ impl<R: Read + Seek> Gguf<R> {
         self.ct.tensor(&mut self.reader, name, &self.device)
     }
 
+    /// Load a raw `QTensor` by name onto `device`.
+    ///
+    /// Identical to [`Self::tensor`] but places the weight on a
+    /// caller-chosen device instead of `self.device` — used for `MoE`
+    /// packed expert tensors, which must load directly onto
+    /// `expert_device` rather than the main model device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named tensor is missing.
+    pub fn tensor_on(&mut self, name: &str, device: &Device) -> Result<QTensor> {
+        self.ct.tensor(&mut self.reader, name, device)
+    }
+
     /// Load a tensor, dequantize, and cast to the target compute dtype.
     /// For small full-precision tensors (norm weights, biases, conv kernels).
     ///

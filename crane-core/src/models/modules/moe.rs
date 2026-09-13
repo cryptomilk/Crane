@@ -4,10 +4,12 @@ use crate::device::{format_budget, query_gpu_memory};
 use crate::models::hunyuan_dense::modeling::Gguf;
 use crate::ops::linear::LinearLayer;
 use crate::ops::prof::{self, Span};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias};
 use ribo::utils::log;
 use std::io::{Read, Seek};
+use std::sync::Arc;
 
 /// Configuration for Mixture-of-Experts feed-forward layers.
 #[derive(Debug, Clone)]
@@ -93,10 +95,10 @@ impl MoeExpert {
     /// Build an expert directly from already-loaded projections.
     ///
     /// Used by [`SparseMoeBlock::new_from_gguf`] for the packed GGUF expert
-    /// layout, where the three projections come from dequantizing and
-    /// narrowing a shared 3D tensor rather than loading per-expert tensors,
-    /// and by `batched_promote` for the same narrow-from-a-stacked-tensor
-    /// pattern when promoting experts to another device.
+    /// layout, where the three projections come from byte-slicing a shared
+    /// 3D tensor rather than loading per-expert tensors, and by
+    /// `batched_promote` for the same narrow-from-a-stacked-tensor pattern
+    /// when promoting experts to another device.
     fn from_layers(gate_proj: LinearLayer, up_proj: LinearLayer, down_proj: LinearLayer) -> Self {
         Self {
             gate_proj,
@@ -240,38 +242,82 @@ impl SparseMoeBlock {
 
     /// Load the packed (Unsloth-style) `_exps` expert tensor layout: each
     /// projection is a single 3D tensor `[num_experts, out, in]` covering all
-    /// experts, dequantized onto `expert_device` and narrowed per expert.
+    /// experts, loaded onto `expert_device` and byte-sliced per expert
+    /// without dequantizing.
     ///
-    /// Unlike the per-expert layout (kept quantized as `LinearLayer::Quantized`
-    /// via [`MoeExpert::new_from_gguf`]), packed experts are dequantized to
-    /// full precision up front, since candle's `QTensor` has no support for
-    /// slicing a packed 3D quantized tensor per-expert without dequantizing
-    /// it. This means CPU-offloading a packed-layout checkpoint's experts
-    /// (`expert_device` != the router's device) costs full-precision memory
-    /// per expert rather than the on-disk quantized size. A checkpoint that
-    /// fits in CPU RAM quantized may not once dequantized this way.
+    /// Expert boundaries align with quantization block boundaries for every
+    /// standard GGML block size (a Qwen3-Coder-30B-A3B expert is
+    /// 768x2048 = 1,572,864 elements, divisible by block sizes 1/32/256), so
+    /// [`slice_packed_qtensor`] can carve each expert's raw bytes out of the
+    /// packed tensor and hand them to `qtensor_from_ggml` directly. This
+    /// keeps packed experts quantized on load, matching the per-expert
+    /// layout (already quantized via [`MoeExpert::new_from_gguf`]).
+    ///
+    /// Each packed tensor's bytes are fetched via `QTensor::data()` once,
+    /// up front, rather than once per expert inside the loop: on CUDA,
+    /// `data()` does a full device-to-host memcpy of the whole buffer, so a
+    /// per-expert call would cost `num_experts` redundant full-tensor
+    /// copies instead of one.
     fn load_packed_experts<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
         num_experts: usize,
         expert_device: &Device,
     ) -> Result<Vec<MoeExpert>> {
-        let gate_all =
-            gg.dequant_tensor_on(&format!("{prefix}.ffn_gate_exps.weight"), expert_device)?;
-        let up_all =
-            gg.dequant_tensor_on(&format!("{prefix}.ffn_up_exps.weight"), expert_device)?;
-        let down_all =
-            gg.dequant_tensor_on(&format!("{prefix}.ffn_down_exps.weight"), expert_device)?;
+        let gate_packed = gg.tensor_on(&format!("{prefix}.ffn_gate_exps.weight"), expert_device)?;
+        let up_packed = gg.tensor_on(&format!("{prefix}.ffn_up_exps.weight"), expert_device)?;
+        let down_packed = gg.tensor_on(&format!("{prefix}.ffn_down_exps.weight"), expert_device)?;
+
+        // Shape is [num_experts, out_dim, in_dim]; gate/up share one shape,
+        // down has its own (in_dim/out_dim swapped relative to gate/up).
+        let gate_dims = gate_packed.shape().dims();
+        if gate_dims[0] != num_experts {
+            candle_core::bail!(
+                "{prefix}: config num_experts={num_experts} does not match packed tensor's expert dim {}",
+                gate_dims[0]
+            );
+        }
+        let (gate_up_out, gate_up_in) = (gate_dims[1], gate_dims[2]);
+        let down_dims = down_packed.shape().dims();
+        let (down_out, down_in) = (down_dims[1], down_dims[2]);
+
+        let gate_dtype = gate_packed.dtype();
+        let up_dtype = up_packed.dtype();
+        let down_dtype = down_packed.dtype();
+        let gate_raw = gate_packed.data()?;
+        let up_raw = up_packed.data()?;
+        let down_raw = down_packed.data()?;
 
         (0..num_experts)
             .map(|i| {
-                let gate = slice_packed_expert(&gate_all, i)?;
-                let up = slice_packed_expert(&up_all, i)?;
-                let down = slice_packed_expert(&down_all, i)?;
+                let gate_qt = slice_packed_qtensor(
+                    &gate_raw,
+                    gate_dtype,
+                    i,
+                    gate_up_out,
+                    gate_up_in,
+                    expert_device,
+                )?;
+                let up_qt = slice_packed_qtensor(
+                    &up_raw,
+                    up_dtype,
+                    i,
+                    gate_up_out,
+                    gate_up_in,
+                    expert_device,
+                )?;
+                let down_qt = slice_packed_qtensor(
+                    &down_raw,
+                    down_dtype,
+                    i,
+                    down_out,
+                    down_in,
+                    expert_device,
+                )?;
                 Ok(MoeExpert::from_layers(
-                    LinearLayer::Standard(Linear::new(gate, None)),
-                    LinearLayer::Standard(Linear::new(up, None)),
-                    LinearLayer::Standard(Linear::new(down, None)),
+                    LinearLayer::quantized(QMatMul::from_arc(Arc::new(gate_qt))?),
+                    LinearLayer::quantized(QMatMul::from_arc(Arc::new(up_qt))?),
+                    LinearLayer::quantized(QMatMul::from_arc(Arc::new(down_qt))?),
                 ))
             })
             .collect()
@@ -352,22 +398,63 @@ impl SparseMoeBlock {
     }
 }
 
-/// Narrow one expert's 2D weight out of a packed `[num_experts, out, in]` tensor.
+/// Byte-slice one expert's 2D weight out of a packed `[num_experts, out, in]`
+/// tensor's raw bytes, without dequantizing.
 ///
-/// Uses `force_contiguous` rather than `contiguous`: a `narrow(0, ..)` slice
-/// of an outer row-major tensor is already contiguous in the stride sense,
-/// so plain `contiguous()` short-circuits to `self.clone()` and keeps
-/// sharing the *entire* packed tensor's storage, just with a narrower
-/// `Layout` window on top. `Tensor::to_device` transfers the raw storage,
-/// not the logical view, so every later per-expert device transfer (e.g.
-/// `Qwen3Model::from_gguf`'s promotion pass) would re-upload the whole
-/// packed tensor instead of one expert's slice — 128x the intended
-/// transfer size and VRAM footprint per expert.
-fn slice_packed_expert(packed: &Tensor, expert_idx: usize) -> Result<Tensor> {
-    packed
-        .narrow(0, expert_idx, 1)?
-        .squeeze(0)?
-        .force_contiguous()
+/// Expert boundaries are quantization-block-aligned (verified at the call
+/// site's doc comment), so `expert_idx`'s raw bytes can be carved directly
+/// out of `raw` and handed to `qtensor_from_ggml` to build an independent,
+/// still-quantized `QTensor` for that expert alone. Takes `raw` (rather than
+/// the source `QTensor`) so callers can fetch the packed tensor's bytes once
+/// and reuse them across all experts — see `load_packed_experts`'s doc
+/// comment on why fetching it per-expert would be expensive on CUDA.
+///
+/// # Errors
+///
+/// Returns an error if `expert_rows * expert_cols` isn't a whole number of
+/// quantization blocks, or if the computed byte range falls outside `raw`.
+fn slice_packed_qtensor(
+    raw: &[u8],
+    ggml_dtype: GgmlDType,
+    expert_idx: usize,
+    expert_rows: usize,
+    expert_cols: usize,
+    device: &Device,
+) -> Result<QTensor> {
+    let expert_elems = expert_rows * expert_cols;
+    let block_size = ggml_dtype.block_size();
+    if !expert_elems.is_multiple_of(block_size) {
+        candle_core::bail!(
+            "expert element count {expert_elems} not divisible by block size {block_size}"
+        );
+    }
+    let bytes_per_expert = expert_elems / block_size * ggml_dtype.type_size();
+    let start = expert_idx * bytes_per_expert;
+    let end = start + bytes_per_expert;
+    if end > raw.len() {
+        candle_core::bail!(
+            "expert {expert_idx} byte range {start}..{end} exceeds packed tensor ({} bytes)",
+            raw.len(),
+        );
+    }
+    qtensor_from_ggml(
+        ggml_dtype,
+        &raw[start..end],
+        vec![expert_rows, expert_cols],
+        device,
+    )
+}
+
+/// Narrows one expert's view out of an already-promoted, single-owner
+/// `[num_experts, out, in]` tensor, without forcing a copy.
+///
+/// The source here (`batched_promote`'s freshly-transferred
+/// `gate_all`/`up_all`/`down_all`) is never handed to another `to_device`
+/// call, so sharing storage across all `num_experts` views back into one
+/// buffer is safe and avoids re-introducing the exact per-allocation
+/// overhead `batched_promote` exists to eliminate.
+fn narrow_packed_expert(packed: &Tensor, expert_idx: usize) -> Result<Tensor> {
+    packed.narrow(0, expert_idx, 1)?.squeeze(0)
 }
 
 /// Stacks `experts`' projection selected by `proj` into one
@@ -442,9 +529,9 @@ fn batched_promote(
     (0..experts.len())
         .map(|i| {
             Ok(MoeExpert::from_layers(
-                LinearLayer::Standard(Linear::new(slice_packed_expert(&gate_all, i)?, None)),
-                LinearLayer::Standard(Linear::new(slice_packed_expert(&up_all, i)?, None)),
-                LinearLayer::Standard(Linear::new(slice_packed_expert(&down_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&gate_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&up_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&down_all, i)?, None)),
             ))
         })
         .collect::<Result<Vec<_>>>()
@@ -764,19 +851,31 @@ mod tests {
         }
     }
 
+    // GgmlDType::F32 quantization is lossless (block_size=1, no bit-packing),
+    // so this exercises the real quantize -> byte-slice -> qtensor_from_ggml
+    // path with exact value comparisons instead of tolerating quantization
+    // error from a lossy dtype.
     #[test]
-    fn test_slice_packed_expert() {
+    fn test_slice_packed_qtensor() {
+        use candle_core::quantized::GgmlDType;
+
         // [num_experts=3, out=2, in=4]; expert i's slice is filled with (i+1).
         let device = &Device::Cpu;
         let data: Vec<f32> = (0..3 * 2 * 4)
             .map(|idx| ((idx / (2 * 4)) + 1) as f32)
             .collect();
-        let packed = Tensor::from_vec(data, (3, 2, 4), device).expect("packed tensor");
+        let packed_tensor = Tensor::from_vec(data, (3, 2, 4), device).expect("packed tensor");
+        let packed = QTensor::quantize(&packed_tensor, GgmlDType::F32).expect("quantize");
+        let raw = packed.data().expect("raw bytes");
 
         for expert_idx in 0..3 {
-            let sliced = slice_packed_expert(&packed, expert_idx).expect("slice");
-            assert_eq!(sliced.dims(), &[2, 4]);
+            let sliced = slice_packed_qtensor(&raw, GgmlDType::F32, expert_idx, 2, 4, device)
+                .expect("slice");
+            assert_eq!(sliced.shape().dims(), &[2, 4]);
+            assert_eq!(sliced.dtype(), GgmlDType::F32);
             let vals = sliced
+                .dequantize(device)
+                .expect("dequantize")
                 .flatten_all()
                 .expect("flatten")
                 .to_vec1::<f32>()
@@ -785,6 +884,110 @@ mod tests {
             assert!(
                 vals.iter().all(|&v| (v - expected_val).abs() < 1e-6),
                 "expert {expert_idx}: got {vals:?}, expected all {expected_val}"
+            );
+        }
+    }
+
+    // GgmlDType::Q8_0 has block_size=32, unlike the F32 test above
+    // (block_size=1) where the `expert_elems / block_size * type_size`
+    // division is a no-op -- this exercises that division with a real
+    // divisor, so a swapped block_size/type_size bug would be caught.
+    #[test]
+    fn test_slice_packed_qtensor_q8_0() {
+        use candle_core::quantized::GgmlDType;
+
+        // [num_experts=3, out=32, in=64]; expert i's slice is filled with (i+1).
+        // out*in = 2048, a multiple of Q8_0's block_size=32.
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3, 32, 64);
+        let data: Vec<f32> = (0..num_experts * out_dim * in_dim)
+            .map(|idx| ((idx / (out_dim * in_dim)) + 1) as f32)
+            .collect();
+        let packed_tensor =
+            Tensor::from_vec(data, (num_experts, out_dim, in_dim), device).expect("packed tensor");
+        let packed = QTensor::quantize(&packed_tensor, GgmlDType::Q8_0).expect("quantize");
+        let raw = packed.data().expect("raw bytes");
+
+        for expert_idx in 0..num_experts {
+            let sliced =
+                slice_packed_qtensor(&raw, GgmlDType::Q8_0, expert_idx, out_dim, in_dim, device)
+                    .expect("slice");
+            assert_eq!(sliced.shape().dims(), &[out_dim, in_dim]);
+            assert_eq!(sliced.dtype(), GgmlDType::Q8_0);
+            let vals = sliced
+                .dequantize(device)
+                .expect("dequantize")
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("to_vec1");
+            let expected_val = (expert_idx + 1) as f32;
+            assert!(
+                vals.iter().all(|&v| (v - expected_val).abs() < 0.1),
+                "expert {expert_idx}: got {vals:?}, expected all ~{expected_val}"
+            );
+        }
+    }
+
+    // `load_packed_experts` must produce `Quantized` layers, not `Standard`
+    // -- the whole point of Phase 3 is to keep packed experts quantized
+    // instead of eagerly dequantizing them at load time.
+    #[test]
+    fn load_packed_experts_produces_quantized_layers() {
+        use candle_core::quantized::GgmlDType;
+        use std::io::Cursor;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let (num_experts, out_dim, in_dim) = (2usize, 4usize, 8usize);
+
+        let mut writer = Cursor::new(Vec::new());
+        let gate = QTensor::quantize(
+            &Tensor::ones((num_experts, out_dim, in_dim), dtype, &device).expect("gate data"),
+            GgmlDType::F32,
+        )
+        .expect("quantize gate");
+        let up = QTensor::quantize(
+            &Tensor::ones((num_experts, out_dim, in_dim), dtype, &device).expect("up data"),
+            GgmlDType::F32,
+        )
+        .expect("quantize up");
+        let down = QTensor::quantize(
+            &Tensor::ones((num_experts, in_dim, out_dim), dtype, &device).expect("down data"),
+            GgmlDType::F32,
+        )
+        .expect("quantize down");
+        candle_core::quantized::gguf_file::write(
+            &mut writer,
+            &[],
+            &[
+                ("blk.0.ffn_gate_exps.weight", &gate),
+                ("blk.0.ffn_up_exps.weight", &up),
+                ("blk.0.ffn_down_exps.weight", &down),
+            ],
+        )
+        .expect("write gguf");
+
+        writer.set_position(0);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
+        let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
+
+        let experts = SparseMoeBlock::load_packed_experts(&mut gg, "blk.0", num_experts, &device)
+            .expect("load_packed_experts");
+
+        assert_eq!(experts.len(), num_experts);
+        for expert in &experts {
+            assert!(
+                matches!(expert.gate_proj, LinearLayer::Quantized(_)),
+                "gate_proj must stay Quantized"
+            );
+            assert!(
+                matches!(expert.up_proj, LinearLayer::Quantized(_)),
+                "up_proj must stay Quantized"
+            );
+            assert!(
+                matches!(expert.down_proj, LinearLayer::Quantized(_)),
+                "down_proj must stay Quantized"
             );
         }
     }
