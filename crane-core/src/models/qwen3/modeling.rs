@@ -51,6 +51,7 @@ use crate::device::{
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
+use crate::models::modules::quant_kv_cache;
 use crate::models::modules::quant_kv_cache::{FpKvCache, KvCache, KvCacheKind, KvCacheState};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::ops::fused_ops::quant_attn;
@@ -160,6 +161,28 @@ impl Config {
             * self.num_key_value_heads as u64
             * self.head_dim() as u64
             * dtype_bytes as u64
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token when K/V
+    /// are stored as `bits`-wide (4 or 8) quantized codes plus a per-token
+    /// f32 scale per head, instead of the compute dtype (see
+    /// [`crate::models::modules::quant_kv_cache::QuantKvCache`]). Only an
+    /// accurate estimate when the fused dequantize-in-attention kernel
+    /// (`crate::ops::fused_ops::quant_attn`) covers the sequence's entire
+    /// lifetime — see [`Self::kv_bytes_per_token`]'s doc for why plain
+    /// compute-dtype pricing is required otherwise.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits` is neither 4 nor 8.
+    #[must_use]
+    pub fn quantized_kv_bytes_per_token(&self, bits: u32) -> u64 {
+        quant_kv_cache::quantized_kv_bytes_per_token(
+            bits,
+            self.num_hidden_layers,
+            self.num_key_value_heads,
+            self.head_dim(),
+        )
     }
 
     /// Builds the `MoE` configuration for this model, or `None` if this is a
@@ -414,29 +437,46 @@ impl Attention {
         #[allow(clippy::cast_possible_truncation)]
         let scale_f32 = scale as f32;
 
-        if n_rep > 1 && seq_len == 1 {
-            // ── Fused dequantize-in-attention for decode, GPU + quantized
-            // cache only (Phase 5.6b) ──
-            // Reads int8/int4 codes + scales directly and dequantizes inside
-            // the QK/SV matmuls instead of reading a fully-dequantized K/V
-            // back from `QuantKvCache`'s scratch buffer, so this step never
-            // materializes a full-context-length compute-dtype K/V tensor.
-            // `try_quantized_append` returns `None` (falling through below)
-            // for an `Fp` cache, a CPU device, or `CRANE_QUANT_ATTN_FUSED=0`.
-            if let Some(kv_ref) = self.kv_cache.try_quantized_append(&k, &v)? {
-                let q_g = (q.reshape((b_sz, self.num_kv_heads, n_rep, self.head_dim))? * scale)?;
-                let scores = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
-                let scores = match attention_mask {
-                    Some(mask) => scores.broadcast_add(mask)?,
-                    None => scores,
-                };
-                let scores = candle_nn::ops::softmax_last_dim(&scores)?;
-                let attn_output = quant_attn::quant_sv_dot(&scores, &kv_ref)?;
-                let attn_output = attn_output
-                    .reshape((b_sz, self.num_heads, self.head_dim))?
-                    .reshape((b_sz, 1, self.num_heads * self.head_dim))?;
-                return self.o_proj.forward(&attn_output);
-            }
+        // ── Fused dequantize-in-attention, GPU + quantized cache only
+        // (Phase 5) ── Reads int8/int4 codes + scales directly and
+        // dequantizes inside the QK/SV matmuls instead of reading a
+        // fully-dequantized K/V back from `QuantKvCache`'s scratch buffer,
+        // so this step never materializes a full-context-length
+        // compute-dtype K/V tensor -- covers both decode (seq_len == 1) and
+        // prefill (seq_len > 1). `try_quantized_append` returns `None`
+        // (falling through below) for an `Fp` cache, a CPU/Metal device, or
+        // `CRANE_QUANT_ATTN_FUSED=0`.
+        if let Some(kv_ref) = self.kv_cache.try_quantized_append(&k, &v)? {
+            // q is [B, num_heads, seq_len, D]; fold (n_rep, seq_len) into a
+            // single R axis per kv head (rep-major, position-minor), the
+            // same merge `quant_qk_dot`'s kernel already expects for decode
+            // (there seq_len == 1 so R == n_rep).
+            let q_g =
+                (q.reshape((b_sz, self.num_kv_heads, n_rep * seq_len, self.head_dim))? * scale)?;
+            let scores = quant_attn::quant_qk_dot(&q_g, &kv_ref)?;
+            let total_kv = scores.dim(D::Minus1)?;
+            // The mask varies per query position, not per rep, so unfold R
+            // back into (n_rep, seq_len) merged with kv_heads into
+            // num_heads before adding it — the exact inverse of the q_g
+            // fold above.
+            let scores = scores.reshape((b_sz, self.num_heads, seq_len, total_kv))?;
+            let scores = match attention_mask {
+                Some(mask) => scores.broadcast_add(mask)?,
+                None => scores,
+            };
+            let scores = candle_nn::ops::softmax_last_dim(&scores)?.reshape((
+                b_sz,
+                self.num_kv_heads,
+                n_rep * seq_len,
+                total_kv,
+            ))?;
+            let attn_output = quant_attn::quant_sv_dot(&scores, &kv_ref)?;
+            let attn_output = attn_output
+                .reshape((b_sz, self.num_heads, seq_len, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((b_sz, seq_len, ()))?;
+            return self.o_proj.forward(&attn_output);
         }
 
         // Update KV cache (pre-allocated with slice_set)
@@ -1335,16 +1375,27 @@ impl Qwen3Model {
             && !gpu_budget.offload_all_experts
             && let WeightBudget::Limited(total_vram) = gpu_budget.weight_budget
         {
-            // Always prices at the compute dtype's size regardless of
-            // kv_kind — see `Model::kv_bytes_per_token`'s doc comment for
-            // why an Int8/Int4 storage size would under-claim VRAM here.
-            let effective_kv_dtype_bytes = dtype.size_in_bytes();
-            let runtime_reservation = gpu_budget.runtime_reservation_bytes(
+            // Quantized pricing is only valid when the fused
+            // dequantize-in-attention kernel covers the whole sequence
+            // lifetime: CUDA/ROCm, `max_concurrent == 1` so batch-decode's
+            // to_fp_pair()/from_fp_pair() round-trip (which always peaks at
+            // the compute dtype) never applies, and `CRANE_QUANT_ATTN_FUSED`
+            // isn't `0` (which forces every append onto the unfused path).
+            // Otherwise price at the compute dtype's size — see
+            // `Model::kv_bytes_per_token`'s doc comment for the same
+            // reasoning.
+            let fused_covers_full_lifetime = (device.is_cuda() || device.is_rocm())
+                && gpu_budget.max_concurrent == Some(1)
+                && !quant_attn::fused_disabled();
+            let kv_bytes_per_token = kv_kind.effective_kv_bytes_per_token(
+                fused_covers_full_lifetime,
                 num_hidden_layers,
                 num_kv_heads,
                 head_dim,
-                effective_kv_dtype_bytes,
+                dtype.size_in_bytes(),
             );
+            let runtime_reservation =
+                gpu_budget.runtime_reservation_bytes_for_kv_bytes_per_token(kv_bytes_per_token);
             model.promote_experts_after_probe(
                 devices,
                 total_vram,
@@ -2103,6 +2154,61 @@ mod tests {
     #[test]
     fn test_kv_bytes_per_token_tiny_config() {
         assert_eq!(tiny_config().kv_bytes_per_token(4), 64);
+    }
+
+    // int8: 1 byte/code + 4 byte f32 scale per head -> 2*48*4*(128+4) =
+    // 50,688 bytes/token for the Qwen3-Coder-30B-A3B geometry, about half
+    // the 96 KiB (98,304 bytes) f16 pricing above.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_int8_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(
+            config.quantized_kv_bytes_per_token(8),
+            2 * 48 * 4 * (128 + 4)
+        );
+    }
+
+    // int4: nibble-packed codes (head_dim/2 bytes) + 4 byte f32 scale per
+    // head -> 2*48*4*(64+4) bytes/token, about half int8's cost.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_int4_matches_qwen3_coder_30b_a3b() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        assert_eq!(
+            config.quantized_kv_bytes_per_token(4),
+            2 * 48 * 4 * (64 + 4)
+        );
+    }
+
+    // Both quantized bit widths must cost strictly less than compute-dtype
+    // (f16) pricing for the same geometry -- otherwise there's no point
+    // ever using quantized pricing.
+    #[test]
+    fn test_quantized_kv_bytes_per_token_smaller_than_fp16() {
+        let config = Config {
+            num_hidden_layers: 48,
+            num_key_value_heads: 4,
+            head_dim: Some(128),
+            ..tiny_config()
+        };
+        let fp16_bytes = config.kv_bytes_per_token(2);
+        assert!(config.quantized_kv_bytes_per_token(8) < fp16_bytes);
+        assert!(config.quantized_kv_bytes_per_token(4) < fp16_bytes);
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 4 or 8")]
+    fn test_quantized_kv_bytes_per_token_rejects_invalid_bits() {
+        let _ = tiny_config().quantized_kv_bytes_per_token(16);
     }
 
     // Dense checkpoints carry no MoE fields, so `moe_config()` must return `None`.
