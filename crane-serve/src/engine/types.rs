@@ -21,6 +21,10 @@ pub struct EngineRequest {
     pub eos_token_id: Vec<u32>,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
+    /// Tool function names offered in the request, used to build a
+    /// grammar constraint on the tool-call XML skeleton. Empty when no
+    /// tools were offered.
+    pub tool_names: Vec<String>,
     pub response_tx: mpsc::UnboundedSender<EngineResponse>,
 }
 
@@ -50,6 +54,10 @@ pub struct GenerationParams {
     pub eos_token_id: Vec<u32>,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
+    /// Tool function names offered in the request, used to build a
+    /// grammar constraint on the tool-call XML skeleton. Empty when no
+    /// tools were offered.
+    pub tool_names: Vec<String>,
 }
 
 /// A response chunk from the engine to an API handler.
@@ -113,6 +121,7 @@ impl EngineHandle {
                 presence_penalty: params.presence_penalty,
                 eos_token_id: params.eos_token_id,
                 stop: params.stop,
+                tool_names: params.tool_names,
                 response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Engine thread has shut down"))?;
@@ -159,6 +168,7 @@ mod tests {
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
                 stop: vec![],
+                tool_names: vec![],
             },
         );
         assert!(rx.is_ok());
@@ -185,6 +195,7 @@ mod tests {
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
                 stop: vec![],
+                tool_names: vec![],
             },
         );
         assert!(result.is_err());
@@ -210,6 +221,7 @@ mod tests {
                 presence_penalty: 0.0,
                 eos_token_id: vec![0],
                 stop: vec![],
+                tool_names: vec![],
             },
         );
         assert!(result.is_err());
@@ -298,6 +310,7 @@ mod tests {
                     presence_penalty: 0.2,
                     eos_token_id: vec![2],
                     stop: vec![],
+                    tool_names: vec![],
                 },
             )
             .unwrap();
