@@ -1,33 +1,38 @@
 // SPDX-License-Identifier: MIT
-//! Fused dequantize-in-attention kernels (Phase 5.6b of the KV-quant work).
+//! Fused dequantize-in-attention kernels (Phase 5 of the KV-quant work).
 //!
 //! `QuantKvCache` (`crate::models::modules::quant_kv_cache`) stores K/V as
-//! int8/int4 codes plus per-token f32 scales. Reading them back today means
-//! dequantizing into a persistent scratch buffer the size of the full
-//! dequantized history — so quantization shrinks storage but not the
-//! attention-time working set. These two kernels close that gap for GPU
-//! decode by reading codes/scales directly, dequantizing per-element inside
-//! the matmul:
+//! int8/int4 codes plus per-token f32 scales. Reading them back the
+//! unfused way means dequantizing into a persistent scratch buffer the
+//! size of the full dequantized history — so quantization shrinks storage
+//! but not the attention-time working set. These two kernels close that
+//! gap for both GPU decode and prefill by reading codes/scales directly,
+//! dequantizing per-element inside the matmul:
 //!
 //! - [`quant_qk_dot`]: `Q_scaled @ dequant(K)^T -> scores`
 //! - [`quant_sv_dot`]: `softmax(scores) @ dequant(V) -> output`
 //!
+//! Both kernels take a query-side dimension `R`: `n_rep` for decode
+//! (`seq_len == 1`), or `n_rep * seq_len` for prefill (`seq_len > 1`) —
+//! see `crate::models::qwen3::modeling::Attention::forward`'s fused branch
+//! for how the caller folds/unfolds `R` around the mask add.
+//!
 //! Callers do the mask broadcast-add and softmax between the two (plain
 //! candle ops — nothing to fuse there). See
-//! `crate::models::qwen3::modeling::Attention::forward`'s GQA-grouped decode
-//! branch for the call site.
+//! `crate::models::qwen3::modeling::Attention::forward`'s fused branch for
+//! the call site.
 //!
 //! Three backends, selected at compile time like the rest of `fused_ops`:
 //! CUDA (PTX built by `build.rs` from `kernels/cuda/quant_attn.cu`), `ROCm`
 //! (the same `.cu` source, compiled by `hipcc` on first use), and a portable
 //! CPU fallback that dequantizes the whole cache and does a plain matmul —
 //! this is O(total cached) per call, so it exists only so tests can run
-//! without a GPU; production decode never reaches it on any device
+//! without a GPU; production attention never reaches it on any device
 //! (`KvCache::try_quantized_append` returns `None` unless the device has a
-//! CUDA or `ROCm` kernel — Metal included — so decode on anything else keeps
-//! using the existing incremental scratch-buffer path instead).
+//! CUDA or `ROCm` kernel — Metal included — so attention on anything else
+//! keeps using the existing incremental scratch-buffer path instead).
 //!
-//! Set `CRANE_QUANT_ATTN_FUSED=0` to force the pre-5.6b path (full
+//! Set `CRANE_QUANT_ATTN_FUSED=0` to force the unfused path (full
 //! dequantize into a scratch buffer, then a plain matmul) for debugging or
 //! A/B correctness checks.
 
@@ -56,8 +61,11 @@ pub fn supports_compute_dtype(dtype: DType) -> bool {
 
 /// `Q_scaled @ dequant(K)^T -> scores`.
 ///
-/// `q` is `[B, num_kv_heads, n_rep, head_dim]`, pre-scaled by `1/sqrt(head_dim)`.
-/// Returns `scores`, `[B, num_kv_heads, n_rep, seq_len]`, in `q`'s dtype.
+/// `q` is `[B, num_kv_heads, R, head_dim]`, pre-scaled by `1/sqrt(head_dim)`.
+/// `R` is `n_rep` for decode (`seq_len == 1`) or `n_rep * seq_len` for
+/// prefill (`seq_len > 1`) — the caller folds the query's own `seq_len` into
+/// `R` alongside `n_rep` before calling this. Returns `scores`,
+/// `[B, num_kv_heads, R, cached_len]`, in `q`'s dtype.
 ///
 /// `kv.k_codes`/`kv.k_scale` are read as-is, without forcing contiguity: they
 /// are a `narrow` view into a buffer with append headroom past `seq_len` (see
@@ -83,8 +91,9 @@ pub fn quant_qk_dot(q: &Tensor, kv: &QuantizedKvRef) -> Result<Tensor> {
 
 /// `softmax(scores) @ dequant(V) -> output`.
 ///
-/// `weights` is `[B, num_kv_heads, n_rep, seq_len]`, post-softmax. Returns
-/// `output`, `[B, num_kv_heads, n_rep, head_dim]`, in `weights`'s dtype.
+/// `weights` is `[B, num_kv_heads, R, cached_len]`, post-softmax (see
+/// [`quant_qk_dot`]'s doc for what `R` is). Returns `output`,
+/// `[B, num_kv_heads, R, head_dim]`, in `weights`'s dtype.
 ///
 /// `kv.v_codes`/`kv.v_scale` are read as-is; see [`quant_qk_dot`]'s doc for why.
 ///
@@ -745,6 +754,117 @@ mod tests {
     #[test]
     fn cpu_full_attention_matches_reference_int4() {
         full_attention_matches_reference(4);
+    }
+
+    // Mirrors `qwen3::modeling::Attention::forward`'s fused branch for
+    // prefill (seq_len > 1): fold (n_rep, seq_len) into R before
+    // `quant_qk_dot`, unfold to num_heads layout for a per-query-position
+    // causal mask, then unfold back around `quant_sv_dot`. Must match a
+    // reference standard SDPA (full dequantize + GQA-expand + the same
+    // causal mask) exactly — this is the part that's new relative to the
+    // decode-only (seq_len == 1, no mask unfold) case above.
+    fn full_attention_matches_reference_prefill(bits: u32) {
+        let b_sz = 1;
+        let kv_heads = 2;
+        let n_rep = 3;
+        let num_heads = kv_heads * n_rep;
+        let head_dim = 8;
+        let seq_len = 4;
+
+        let mut cache = QuantKvCache::new(bits);
+        let k = rand_kv(b_sz, kv_heads, seq_len, head_dim);
+        let v = rand_kv(b_sz, kv_heads, seq_len, head_dim);
+        let kv_ref = cache.quantized_append(&k, &v).unwrap();
+
+        let q = rand_kv(b_sz, num_heads, seq_len, head_dim);
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Causal mask [B, 1, seq_len, seq_len]: 0 on/below diagonal, -inf above.
+        let mask_vals: Vec<f32> = (0..seq_len * seq_len)
+            .map(|idx| {
+                let (i, j) = (idx / seq_len, idx % seq_len);
+                if j > i { f32::NEG_INFINITY } else { 0.0 }
+            })
+            .collect();
+        let mask = Tensor::from_vec(mask_vals, (1, 1, seq_len, seq_len), &Device::Cpu).unwrap();
+
+        // Fused path, exactly mirroring the modeling.rs fold/mask/unfold.
+        let q_g = (q
+            .reshape((b_sz, kv_heads, n_rep * seq_len, head_dim))
+            .unwrap()
+            * scale)
+            .unwrap();
+        let scores = quant_qk_dot(&q_g, &kv_ref).unwrap();
+        let total_kv = scores.dim(D::Minus1).unwrap();
+        let scores = scores
+            .reshape((b_sz, num_heads, seq_len, total_kv))
+            .unwrap();
+        let scores = scores.broadcast_add(&mask).unwrap();
+        let scores = candle_nn::ops::softmax_last_dim(&scores)
+            .unwrap()
+            .reshape((b_sz, kv_heads, n_rep * seq_len, total_kv))
+            .unwrap();
+        let output = quant_sv_dot(&scores, &kv_ref).unwrap();
+        let output = output
+            .reshape((b_sz, num_heads, seq_len, head_dim))
+            .unwrap()
+            .transpose(1, 2)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        // Reference: full dequantize + GQA-expand + standard SDPA, no
+        // R-folding at all.
+        let k_ref = kv_ref
+            .dequantize_k(DType::F32)
+            .unwrap()
+            .unsqueeze(2)
+            .unwrap()
+            .expand((b_sz, kv_heads, n_rep, seq_len, head_dim))
+            .unwrap()
+            .reshape((b_sz, num_heads, seq_len, head_dim))
+            .unwrap();
+        let v_ref = kv_ref
+            .dequantize_v(DType::F32)
+            .unwrap()
+            .unsqueeze(2)
+            .unwrap()
+            .expand((b_sz, kv_heads, n_rep, seq_len, head_dim))
+            .unwrap()
+            .reshape((b_sz, num_heads, seq_len, head_dim))
+            .unwrap();
+        let q_scaled = (&q * scale).unwrap();
+        let ref_scores = q_scaled.matmul(&k_ref.transpose(2, 3).unwrap()).unwrap();
+        let ref_scores = ref_scores.broadcast_add(&mask).unwrap();
+        let ref_scores = candle_nn::ops::softmax_last_dim(&ref_scores).unwrap();
+        let ref_output = ref_scores.matmul(&v_ref).unwrap();
+        let ref_output = ref_output.transpose(1, 2).unwrap().contiguous().unwrap();
+
+        let diff = (&output - &ref_output)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-4,
+            "bits={bits}: fused prefill path diverged: {diff}"
+        );
+        assert_eq!(output.dims(), &[b_sz, seq_len, num_heads, head_dim]);
+    }
+
+    // Verifies the fused int8 path matches reference SDPA for prefill.
+    #[test]
+    fn cpu_full_attention_matches_reference_prefill_int8() {
+        full_attention_matches_reference_prefill(8);
+    }
+
+    // Verifies the fused int4 path matches reference SDPA for prefill.
+    #[test]
+    fn cpu_full_attention_matches_reference_prefill_int4() {
+        full_attention_matches_reference_prefill(4);
     }
 
     // The env var toggle must be readable and reflect its value; the actual

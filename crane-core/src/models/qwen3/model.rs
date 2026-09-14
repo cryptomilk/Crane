@@ -20,6 +20,7 @@ use crate::device::{DeviceAssignment, GpuBudget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::models::modules::quant_kv_cache::{KvCacheKind, KvCacheState};
+use crate::utils::DeviceExt;
 use crate::utils::token_output_stream::TokenOutputStream;
 use crate::utils::tokenizer_utils;
 use crate::utils::utils;
@@ -39,6 +40,10 @@ pub struct Model {
     pub tokenizer: TokenOutputStream,
     pub device: Device,
     pub dtype: DType,
+    /// From `GpuBudget::max_concurrent` at load time; used by
+    /// [`Self::kv_bytes_per_token`] to decide whether quantized KV pricing
+    /// is safe (see its doc comment).
+    max_concurrent: Option<usize>,
     inner: Qwen3Model,
 }
 
@@ -130,17 +135,31 @@ impl Model {
     }
 
     /// Bytes of KV cache one sequence consumes per generated token. See
-    /// [`Config::kv_bytes_per_token`].
+    /// [`Config::kv_bytes_per_token`]/[`Config::quantized_kv_bytes_per_token`].
     ///
-    /// Always prices at the compute dtype's size, regardless of KV cache
-    /// kind: batch decode, KV-swap/preemption, and prefill all fully
-    /// dequantize `Int8`/`Int4` caches to the compute dtype, so a reservation
-    /// based on the smaller quantized storage size would under-claim VRAM
-    /// against that worst case (see git history for why that matters here).
+    /// Prices at the smaller quantized storage size only when the fused
+    /// dequantize-in-attention kernel (`crate::ops::fused_ops::quant_attn`)
+    /// covers the sequence's entire lifetime: CUDA/ROCm, `max_concurrent ==
+    /// 1` so batch decode's `to_fp_pair()`/`from_fp_pair()` round-trip
+    /// (which always dequantizes to the compute dtype) never applies, and
+    /// `CRANE_QUANT_ATTN_FUSED` isn't `0` (which forces every append onto
+    /// the unfused path). Otherwise prices at the compute dtype's size,
+    /// since KV-swap/preemption and any unfused decode/prefill step fully
+    /// dequantize `Int8`/`Int4` caches, and a reservation based on the
+    /// smaller quantized size would under-claim VRAM against that worst
+    /// case (see git history for why that matters here).
     pub fn kv_bytes_per_token(&self) -> u64 {
-        self.inner
-            .config()
-            .kv_bytes_per_token(self.dtype.size_in_bytes())
+        let config = self.inner.config();
+        let fused_covers_full_lifetime = (self.device.is_cuda() || self.device.is_rocm())
+            && self.max_concurrent == Some(1)
+            && !crate::ops::fused_ops::quant_attn::fused_disabled();
+        self.inner.kv_kind().effective_kv_bytes_per_token(
+            fused_covers_full_lifetime,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim(),
+            self.dtype.size_in_bytes(),
+        )
     }
 
     fn from_pretrained(
@@ -170,6 +189,7 @@ impl Model {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: devices.main.clone(),
             dtype,
+            max_concurrent: gpu_budget.max_concurrent,
             inner,
         })
     }
@@ -203,6 +223,7 @@ impl Model {
             tokenizer: TokenOutputStream::new(tokenizer),
             device: devices.main.clone(),
             dtype,
+            max_concurrent: gpu_budget.max_concurrent,
             inner,
         })
     }

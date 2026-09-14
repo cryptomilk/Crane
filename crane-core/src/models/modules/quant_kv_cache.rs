@@ -5,11 +5,15 @@
 //! (see [`crate::ops::gdn::GdnLayerCache`]), so the context-growing part of the
 //! cache lives in just these layers. On plain Qwen 3, every layer will use
 //! this cache. At long context that K/V dominates memory, which is why
-//! quantizing shrinks the *stored* K/V codes. [`QuantKvCache`] currently also
-//! keeps a full-size dequantized scratch buffer alongside those codes (see
-//! its struct doc), so today this does not reduce peak memory. A fused
-//! dequantize-in-attention kernel that drops the scratch buffer is the
-//! planned follow-up to actually shrink peak memory.
+//! quantizing shrinks the *stored* K/V codes. [`QuantKvCache`] also keeps a
+//! full-size dequantized scratch buffer alongside those codes (see its
+//! struct doc) for callers that can't use the fused kernel — CPU/Metal, or
+//! CUDA/ROCm whenever [`KvCache::try_quantized_append`] declines (e.g.
+//! `CRANE_QUANT_ATTN_FUSED=0`) — so peak memory isn't reduced in those
+//! cases. The fused dequantize-in-attention kernel
+//! (`crate::ops::fused_ops::quant_attn`) drops the scratch buffer entirely
+//! for CUDA/ROCm decode and prefill, which is where the actual peak-memory
+//! reduction comes from.
 //!
 //! # Backends behind one contract
 //!
@@ -298,6 +302,38 @@ impl QuantizedKvRef {
     }
 }
 
+/// Bytes of KV cache one sequence consumes per generated token when K/V
+/// are stored as `bits`-wide (4 or 8) quantized codes plus a per-token
+/// f32 scale per head (see [`QuantKvCache`]).
+///
+/// `num_kv_layers` is the number of layers that carry a growing K/V cache
+/// (all layers for Qwen 3, only the full-attention layers for Qwen 3.5's
+/// hybrid architecture).
+///
+/// # Panics
+///
+/// Panics if `bits` is neither 4 nor 8.
+#[must_use]
+pub fn quantized_kv_bytes_per_token(
+    bits: u32,
+    num_kv_layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) -> u64 {
+    const SCALE_BYTES_PER_TOKEN_PER_HEAD: u64 = 4;
+    assert!(
+        bits == 4 || bits == 8,
+        "quantized_kv_bytes_per_token: bits must be 4 or 8"
+    );
+    let head_dim = head_dim as u64;
+    let code_bytes = if bits == 8 {
+        head_dim
+    } else {
+        head_dim.div_ceil(2)
+    };
+    2 * num_kv_layers as u64 * num_kv_heads as u64 * (code_bytes + SCALE_BYTES_PER_TOKEN_PER_HEAD)
+}
+
 /// Which cache representation to use. Selected once per model load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvCacheKind {
@@ -333,27 +369,70 @@ impl KvCacheKind {
         }
     }
 
+    /// Resolve the effective per-token KV byte cost for VRAM pricing.
+    ///
+    /// Returns [`quantized_kv_bytes_per_token`] when this is an `Int8`/`Int4`
+    /// cache and the fused dequantize-in-attention kernel
+    /// (`crate::ops::fused_ops::quant_attn`) covers the sequence's entire
+    /// lifetime. Returns compute-dtype pricing otherwise, since unfused
+    /// decode/prefill or batch-decode's `to_fp_pair()`/`from_fp_pair()`
+    /// round-trip dequantize to the compute dtype.
+    ///
+    /// `num_kv_layers` is the number of layers that carry a growing K/V
+    /// cache (all layers for Qwen 3, only the full-attention layers for
+    /// Qwen 3.5).
+    #[must_use]
+    pub fn effective_kv_bytes_per_token(
+        self,
+        fused_covers_full_lifetime: bool,
+        num_kv_layers: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dtype_bytes: usize,
+    ) -> u64 {
+        match self {
+            Self::Int8 if fused_covers_full_lifetime => {
+                quantized_kv_bytes_per_token(8, num_kv_layers, num_kv_heads, head_dim)
+            },
+            Self::Int4 if fused_covers_full_lifetime => {
+                quantized_kv_bytes_per_token(4, num_kv_layers, num_kv_heads, head_dim)
+            },
+            Self::Fp | Self::Int8 | Self::Int4 => {
+                2 * num_kv_layers as u64
+                    * num_kv_heads as u64
+                    * head_dim as u64
+                    * dtype_bytes as u64
+            },
+        }
+    }
+
     /// Human-readable description for startup logging, so it's always
     /// possible to tell which mode actually ended up active (an explicit
     /// `--kv-quant`/`new_with_kv_kind` request vs. the `CRANE_KV_QUANT` env
     /// var vs. neither) without re-deriving it from the request itself.
     ///
-    /// The quantized variants deliberately don't claim a peak-VRAM
-    /// reduction: until the fused dequantize-in-attention kernel described
-    /// in [`QuantKvCache`]'s doc lands, the persistent dequant scratch
-    /// buffer makes prefill (and any decode step that can't use the fused
-    /// single-token kernel) cost as much as `Fp`, not less.
+    /// The fused dequantize-in-attention kernel
+    /// (`crate::ops::fused_ops::quant_attn`) now covers both decode and
+    /// prefill on CUDA/ROCm, so peak VRAM is actually reduced there. On
+    /// CPU/Metal (no fused kernel), or for batch-decode's
+    /// `to_fp_pair()`/`from_fp_pair()` round-trip, the persistent dequant
+    /// scratch buffer still makes an unfused step cost as much as `Fp`, not
+    /// less — this description doesn't distinguish those cases from the
+    /// caller's actual device/config, since it's a static per-`KvCacheKind`
+    /// string.
     #[must_use]
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Fp => "fp16/bf16 (unquantized)",
             Self::Int8 => {
-                "int8 (quantized; stored codes ~2x smaller than fp16, but peak VRAM during \
-                 prefill is not reduced yet)"
+                "int8 (quantized; stored codes ~2x smaller than fp16; peak VRAM is reduced on \
+                 CUDA/ROCm's fused attention path, but not yet on CPU/Metal or for batch decode, \
+                 and not if CRANE_QUANT_ATTN_FUSED=0 is set)"
             },
             Self::Int4 => {
-                "int4 (quantized; stored codes ~4x smaller than fp16, but peak VRAM during \
-                 prefill is not reduced yet)"
+                "int4 (quantized; stored codes ~4x smaller than fp16; peak VRAM is reduced on \
+                 CUDA/ROCm's fused attention path, but not yet on CPU/Metal or for batch decode, \
+                 and not if CRANE_QUANT_ATTN_FUSED=0 is set)"
             },
         }
     }
@@ -393,8 +472,9 @@ impl KvCache {
     }
 
     /// Try the fused-kernel append path: quantize and store `k`/`v` without
-    /// maintaining the dequantized scratch buffer, for GPU decode attention
-    /// that dequantizes on the fly (`crate::ops::fused_ops::quant_attn`).
+    /// maintaining the dequantized scratch buffer, for GPU decode and
+    /// prefill attention that dequantizes on the fly
+    /// (`crate::ops::fused_ops::quant_attn`).
     ///
     /// Returns `Ok(None)` — meaning the caller should fall back to
     /// [`Self::append`] instead — when this cache is [`Self::Fp`] (nothing to
@@ -610,15 +690,22 @@ impl KvCacheBackend for FpKvCache {
 /// - 8-bit: one code per element (`[B,H,S,head_dim]`), ~2x smaller than f16.
 /// - 4-bit: two nibbles packed per byte (`[B,H,S,head_dim/2]`), ~4x smaller.
 ///
-/// On read the filled span is dequantized to the compute dtype, so attention is
-/// unchanged. Only newly appended tokens are dequantized each step — the
-/// result is kept in a persistent scratch buffer alongside the quantized
-/// codes, so a step costs O(new tokens), not O(total cached); a fused
-/// dequantize-in-attention kernel that drops the scratch buffer entirely is
-/// the perf follow-up. Until that kernel lands, the scratch buffer holds the
-/// full dequantized history, so peak memory is not reduced versus
-/// [`FpKvCache`] — quantization only shrinks the stored codes, not what
-/// attention actually reads from.
+/// On read via [`KvCacheBackend::append`] the filled span is dequantized to
+/// the compute dtype, so attention is unchanged. Only newly appended tokens
+/// are dequantized each step — the result is kept in a persistent scratch
+/// buffer alongside the quantized codes, so a step costs O(new tokens), not
+/// O(total cached). This path's scratch buffer holds the full dequantized
+/// history, so peak memory is not reduced versus [`FpKvCache`] for it —
+/// quantization only shrinks the stored codes, not what attention actually
+/// reads from.
+///
+/// [`Self::quantized_append`] is the alternative, scratch-buffer-free path:
+/// GPU decode and prefill on CUDA/ROCm use it via
+/// [`KvCache::try_quantized_append`], reading codes/scales directly inside
+/// the fused dequantize-in-attention kernels
+/// (`crate::ops::fused_ops::quant_attn`) instead of dequantizing into the
+/// scratch buffer at all — that's where the actual peak-memory reduction
+/// comes from.
 #[derive(Debug)]
 pub struct QuantKvCache {
     bits: u32,
@@ -658,8 +745,9 @@ impl QuantKvCache {
     }
 
     /// Quantize and store `k`/`v`, without maintaining the dequantized
-    /// scratch buffer — for GPU decode attention that dequantizes on the fly
-    /// (`crate::ops::fused_ops::quant_attn`) instead of reading it back.
+    /// scratch buffer — for GPU decode and prefill attention that
+    /// dequantizes on the fly (`crate::ops::fused_ops::quant_attn`) instead
+    /// of reading it back.
     ///
     /// Invalidates the scratch buffer (`k_dequant`/`v_dequant` become
     /// `None`); a subsequent [`KvCacheBackend::append`] call lazily rebuilds
@@ -911,6 +999,58 @@ mod tests {
     fn rand_kv(b: usize, h: usize, s: usize, d: usize) -> Tensor {
         // Scaled up so quantization error isn't dominated by eps.
         (Tensor::randn(0f32, 1f32, (b, h, s, d), &Device::Cpu).unwrap() * 4.0).unwrap()
+    }
+
+    // int8: 1 byte/code + 4 byte f32 scale per head -> 2*48*4*(128+4) bytes/token.
+    #[test]
+    fn quantized_kv_bytes_per_token_int8() {
+        assert_eq!(
+            quantized_kv_bytes_per_token(8, 48, 4, 128),
+            2 * 48 * 4 * (128 + 4)
+        );
+    }
+
+    // int4: nibble-packed codes (head_dim/2 bytes) + 4 byte f32 scale per head.
+    #[test]
+    fn quantized_kv_bytes_per_token_int4() {
+        assert_eq!(
+            quantized_kv_bytes_per_token(4, 48, 4, 128),
+            2 * 48 * 4 * (64 + 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bits must be 4 or 8")]
+    fn quantized_kv_bytes_per_token_rejects_invalid_bits() {
+        let _ = quantized_kv_bytes_per_token(16, 48, 4, 128);
+    }
+
+    // Fused-not-covering-lifetime must fall back to compute-dtype pricing
+    // even for a quantized KvCacheKind, regardless of bits.
+    #[test]
+    fn effective_kv_bytes_per_token_falls_back_to_compute_dtype_when_not_fused() {
+        let fp16_bytes = 2 * 48 * 4 * 128 * 2;
+        assert_eq!(
+            KvCacheKind::Int8.effective_kv_bytes_per_token(false, 48, 4, 128, 2),
+            fp16_bytes
+        );
+        assert_eq!(
+            KvCacheKind::Fp.effective_kv_bytes_per_token(true, 48, 4, 128, 2),
+            fp16_bytes
+        );
+    }
+
+    // Fused-covers-lifetime must use the smaller quantized price for Int8/Int4.
+    #[test]
+    fn effective_kv_bytes_per_token_uses_quantized_price_when_fused() {
+        assert_eq!(
+            KvCacheKind::Int8.effective_kv_bytes_per_token(true, 48, 4, 128, 2),
+            quantized_kv_bytes_per_token(8, 48, 4, 128)
+        );
+        assert_eq!(
+            KvCacheKind::Int4.effective_kv_bytes_per_token(true, 48, 4, 128, 2),
+            quantized_kv_bytes_per_token(4, 48, 4, 128)
+        );
     }
 
     #[test]

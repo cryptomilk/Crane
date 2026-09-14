@@ -41,6 +41,10 @@ pub struct Qwen3_5TextModel {
     attn_caches: Vec<Option<KvCache>>,
     device: Device,
     dtype: DType,
+    /// KV cache representation in use, read from `CRANE_KV_QUANT` at
+    /// construction (see [`build_layer_caches`]). Needed by
+    /// [`Self::kv_kind`] for VRAM pricing.
+    kv_kind: KvCacheKind,
 }
 
 impl Qwen3_5TextModel {
@@ -147,7 +151,9 @@ impl Qwen3_5TextModel {
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
 
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let kv_kind = KvCacheKind::from_env();
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, device, kv_kind)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -160,6 +166,7 @@ impl Qwen3_5TextModel {
             attn_caches,
             device: device.clone(),
             dtype,
+            kv_kind,
         })
     }
 
@@ -347,7 +354,9 @@ impl Qwen3_5TextModel {
         };
 
         let rotary = MRotaryEmbedding::new(&text_cfg, device)?;
-        let (gdn_caches, attn_caches) = build_layer_caches(&layers, &text_cfg, dtype, device)?;
+        let kv_kind = KvCacheKind::from_env();
+        let (gdn_caches, attn_caches) =
+            build_layer_caches(&layers, &text_cfg, dtype, device, kv_kind)?;
 
         Ok(Self {
             cfg: text_cfg,
@@ -360,12 +369,20 @@ impl Qwen3_5TextModel {
             attn_caches,
             device: device.clone(),
             dtype,
+            kv_kind,
         })
     }
 
     #[must_use]
     pub fn config(&self) -> &TextConfig {
         &self.cfg
+    }
+
+    /// KV cache representation in use, selected at construction from
+    /// `CRANE_KV_QUANT` (see [`KvCacheKind::from_env`]).
+    #[must_use]
+    pub fn kv_kind(&self) -> KvCacheKind {
+        self.kv_kind
     }
 
     #[must_use]
@@ -582,11 +599,11 @@ fn build_layer_caches(
     cfg: &TextConfig,
     dtype: DType,
     device: &Device,
+    kv_kind: KvCacheKind,
 ) -> Result<(
     Vec<Option<crate::ops::gdn::GdnLayerCache>>,
     Vec<Option<KvCache>>,
 )> {
-    let kv_kind = KvCacheKind::from_env();
     let mut gdn_caches = Vec::with_capacity(layers.len());
     let mut attn_caches = Vec::with_capacity(layers.len());
     for layer in layers {
@@ -900,6 +917,30 @@ impl Model {
     /// Total bytes held by the full-attention K/V caches (context-scaling term).
     pub fn attn_cache_bytes(&self) -> usize {
         self.inner.attn_cache_bytes()
+    }
+
+    /// Bytes of KV cache one sequence consumes per generated token. See
+    /// [`TextConfig::kv_bytes_per_token`]/[`TextConfig::quantized_kv_bytes_per_token`].
+    ///
+    /// Batch decode isn't implemented for this hybrid architecture
+    /// (`Qwen3_5Backend` never sets `supports_kv_swap`, so the engine caps
+    /// `max_concurrent` to 1 — see the cross-referencing comment on its
+    /// `ModelBackend` impl in `crane-serve/src/engine/backend.rs`), so the
+    /// only conditions gating the fused dequantize-in-attention kernel's
+    /// full-lifetime coverage are CUDA/ROCm and `CRANE_QUANT_ATTN_FUSED` not
+    /// being `0`. Otherwise prices at the compute dtype's size, for the same
+    /// reasoning as `qwen3::Model::kv_bytes_per_token`.
+    pub fn kv_bytes_per_token(&self) -> u64 {
+        let config = self.inner.config();
+        let fused_covers_full_lifetime = (self.device.is_cuda() || self.device.is_rocm())
+            && !crate::ops::fused_ops::quant_attn::fused_disabled();
+        self.inner.kv_kind().effective_kv_bytes_per_token(
+            fused_covers_full_lifetime,
+            config.num_full_attention_layers(),
+            config.num_key_value_heads,
+            config.head_dim,
+            self.dtype.size_in_bytes(),
+        )
     }
 
     /// Warm up the model with a small forward pass.

@@ -652,8 +652,19 @@ impl ModelBackend for Qwen3_5Backend {
         self.model.warmup();
     }
 
+    fn kv_bytes_per_token(&self) -> Option<u64> {
+        Some(self.model.kv_bytes_per_token())
+    }
+
     // supports_kv_swap defaults to false → engine caps max_concurrent to 1.
     // Batch decode is not yet implemented for hybrid layer types.
+    //
+    // `crane_core::models::qwen3_5::Model::kv_bytes_per_token`'s quantized
+    // VRAM pricing assumes this backend never runs batch decode, since it
+    // has no `max_concurrent == 1` check of its own (unlike the plain Qwen 3
+    // backend). If this default is ever overridden to add batch-decode
+    // support for hybrid layer types, revisit that pricing gate first —
+    // otherwise VRAM would be silently under-reserved.
 }
 
 // ─────────────────────────────────────────────────────────────
