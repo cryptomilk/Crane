@@ -149,10 +149,16 @@ impl GpuBudget {
     ///
     /// `num_layers`, `num_kv_heads`, and `head_dim` come from the model's
     /// own config; `dtype_bytes` should always be the compute dtype's
-    /// `size_in_bytes()`, even for a quantized KV cache — batch decode,
-    /// KV-swap/preemption, and prefill all fully dequantize to the compute
-    /// dtype, so reserving at the smaller quantized storage size would
-    /// under-claim VRAM against that worst case.
+    /// `size_in_bytes()`, even for a quantized KV cache whose fused
+    /// dequantize-in-attention kernel (`crate::ops::fused_ops::quant_attn`)
+    /// doesn't yet cover the sequence's entire lifetime on the active
+    /// backend — batch decode, KV-swap/preemption, and unfused prefill/decode
+    /// all fully dequantize to the compute dtype in that case, so reserving
+    /// at the smaller quantized storage size would under-claim VRAM against
+    /// that worst case. Callers that *can* rely on the fused kernel for the
+    /// full lifetime (CUDA/ROCm, `max_concurrent == 1`) should call
+    /// [`Self::runtime_reservation_bytes_for_kv_bytes_per_token`] instead,
+    /// passing `Config::quantized_kv_bytes_per_token`'s result.
     /// [`Self::max_concurrent`] defaults to `1` and [`Self::max_seq_len`]
     /// defaults to `4096` when unset, since the real values may not be
     /// known yet at the point this is called.
@@ -164,13 +170,27 @@ impl GpuBudget {
         head_dim: usize,
         dtype_bytes: usize,
     ) -> u64 {
+        let kv_bytes_per_token =
+            2 * num_layers as u64 * num_kv_heads as u64 * head_dim as u64 * dtype_bytes as u64;
+        self.runtime_reservation_bytes_for_kv_bytes_per_token(kv_bytes_per_token)
+    }
+
+    /// Same estimate as [`Self::runtime_reservation_bytes`], but takes an
+    /// already-computed per-sequence, per-token KV byte cost directly —
+    /// for callers pricing a quantized KV cache
+    /// (`Config::quantized_kv_bytes_per_token`), whose cost doesn't
+    /// decompose into a uniform per-element `dtype_bytes` factor (the
+    /// per-token scale overhead doesn't scale with `head_dim`).
+    #[must_use]
+    pub fn runtime_reservation_bytes_for_kv_bytes_per_token(&self, kv_bytes_per_token: u64) -> u64 {
+        const DEFAULT_SEQ_LEN: usize = 4096;
+
         if matches!(
             self.weight_budget,
             WeightBudget::NoGpu | WeightBudget::Unlimited
         ) {
             return 0;
         }
-        const DEFAULT_SEQ_LEN: usize = 4096;
 
         let max_concurrent = self.max_concurrent.unwrap_or(1);
         let effective_seq_len = self
@@ -178,13 +198,7 @@ impl GpuBudget {
             .filter(|&n| n > 0)
             .unwrap_or(DEFAULT_SEQ_LEN) as u64;
 
-        let kv_storage = max_concurrent as u64
-            * effective_seq_len
-            * 2
-            * num_layers as u64
-            * num_kv_heads as u64
-            * head_dim as u64
-            * dtype_bytes as u64;
+        let kv_storage = max_concurrent as u64 * effective_seq_len * kv_bytes_per_token;
 
         kv_vram_overhead(kv_storage, max_concurrent)
     }
@@ -420,6 +434,50 @@ mod tests {
         let kv_storage: u64 = 1 * 1 * 2 * 48 * 4 * 128 * 2;
         let expected = kv_storage + KV_SAFETY_MARGIN_BYTES;
         assert_eq!(budget.runtime_reservation_bytes(48, 4, 128, 2), expected);
+    }
+
+    // Verifies runtime_reservation_bytes_for_kv_bytes_per_token computes the
+    // same result as runtime_reservation_bytes when fed the equivalent
+    // per-token byte cost (2 * layers * kv_heads * head_dim * dtype_bytes) —
+    // the two must agree since the latter is defined in terms of the former.
+    #[test]
+    fn runtime_reservation_bytes_for_kv_bytes_per_token_matches_decomposed_form() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(16 << 30),
+            offload_all_experts: false,
+            max_concurrent: Some(8),
+            max_seq_len: Some(2048),
+        };
+        let kv_bytes_per_token: u64 = 2 * 48 * 4 * 128 * 2;
+        assert_eq!(
+            budget.runtime_reservation_bytes_for_kv_bytes_per_token(kv_bytes_per_token),
+            budget.runtime_reservation_bytes(48, 4, 128, 2)
+        );
+    }
+
+    // A quantized per-token byte cost (int8: ~head_dim + 4 bytes/head,
+    // instead of head_dim * 2 for f16) must yield a strictly smaller
+    // reservation than compute-dtype pricing — this is the whole point of
+    // pricing at the quantized size once the fused kernel covers the full
+    // sequence lifetime.
+    #[test]
+    fn runtime_reservation_bytes_for_kv_bytes_per_token_quantized_is_smaller() {
+        let budget = GpuBudget {
+            weight_budget: WeightBudget::Limited(16 << 30),
+            offload_all_experts: false,
+            max_concurrent: Some(1),
+            max_seq_len: Some(131_072),
+        };
+        let fp_bytes_per_token: u64 = 2 * 48 * 4 * 128 * 2; // f16
+        let int8_bytes_per_token: u64 = 2 * 48 * 4 * (128 + 4); // codes + scale
+        let fp_reservation =
+            budget.runtime_reservation_bytes_for_kv_bytes_per_token(fp_bytes_per_token);
+        let int8_reservation =
+            budget.runtime_reservation_bytes_for_kv_bytes_per_token(int8_bytes_per_token);
+        assert!(
+            int8_reservation < fp_reservation,
+            "int8 reservation ({int8_reservation}) should be smaller than fp ({fp_reservation})"
+        );
     }
 
     // Verifies the human-readable size formatting used in placement logs.
