@@ -29,6 +29,7 @@
 //! | `memory`        | GPU memory-limit parsing + usage queries          |
 
 pub mod backend;
+pub mod grammar;
 mod memory;
 pub mod model_factory;
 pub mod sampling;
@@ -77,6 +78,20 @@ const PREFILL_CHUNK_SIZE: usize = 2048;
 fn vram_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("CRANE_VRAM_TRACE").as_deref() == Ok("1"))
+}
+
+/// Whether to log every tool-call grammar state transition and the
+/// resulting next-token mask (`CRANE_GRAMMAR_TRACE=1`).
+///
+/// Diagnostic for confirming whether `grammar::tool_call_skeleton`'s
+/// `<tool_call>` wrapper enforcement is actually engaging for a request,
+/// as opposed to silently degrading to unconstrained (e.g. because
+/// `VocabByteTable::tokens_matching_prefix` found no token able to start
+/// a forced literal — see [`InferenceEngine::new`]'s startup sanity log).
+#[must_use]
+fn grammar_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CRANE_GRAMMAR_TRACE").as_deref() == Ok("1"))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -137,15 +152,28 @@ pub struct InferenceEngine {
     /// grant a short cooldown after preemption to avoid a deadlock where
     /// cuMemGetInfo always reports over-limit.
     eviction_cooldown: u32,
+    /// Token-id → decoded-text lookup for the whole vocabulary, built once
+    /// from the loaded model's tokenizer. Shared (via `Arc`) into every
+    /// sequence's grammar constraint, since it depends only on the model,
+    /// not the request. `None` for models that don't use the tool-call XML
+    /// skeleton grammar (see [`InferenceEngine::new`]'s `uses_xml_tool_format`
+    /// parameter).
+    vocab_byte_table: Option<Arc<grammar::VocabByteTable>>,
 }
 
 impl InferenceEngine {
     /// Create the engine and return a handle for submitting requests.
+    ///
+    /// `uses_xml_tool_format` gates the tool-call XML skeleton grammar
+    /// (see `grammar::tool_call_skeleton`): only Qwen3-Coder checkpoints
+    /// emit that format, so the grammar must stay off for every other
+    /// model or it would corrupt their (already well-formed) tool calls.
     pub fn new(
         model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
         memory_config: MemoryConfig,
+        uses_xml_tool_format: bool,
     ) -> (Self, EngineHandle) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let num_layers = model.num_layers();
@@ -160,6 +188,22 @@ impl InferenceEngine {
             info!("Model does not support KV swap — limiting max_concurrent to {effective_max}");
         }
 
+        let vocab_byte_table = uses_xml_tool_format.then(|| {
+            let table = Arc::new(grammar::VocabByteTable::build(model.tokenizer()));
+            // One-time sanity check: does the vocab contain any token able to
+            // *start* forcing each literal the tool-call grammar relies on? A
+            // zero here means `apply_grammar_mask` will always see an empty
+            // allow-list for that literal and silently degrade to
+            // unconstrained (see `VocabByteTable::tokens_matching_prefix`'s
+            // doc) — i.e. the grammar would never actually constrain anything
+            // at that point, without erroring.
+            info!(
+                wrapper_open_from_idle = table.tokens_matching_prefix("\n<function=", 0).len(),
+                call_close = table.tokens_matching_prefix("\n</tool_call>", 0).len(),
+                "Grammar vocab sanity check (0 = that literal can never be forced)",
+            );
+            table
+        });
         let stats = Arc::new(EngineStats::new());
         let engine = Self {
             model,
@@ -180,6 +224,7 @@ impl InferenceEngine {
                 .unwrap_or_else(Instant::now),
             tracked_kv_bytes: 0,
             eviction_cooldown: 0,
+            vocab_byte_table,
         };
         let handle = EngineHandle { request_tx, stats };
         (engine, handle)
@@ -732,6 +777,35 @@ impl InferenceEngine {
             .total_prompt_tokens
             .fetch_add(prompt_len as u64, Ordering::Relaxed);
 
+        // Constrains the tool-call XML skeleton so Qwen3-Coder's documented
+        // quirk of occasionally omitting the `<tool_call>` opener can't
+        // reach the client. `None` when the request offers no tools, or when
+        // the loaded model isn't Qwen3-Coder (`vocab_byte_table` is only
+        // built for that format — see `InferenceEngine::new`).
+        info!(
+            id = %req.id,
+            tool_count = req.tool_names.len(),
+            tool_names = ?req.tool_names,
+            "Grammar constraint: {}",
+            if req.tool_names.is_empty() {
+                "no tools offered, none constructed"
+            } else if self.vocab_byte_table.is_none() {
+                "tools offered, but model doesn't use the XML tool-call format — none constructed"
+            } else {
+                "constructed"
+            },
+        );
+        let grammar: Option<Box<dyn grammar::GrammarConstraint>> = if req.tool_names.is_empty() {
+            None
+        } else {
+            self.vocab_byte_table.as_ref().map(|vocab_byte_table| {
+                Box::new(grammar::tool_call_skeleton::ToolCallSkeleton::new(
+                    req.tool_names,
+                    vocab_byte_table.clone(),
+                )) as Box<dyn grammar::GrammarConstraint>
+            })
+        };
+
         let seq = Sequence {
             id: req.id.clone(),
             status: SequenceStatus::Waiting,
@@ -748,6 +822,7 @@ impl InferenceEngine {
             top_k: req.top_k,
             max_tokens: effective_max_tokens,
             eos_token_id: req.eos_token_id,
+            grammar,
             repetition_penalty: req.repetition_penalty,
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
@@ -1452,6 +1527,26 @@ impl InferenceEngine {
 
         if let Some(seq) = self.sequences.get_mut(seq_id) {
             seq.unsent_text.push_str(&text);
+            if let Some(g) = seq.grammar.as_mut() {
+                g.advance(token_id, &text);
+                if grammar_trace_enabled() {
+                    let mask_desc = match g.token_mask() {
+                        grammar::TokenMask::Unconstrained => "unconstrained".to_string(),
+                        grammar::TokenMask::AllowOnly(ids) => format!("allow_only({})", ids.len()),
+                    };
+                    debug!(
+                        id = %seq_id,
+                        token_id,
+                        text = %text,
+                        allows_eos = g.allows_eos(),
+                        next_mask = %mask_desc,
+                        "CRANE_GRAMMAR_TRACE",
+                    );
+                }
+                if g.is_finished() {
+                    seq.grammar = None;
+                }
+            }
         }
     }
 

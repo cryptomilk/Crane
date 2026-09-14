@@ -1413,6 +1413,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             args.max_concurrent,
             args.decode_tokens_per_seq,
             memory_config,
+            engine::model_factory::uses_xml_tool_format(&args.model_path),
         );
         std::thread::Builder::new()
             .name("inference-engine".into())

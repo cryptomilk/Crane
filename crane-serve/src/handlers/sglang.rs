@@ -96,6 +96,8 @@ pub async fn generate(
                     .stop
                     .clone()
                     .map_or_else(Vec::new, StringOrList::into_vec),
+                // SGLang's `/generate` has no tool-calling concept.
+                tool_names: Vec::new(),
             },
         )
         .map_err(|e| make_error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
@@ -225,6 +227,7 @@ pub async fn health_generate(
                 presence_penalty: 0.0,
                 eos_token_id: state.eos_token_id.clone(),
                 stop: vec![],
+                tool_names: Vec::new(),
             },
         )
         .map_err(|e| {

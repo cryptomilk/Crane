@@ -395,6 +395,48 @@ pub fn detect_model_type(model_path: &str) -> ModelType {
     }
 }
 
+/// Whether `model_path`'s checkpoint uses Qwen3-Coder's XML tool-call
+/// skeleton (`<tool_call>\n<function=NAME>...`) rather than plain Qwen3's
+/// JSON tool-call format (`<tool_call>\n{"name": ...}`). Both ship as
+/// [`ModelType::Qwen3`] since they share architecture; only the raw
+/// `model_type`/`general.architecture` string (`"qwen3moe"` vs `"qwen3"`)
+/// tells them apart. Used to gate the tool-call skeleton grammar, since
+/// applying it to a plain-Qwen3 checkpoint would corrupt its (already
+/// well-formed) JSON tool calls.
+#[must_use]
+pub fn uses_xml_tool_format(model_path: &str) -> bool {
+    let path = Path::new(model_path);
+
+    let config_path = if path.is_file() {
+        path.parent().map(|p| p.join("config.json"))
+    } else {
+        Some(path.join("config.json"))
+    };
+    if let Some(config_path) = config_path
+        && let Ok(data) = std::fs::read(&config_path)
+        && let Ok(config) = serde_json::from_slice::<HfConfig>(&data)
+        && let Some(ref mt) = config.model_type
+    {
+        return mt.eq_ignore_ascii_case("qwen3moe");
+    }
+
+    // GGUF conversions carry the same "qwen3moe" architecture tag in place
+    // of a `config.json` `model_type` field.
+    if path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        && let Ok(mut file) = std::fs::File::open(path)
+        && let Ok(ct) = candle_core::quantized::gguf_file::Content::read(&mut file)
+        && let Some(arch) = ct.metadata.get("general.architecture")
+        && let Ok(arch) = arch.to_string()
+    {
+        return arch.eq_ignore_ascii_case("qwen3moe");
+    }
+
+    false
+}
+
 /// Path-name markers for the Qwen 3.5 family. Qwen 3.6 and 3.8 are the same
 /// architecture (see `crane_core::models::qwen3_5`), so they route here too —
 /// without these, `Qwen3.8-27B-GGUF/` falls through to the bare `qwen3` branch
@@ -864,6 +906,30 @@ mod tests {
         std::fs::write(&config, r#"{"model_type": "qwen3moe"}"#).unwrap();
         let result = detect_model_type(dir.path().to_str().unwrap());
         assert_eq!(result, ModelType::Qwen3);
+    }
+
+    // ── uses_xml_tool_format ──
+
+    #[test]
+    fn uses_xml_tool_format_true_for_qwen3moe() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3moe"}"#).unwrap();
+        assert!(uses_xml_tool_format(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn uses_xml_tool_format_false_for_plain_qwen3() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, r#"{"model_type": "qwen3"}"#).unwrap();
+        assert!(!uses_xml_tool_format(dir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn uses_xml_tool_format_false_when_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!uses_xml_tool_format(dir.path().to_str().unwrap()));
     }
 
     #[test]

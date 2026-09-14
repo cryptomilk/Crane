@@ -58,6 +58,12 @@ pub struct Sequence {
     pub presence_penalty: f32,
     pub repeat_last_n: usize,
 
+    // ── grammar ──
+    /// Grammar constraint on what the sampler may produce next (e.g. the
+    /// tool-call XML skeleton). `None` when the request offers no tools,
+    /// or once the grammar reports [`super::grammar::GrammarConstraint::is_finished`].
+    pub grammar: Option<Box<dyn super::grammar::GrammarConstraint>>,
+
     // ── stop sequences ──
     /// String sequences that terminate generation when produced.
     pub stop_sequences: Vec<String>,
@@ -297,6 +303,7 @@ mod tests {
             top_k: Some(40),
             max_tokens,
             eos_token_id: vec![eos_token_id],
+            grammar: None,
             stop_sequences: vec![],
             unsent_text: String::new(),
             decode_start: None,
