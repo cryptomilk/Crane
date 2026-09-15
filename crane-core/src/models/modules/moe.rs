@@ -4,6 +4,7 @@ use crate::device::{format_budget, query_gpu_memory};
 use crate::models::hunyuan_dense::modeling::Gguf;
 use crate::ops::linear::LinearLayer;
 use crate::ops::prof::{self, Span};
+use crate::utils::DeviceExt;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias};
@@ -144,6 +145,19 @@ pub struct SparseMoeBlock {
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     expert_device: Device,
+    /// Packed `(num_experts, moe_intermediate, hidden)` gate-projection
+    /// weights for the fused `indexed_moe_forward` dispatch path (CUDA/ROCm
+    /// only). `Some` only when [`supports_fused_moe`] held for every packed
+    /// projection at load time; `experts` is left empty in that case since
+    /// the fused path replaces the per-expert loop entirely (see
+    /// [`load_packed_experts`]'s doc comment on why both aren't kept).
+    packed_gate_exps: Option<Arc<QTensor>>,
+    /// Packed `(num_experts, moe_intermediate, hidden)` up-projection
+    /// weights. See [`Self::packed_gate_exps`].
+    packed_up_exps: Option<Arc<QTensor>>,
+    /// Packed `(num_experts, hidden, moe_intermediate)` down-projection
+    /// weights. See [`Self::packed_gate_exps`].
+    packed_down_exps: Option<Arc<QTensor>>,
 }
 
 impl SparseMoeBlock {
@@ -186,6 +200,9 @@ impl SparseMoeBlock {
             num_experts_per_tok: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
             expert_device: expert_device.clone(),
+            packed_gate_exps: None,
+            packed_up_exps: None,
+            packed_down_exps: None,
         })
     }
 
@@ -219,15 +236,17 @@ impl SparseMoeBlock {
         let gate = LinearLayer::Standard(Linear::new(gate_weight, None));
 
         let packed_name = format!("{prefix}.ffn_gate_exps.weight");
-        let experts = if gg.contains_tensor(&packed_name) {
-            Self::load_packed_experts(gg, &prefix, config.num_experts, expert_device)?
-        } else {
-            (0..config.num_experts)
-                .map(|expert_idx| {
-                    MoeExpert::new_from_gguf(gg, layer_idx, expert_idx, expert_device)
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
+        let (experts, packed_gate_exps, packed_up_exps, packed_down_exps) =
+            if gg.contains_tensor(&packed_name) {
+                Self::load_packed_experts(gg, &prefix, config.num_experts, expert_device)?
+            } else {
+                let experts = (0..config.num_experts)
+                    .map(|expert_idx| {
+                        MoeExpert::new_from_gguf(gg, layer_idx, expert_idx, expert_device)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (experts, None, None, None)
+            };
 
         Ok(Self {
             gate,
@@ -235,13 +254,23 @@ impl SparseMoeBlock {
             num_experts_per_tok: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
             expert_device: expert_device.clone(),
+            packed_gate_exps,
+            packed_up_exps,
+            packed_down_exps,
         })
     }
 
     /// Load the packed (Unsloth-style) `_exps` expert tensor layout: each
     /// projection is a single 3D tensor `[num_experts, out, in]` covering all
-    /// experts, loaded onto `expert_device` and byte-sliced per expert
-    /// without dequantizing.
+    /// experts, loaded onto `expert_device`.
+    ///
+    /// When [`supports_fused_moe`] holds for every projection's quant type
+    /// (CUDA/`ROCm`, `Q2K`-`Q6K` or `Q8_0`), the packed tensors are kept intact and
+    /// returned directly for Phase 8a's `indexed_moe_forward` dispatch, with
+    /// an empty `Vec<MoeExpert>`. Keeping both the packed and per-expert
+    /// copies would double GPU memory for expert weights. Otherwise (CPU,
+    /// Metal, or an unsupported quant type), falls back to byte-slicing each
+    /// packed tensor into per-expert 2D `QTensor`s without dequantizing.
     ///
     /// Expert boundaries align with quantization block boundaries for every
     /// standard GGML block size (a Qwen3-Coder-30B-A3B expert is
@@ -256,12 +285,18 @@ impl SparseMoeBlock {
     /// `data()` does a full device-to-host memcpy of the whole buffer, so a
     /// per-expert call would cost `num_experts` redundant full-tensor
     /// copies instead of one.
+    #[allow(clippy::type_complexity)]
     fn load_packed_experts<R: Read + Seek>(
         gg: &mut Gguf<R>,
         prefix: &str,
         num_experts: usize,
         expert_device: &Device,
-    ) -> Result<Vec<MoeExpert>> {
+    ) -> Result<(
+        Vec<MoeExpert>,
+        Option<Arc<QTensor>>,
+        Option<Arc<QTensor>>,
+        Option<Arc<QTensor>>,
+    )> {
         let gate_packed = gg.tensor_on(&format!("{prefix}.ffn_gate_exps.weight"), expert_device)?;
         let up_packed = gg.tensor_on(&format!("{prefix}.ffn_up_exps.weight"), expert_device)?;
         let down_packed = gg.tensor_on(&format!("{prefix}.ffn_down_exps.weight"), expert_device)?;
@@ -282,11 +317,24 @@ impl SparseMoeBlock {
         let gate_dtype = gate_packed.dtype();
         let up_dtype = up_packed.dtype();
         let down_dtype = down_packed.dtype();
+
+        if supports_fused_moe(expert_device, gate_dtype)
+            && supports_fused_moe(expert_device, up_dtype)
+            && supports_fused_moe(expert_device, down_dtype)
+        {
+            return Ok((
+                Vec::new(),
+                Some(Arc::new(gate_packed)),
+                Some(Arc::new(up_packed)),
+                Some(Arc::new(down_packed)),
+            ));
+        }
+
         let gate_raw = gate_packed.data()?;
         let up_raw = up_packed.data()?;
         let down_raw = down_packed.data()?;
 
-        (0..num_experts)
+        let experts = (0..num_experts)
             .map(|i| {
                 let gate_qt = slice_packed_qtensor(
                     &gate_raw,
@@ -318,7 +366,8 @@ impl SparseMoeBlock {
                     LinearLayer::Quantized(QMatMul::from_arc(Arc::new(down_qt))?),
                 ))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((experts, None, None, None))
     }
 
     /// Moves every expert's weights to `device`, in `dtype`, updating
@@ -339,6 +388,13 @@ impl SparseMoeBlock {
         if self.expert_device.location() == device.location() {
             return Ok(());
         }
+        debug_assert!(
+            self.packed_gate_exps.is_none()
+                && self.packed_up_exps.is_none()
+                && self.packed_down_exps.is_none(),
+            "promote_experts_to called on a block with packed tensors; \
+             the fused path's packed QTensors would not be migrated"
+        );
         match batched_promote(&self.experts, device, dtype) {
             Ok(Some(moved)) => {
                 self.experts = moved;
@@ -406,6 +462,83 @@ impl SparseMoeBlock {
         self.expert_device = device.clone();
         Ok(())
     }
+
+    /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a): three
+    /// kernel launches (gate, up, down) against the packed 3D expert
+    /// tensors, instead of a per-expert `index_select`/`forward`/`index_add`
+    /// loop. `topk_ids`/`topk_weights` stay on-device throughout.
+    ///
+    /// `xs_f32` is `(num_tokens, hidden_size)`. For the gate/up projections,
+    /// every routed expert of a token shares the same input row
+    /// (`indexed_moe_forward`'s `input_dim1 == 1` case), so `xs_f32` is
+    /// unsqueezed to `(num_tokens, 1, hidden_size)`. For the down
+    /// projection, each routed expert has its own intermediate activation
+    /// (`input_dim1 == topk`), which the `(num_tokens, topk,
+    /// moe_intermediate_size)` `hidden` tensor already matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `indexed_moe_forward` call fails (e.g. a
+    /// device/dtype mismatch) or if a tensor op fails.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_forward(
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_exps: &QTensor,
+        up_exps: &QTensor,
+        down_exps: &QTensor,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        let xs_3d = xs_f32.unsqueeze(1)?.contiguous()?;
+        let gate_out = gate_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
+        let up_out = up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
+        let hidden = (Activation::Silu.forward(&gate_out)? * up_out)?.contiguous()?;
+        let down_out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
+
+        Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
+    }
+
+    /// Weighted sum of per-expert outputs back to the original sequence shape.
+    ///
+    /// `expert_out` is `(tokens, top_k, hidden)`, `topk_weights` is
+    /// `(tokens, top_k)`. Returns a tensor of shape `original_dims` in
+    /// `original_dtype`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any tensor op fails.
+    fn combine_expert_outputs(
+        expert_out: &Tensor,
+        topk_weights: &Tensor,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        let weights = topk_weights.unsqueeze(D::Minus1)?;
+        let weighted = expert_out.broadcast_mul(&weights)?;
+        let summed = weighted.sum(1)?;
+        summed.to_dtype(original_dtype)?.reshape(original_dims)
+    }
+}
+
+/// Whether `QTensor::indexed_moe_forward` (Phase 8a's fused `MoE` dispatch) is
+/// available for `device` and `ggml_dtype`. `indexed_moe_forward` is
+/// implemented on CUDA and `ROCm` only (see the xmiksay/candle fork's
+/// `quantized/{cuda,rocm}.rs`). It only supports `Q2K`-`Q6K` and `Q8_0`.
+/// Those are the same dtypes MMVQ supports, since the kernel reuses its
+/// `vec_dot_q*_q8_1` inner loop.
+fn supports_fused_moe(device: &Device, ggml_dtype: GgmlDType) -> bool {
+    (device.is_cuda() || device.is_rocm())
+        && matches!(
+            ggml_dtype,
+            GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+                | GgmlDType::Q8_0
+        )
 }
 
 /// Byte-slice one expert's 2D weight out of a packed `[num_experts, out, in]`
@@ -637,12 +770,35 @@ impl Module for SparseMoeBlock {
                 Ok((topk_ids, topk_weights))
             })?;
 
+        // Fused GPU MoE dispatch (Phase 8a, CUDA/ROCm only): 3 kernel
+        // launches (gate, up, down) instead of the per-expert loop below,
+        // with `topk_ids`/`topk_weights` staying on-device throughout (no
+        // CPU sync). Only set when `load_packed_experts` found every packed
+        // projection's quant type eligible; see `supports_fused_moe`.
+        if let (Some(gate_exps), Some(up_exps), Some(down_exps)) = (
+            &self.packed_gate_exps,
+            &self.packed_up_exps,
+            &self.packed_down_exps,
+        ) {
+            return prof::timed(Span::MoeFused, || {
+                Self::fused_forward(
+                    &xs_f32,
+                    &topk_ids,
+                    &topk_weights,
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                    original_dtype,
+                    &original_dims,
+                )
+            });
+        }
+
         // Routing dispatch is CPU-side: topk indices and weights are pulled to
         // the host each forward call, and per-expert token/weight lists below
-        // are heap-allocated fresh each call. A fused GPU MoE kernel (as in
-        // candle's moe_gemm_gguf) would eliminate both the sync and the
-        // allocations, at the cost of losing the packed/per-expert layout
-        // flexibility this dispatch loop gets for free.
+        // are heap-allocated fresh each call. This is the fallback path for
+        // CPU, Metal, and unsupported quant types; the fused path above
+        // avoids both the sync and the allocations on CUDA/ROCm.
         let topk_ids = topk_ids.to_vec2::<u32>()?;
         let topk_weights = topk_weights.to_vec2::<f32>()?;
 
@@ -1006,6 +1162,78 @@ mod tests {
         }
     }
 
+    // `combine_expert_outputs` is plain candle-core tensor arithmetic (no
+    // CUDA/ROCm dependency), so it can be verified on CPU even though
+    // `indexed_moe_forward` itself cannot.
+    #[test]
+    fn combine_expert_outputs_weights_and_reshapes() {
+        // 2 tokens, top_k=3, hidden=4.
+        let expert_out =
+            Tensor::from_vec(vec![1.0f32; 2 * 3 * 4], (2, 3, 4), &Device::Cpu).unwrap();
+        let topk_weights =
+            Tensor::from_vec(vec![0.5f32, 0.3, 0.2, 0.6, 0.1, 0.3], (2, 3), &Device::Cpu).unwrap();
+        let result =
+            SparseMoeBlock::combine_expert_outputs(&expert_out, &topk_weights, DType::F32, &[2, 4])
+                .unwrap();
+        assert_eq!(result.dims(), &[2, 4]);
+        // Each token's per-hidden-dim output is the sum of its top-k weights
+        // (since every expert output element is 1.0): both rows sum to 1.0.
+        let vals = result.to_vec2::<f32>().unwrap();
+        let eps = 1e-6;
+        for row in &vals {
+            for &v in row {
+                assert!((v - 1.0).abs() < eps, "expected ~1.0, got {v}");
+            }
+        }
+    }
+
+    // `indexed_moe_forward` is CUDA/ROCm-only in the candle fork, so the CPU
+    // unit test process can never construct an eligible device, but the
+    // eligibility check itself is still a plain function callable here.
+    #[test]
+    fn supports_fused_moe_cpu_always_false() {
+        use candle_core::quantized::GgmlDType;
+
+        for dtype in [
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8_0,
+        ] {
+            assert!(
+                !supports_fused_moe(&Device::Cpu, dtype),
+                "CPU must never be fused-eligible, dtype={dtype:?}"
+            );
+        }
+    }
+
+    // Quant types outside Q2K-Q6K/Q8_0 have no `indexed_moe_forward` kernel
+    // in the candle fork, so they must stay ineligible even if some future
+    // change makes `Device::Cpu` erroneously report as CUDA/ROCm-like.
+    #[test]
+    fn supports_fused_moe_unsupported_dtype_always_false() {
+        use candle_core::quantized::GgmlDType;
+
+        for dtype in [
+            GgmlDType::F32,
+            GgmlDType::F16,
+            GgmlDType::BF16,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_1,
+            GgmlDType::Q8K,
+        ] {
+            assert!(
+                !supports_fused_moe(&Device::Cpu, dtype),
+                "unsupported dtype must never be fused-eligible: {dtype:?}"
+            );
+        }
+    }
+
     // `load_packed_experts` must produce `Quantized` layers, not `Standard`
     // -- the whole point of Phase 3 is to keep packed experts quantized
     // instead of eagerly dequantizing them at load time.
@@ -1049,10 +1277,15 @@ mod tests {
         let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
         let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
 
-        let experts = SparseMoeBlock::load_packed_experts(&mut gg, "blk.0", num_experts, &device)
-            .expect("load_packed_experts");
+        let (experts, packed_gate, packed_up, packed_down) =
+            SparseMoeBlock::load_packed_experts(&mut gg, "blk.0", num_experts, &device)
+                .expect("load_packed_experts");
 
         assert_eq!(experts.len(), num_experts);
+        assert!(
+            packed_gate.is_none() && packed_up.is_none() && packed_down.is_none(),
+            "CPU device is never fused-eligible, so per-expert slicing must run"
+        );
         for expert in &experts {
             assert!(
                 matches!(expert.gate_proj, LinearLayer::Quantized(_)),
