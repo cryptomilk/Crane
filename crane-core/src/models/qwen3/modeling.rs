@@ -851,15 +851,39 @@ impl DecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let hidden_states = self.forward_attn(hidden_states, cos, sin, attention_mask)?;
+        self.forward_mlp(&hidden_states)
+    }
+
+    /// Attention half: input layernorm, self-attention, residual add.
+    ///
+    /// Split out from [`Self::forward`] so [`Qwen3Model::decode`] can prune
+    /// hidden states to only the output-needing positions between this and
+    /// [`Self::forward_mlp`] on the last layer, saving `MoE` expert
+    /// dispatches on positions whose hidden states would otherwise be
+    /// discarded before `lm_head`. Self-attention must still see every
+    /// position (for KV cache correctness), so only the MLP half is
+    /// prunable.
+    fn forward_attn(
+        &mut self,
+        hidden_states: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let residual = hidden_states;
         let hidden_states = self.input_layernorm.forward(hidden_states)?;
         let hidden_states = self
             .self_attn
             .forward(&hidden_states, cos, sin, attention_mask)?;
-        let hidden_states = (residual + hidden_states)?;
+        residual + hidden_states
+    }
 
-        let residual = &hidden_states;
-        let hidden_states = self.post_attention_layernorm.forward(&hidden_states)?;
+    /// MLP half: post-attention layernorm, dense/`MoE` MLP, residual add.
+    /// See [`Self::forward_attn`] for why this is split out.
+    fn forward_mlp(&self, hidden_states: &Tensor) -> Result<Tensor> {
+        let residual = hidden_states;
+        let hidden_states = self.post_attention_layernorm.forward(hidden_states)?;
         let hidden_states = self.mlp.forward(&hidden_states)?;
         residual + hidden_states
     }
@@ -879,14 +903,21 @@ pub struct Qwen3Model {
     rotary_emb: RotaryEmbedding,
     config: Config,
     dtype: DType,
-    /// Full-sequence post-norm hidden states from the most recent forward
-    /// call — see [`Self::last_hidden_states`].
+    /// Post-norm hidden states from the most recent forward call.
+    ///
+    /// Shape is `[B, S, H]` in the common case, but `[B, 1, H]` (last
+    /// position only) when the last decoder layer is `MoE` and `seq_len > 1`,
+    /// because the `MoE` pruning optimization narrows hidden states before
+    /// the final MLP. See [`Self::last_hidden_states`].
     last_hidden_states: Option<Tensor>,
     /// KV cache representation in use, selected at construction either
     /// from `CRANE_KV_QUANT` or an explicit `kv_kind` argument (e.g.
     /// `--kv-quant`). Needed by [`Self::extract_batch_kv`] to decide
     /// whether to re-quantize.
     kv_kind: KvCacheKind,
+    /// Whether the last decoder layer uses a Mixture-of-Experts MLP,
+    /// cached at construction to avoid re-checking on every decode call.
+    last_layer_is_moe: bool,
 }
 
 /// `MoE` expert metadata read from GGUF, all `None` for dense
@@ -1156,6 +1187,10 @@ impl Qwen3Model {
             model_vb.device(),
         )?;
 
+        let last_layer_is_moe = layers
+            .last()
+            .is_some_and(|l| matches!(l.mlp, MlpOrMoe::Moe(_)));
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -1166,6 +1201,7 @@ impl Qwen3Model {
             dtype,
             last_hidden_states: None,
             kv_kind,
+            last_layer_is_moe,
         })
     }
 
@@ -1359,6 +1395,10 @@ impl Qwen3Model {
             device,
         )?;
 
+        let last_layer_is_moe = layers
+            .last()
+            .is_some_and(|l| matches!(l.mlp, MlpOrMoe::Moe(_)));
+
         let mut model = Self {
             embed_tokens,
             layers,
@@ -1369,6 +1409,7 @@ impl Qwen3Model {
             dtype,
             last_hidden_states: None,
             kv_kind,
+            last_layer_is_moe,
         };
 
         if is_moe_checkpoint
@@ -1724,29 +1765,69 @@ impl Qwen3Model {
             None
         };
 
+        // Only the last position's hidden state feeds `lm_head` below, but
+        // every position must still pass through every layer's
+        // self-attention (for KV cache correctness). When the last layer is
+        // MoE, its expert dispatch is otherwise wasted on the `seq_len - 1`
+        // positions this method discards anyway: prune to the last position
+        // right after that layer's attention, before its MoE MLP runs.
+        // Skipped for single-token decode (`seq_len == 1`, nothing to prune)
+        // and for a dense last layer (no MoE dispatch cost to save, and
+        // preserves full-sequence `last_hidden_states` for callers like
+        // MiniCPM-o's TTS conditioning).
+        let prune_last = seq_len > 1 && self.last_layer_is_moe;
+
         let mut hidden_states = hidden_states;
-        for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+        if let Some((last, rest)) = self.layers.split_last_mut() {
+            for layer in rest {
+                hidden_states =
+                    layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            }
+            if prune_last {
+                hidden_states =
+                    last.forward_attn(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                hidden_states = hidden_states.narrow(1, seq_len - 1, 1)?;
+                hidden_states = last.forward_mlp(&hidden_states)?;
+            } else {
+                hidden_states =
+                    last.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            }
         }
 
         let hidden_states = self.norm.forward(&hidden_states)?;
         // Cheap to stash: Tensor is Arc-backed, so this is a refcount bump,
-        // not a data copy. Lets callers that need the full-sequence
-        // post-norm hidden states (e.g. MiniCPM-o's TTS conditioning, which
-        // needs every generated position's hidden state, not just the
-        // last) get them via `last_hidden_states()` without changing this
-        // method's return type for every other caller.
+        // not a data copy. Lets callers that need the post-norm hidden
+        // states (e.g. MiniCPM-o's TTS conditioning, which needs every
+        // generated position's hidden state, not just the last) get them
+        // via `last_hidden_states()` without changing this method's return
+        // type for every other caller. Already pruned to the last position
+        // alone when `prune_last` fired above.
         self.last_hidden_states = Some(hidden_states.clone());
-        let logits = self
-            .lm_head
-            .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?;
+        debug_assert!(
+            prune_last || hidden_states.dim(1).is_ok_and(|s| s == seq_len),
+            "last_hidden_states seq dim mismatch: expected {seq_len}, got {:?}",
+            hidden_states.dim(1),
+        );
+        let logits = if prune_last {
+            self.lm_head.forward_logits(&hidden_states)?
+        } else {
+            self.lm_head
+                .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?
+        };
         Ok(logits)
     }
 
-    /// Full-sequence post-norm hidden states (`[B, S, H]`, pre-`lm_head`)
-    /// from the most recent [`Self::forward`]/[`Self::forward_embeds`] call.
-    /// See the field doc on why this exists instead of widening every
-    /// caller's return type.
+    /// Post-norm hidden states (pre-`lm_head`) from the most recent
+    /// [`Self::forward`]/[`Self::forward_embeds`] call.
+    ///
+    /// Shape is `[B, S, H]` normally, but `[B, 1, H]` (last position only)
+    /// when the last decoder layer is `MoE` and `seq_len > 1`. The `MoE`
+    /// pruning optimization narrows hidden states before that layer's MLP,
+    /// so only the output-relevant position survives. Callers that need the
+    /// full sequence should check `dim(1)`.
+    ///
+    /// Exists as a side-channel instead of widening every caller's return
+    /// type.
     #[must_use]
     pub fn last_hidden_states(&self) -> Option<&Tensor> {
         self.last_hidden_states.as_ref()
@@ -3038,5 +3119,110 @@ mod tests {
 
         assert_eq!(out_single.dims(), out_chunked.dims());
         assert!(max_abs_diff(&out_single, &out_chunked) < 1e-4);
+    }
+
+    // MoE last-layer pruning (narrowing hidden states to the last position
+    // between attention and MLP on the final layer when it is MoE) must not
+    // change the model's output. Verify by comparing a multi-token prefill
+    // (which triggers the prune path) against single-token-at-a-time
+    // decoding through the same weights (which never prunes because
+    // `seq_len == 1`).
+    #[test]
+    fn test_moe_last_layer_prune_matches_incremental_decode() {
+        // 2 layers, all MoE (decoder_sparse_step: None), so
+        // `prune_last` fires when seq_len > 1.
+        let cfg = moe_layer_config(2, None);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model_prefill = Qwen3Model::new(&cfg, vb.clone(), &device, &GpuBudget::default())
+            .expect("model_prefill");
+        let mut model_incr =
+            Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("model_incr");
+
+        assert!(
+            matches!(
+                model_prefill.layers.last().expect("layers").mlp,
+                MlpOrMoe::Moe(_)
+            ),
+            "last layer should be MoE for this test",
+        );
+
+        // Multi-token prefill: seq_len=3 > 1, triggers prune path.
+        let prefill_ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("prefill_ids");
+        let logits_prefill = model_prefill
+            .forward(&prefill_ids, 0)
+            .expect("prefill forward");
+
+        // Incremental decode: feed tokens one at a time (never prunes).
+        let t1 = Tensor::new(&[[1u32]], &device).expect("t1");
+        let t2 = Tensor::new(&[[2u32]], &device).expect("t2");
+        let t3 = Tensor::new(&[[3u32]], &device).expect("t3");
+        model_incr.forward(&t1, 0).expect("incr t1");
+        model_incr.forward(&t2, 1).expect("incr t2");
+        let logits_incr = model_incr.forward(&t3, 2).expect("incr t3");
+
+        // Both produce logits for the last position given the same
+        // context; they must match.
+        assert_eq!(logits_prefill.dims(), logits_incr.dims());
+        assert!(
+            max_abs_diff(&logits_prefill, &logits_incr) < 1e-4,
+            "MoE pruned prefill diverged from incremental decode",
+        );
+    }
+
+    // When the last layer is dense (not MoE), the pruning optimization
+    // must not fire and `last_hidden_states` must retain the full sequence
+    // dimension.
+    #[test]
+    fn test_dense_last_layer_preserves_full_hidden_states() {
+        // 3 layers, step=2: layers [dense, MoE, dense]. Last is dense,
+        // so prune_last stays false.
+        let cfg = moe_layer_config(3, Some(2));
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        assert!(
+            matches!(model.layers.last().expect("layers").mlp, MlpOrMoe::Dense(_)),
+            "last layer should be dense for this test",
+        );
+
+        let ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("ids");
+        model.forward(&ids, 0).expect("forward");
+
+        let hidden = model
+            .last_hidden_states()
+            .expect("last_hidden_states should be Some");
+        assert_eq!(
+            hidden.dims(),
+            &[1, 3, 16],
+            "dense last layer should preserve full sequence in hidden states",
+        );
+    }
+
+    // When pruning fires, `last_hidden_states` should be narrowed to
+    // `[B, 1, H]`.
+    #[test]
+    fn test_moe_last_layer_prune_narrows_hidden_states() {
+        let cfg = moe_layer_config(2, None);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb, &device, &GpuBudget::default()).expect("new");
+
+        let ids = Tensor::new(&[[1u32, 2, 3]], &device).expect("ids");
+        model.forward(&ids, 0).expect("forward");
+
+        let hidden = model
+            .last_hidden_states()
+            .expect("last_hidden_states should be Some");
+        assert_eq!(
+            hidden.dims(),
+            &[1, 1, 16],
+            "MoE pruned path should narrow hidden states to last position",
+        );
     }
 }
