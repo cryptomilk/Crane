@@ -5,11 +5,24 @@ use std::convert::Infallible;
 use axum::response::sse::Event;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
+use tracing::trace;
 
 use crate::engine::EngineResponse;
 use crate::now_epoch;
 use crate::openai_api::*;
 use crate::sglang_api::*;
+
+/// Logs when an SSE stream's generator is dropped, so a debug session can
+/// tell whether axum ever tears down the stream on client disconnect (as
+/// opposed to it staying alive, e.g. because the connection is only
+/// half-closed and no write has failed yet).
+struct StreamDropTrace(String);
+
+impl Drop for StreamDropTrace {
+    fn drop(&mut self) {
+        trace!(id = %self.0, "SSE stream generator dropped");
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Chat completions SSE
@@ -28,6 +41,9 @@ pub fn make_chat_sse_stream(
     let created = now_epoch();
 
     async_stream::stream! {
+        trace!(id = %request_id, "Chat SSE stream started");
+        let _drop_trace = StreamDropTrace(request_id.clone());
+
         // Role announcement chunk.
         let first_chunk = ChatCompletionChunk {
             id: request_id.clone(),
@@ -193,6 +209,9 @@ pub fn make_completion_sse_stream(
     let created = now_epoch();
 
     async_stream::stream! {
+        trace!(id = %request_id, "Completion SSE stream started");
+        let _drop_trace = StreamDropTrace(request_id.clone());
+
         let mut _prompt_tokens = 0usize;
         let mut _completion_tokens = 0usize;
 
@@ -281,6 +300,9 @@ pub fn make_generate_sse_stream(
     mut rx: mpsc::UnboundedReceiver<EngineResponse>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
+        trace!(id = %request_id, "Generate SSE stream started");
+        let _drop_trace = StreamDropTrace(request_id.clone());
+
         while let Some(resp) = rx.recv().await {
             match resp {
                 EngineResponse::Token { text, .. } => {
