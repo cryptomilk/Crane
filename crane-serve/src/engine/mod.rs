@@ -51,7 +51,7 @@ use std::time::Instant;
 
 use candle_core::Tensor;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use backend::ModelBackend;
 use crane_core::utils::token_output_stream::TokenOutputStream;
@@ -821,6 +821,13 @@ impl InferenceEngine {
         let cancelled: Vec<String> = self
             .sequences
             .iter()
+            .inspect(|(id, seq)| {
+                trace!(
+                    id = %id,
+                    is_closed = seq.response_tx.is_closed(),
+                    "check_cancelled: sequence tx state",
+                );
+            })
             .filter(|(_, seq)| seq.response_tx.is_closed())
             .map(|(id, _)| id.clone())
             .collect();
@@ -892,6 +899,29 @@ impl InferenceEngine {
                 },
             };
             processed = chunk_end;
+
+            // A large prompt's prefill is chunked across multiple forward
+            // passes with no other yield point back to the engine loop, so
+            // a disconnect mid-prefill would otherwise run undetected until
+            // every remaining chunk finishes (see check_cancelled(), which
+            // only runs between steps).
+            if self
+                .sequences
+                .get(&seq_id)
+                .is_none_or(|s| s.response_tx.is_closed())
+            {
+                warn!(
+                    id = %seq_id,
+                    tokens_processed = processed,
+                    prompt_len,
+                    "Client disconnected mid-prefill",
+                );
+                self.stats
+                    .cancelled_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                self.cleanup_sequence(&seq_id);
+                return;
+            }
         }
 
         let logits = match logits {
@@ -1680,6 +1710,8 @@ impl InferenceEngine {
     }
 
     fn cleanup_sequence(&mut self, seq_id: &str) {
+        trace!(id = %seq_id, "cleanup_sequence: removing sequence from engine state");
+
         // Subtract this sequence's KV bytes from the tracked total.
         // If active, bytes are in the model (not in seq.kv_caches).
         let freed = if self.active_seq_id.as_deref() == Some(seq_id) {

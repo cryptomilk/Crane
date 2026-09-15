@@ -290,6 +290,10 @@ pub async fn flush_cache() -> impl IntoResponse {
 /// explicit abort via engine control channel is a future enhancement.
 pub async fn abort_request(Json(req): Json<AbortRequest>) -> impl IntoResponse {
     // TODO: Add explicit abort via engine control channel.
+    tracing::debug!(
+        rid = %req.rid,
+        "abort_request called but is currently a no-op (no engine control channel wired up)",
+    );
     Json(AbortResponse {
         success: true,
         message: format!(
