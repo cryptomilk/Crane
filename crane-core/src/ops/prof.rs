@@ -31,7 +31,7 @@ use candle_core::Device;
 /// The variants form four non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
-/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeExpert`] partition
+/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeFused`] partition
 /// [`Span::Mlp`] for `MoE` layers. Each tier is reported on its own line and
 /// should sum to its parent.
 #[derive(Clone, Copy)]
@@ -58,19 +58,21 @@ pub enum Span {
     MoeRouter,
     MoeToDevice,
     MoeExpert,
+    /// Fused `indexed_moe_forward` dispatch path (CUDA/ROCm).
+    MoeFused,
 }
 
-const NUM_SPANS: usize = 18;
+const NUM_SPANS: usize = 19;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
-const TIER2_MOE: std::ops::Range<usize> = 15..18;
+const TIER2_MOE: std::ops::Range<usize> = 15..19;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
     "proj", "conv", "qkv", "recur", "finish", //
     "prep", "launch", "post", //
-    "router", "to_dev", "expert",
+    "router", "to_dev", "expert", "fused",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
