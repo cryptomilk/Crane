@@ -21,6 +21,7 @@
 //! backend dispatch internally):
 //! - [`snake`] — fused Snake periodic activation
 //! - [`atan2`] — fused two-argument arctangent
+//! - [`topk_moe`] — fused top-K `MoE` routing (softmax + top-K + normalize)
 //!
 //! [`quant_attn`] is a third category: reusable and backend-dispatching like
 //! the two above, but with 3+ tensor inputs (past `CustomOp1`/`CustomOp2`'s
@@ -30,6 +31,7 @@
 pub mod atan2;
 pub mod quant_attn;
 pub mod snake;
+pub mod topk_moe;
 
 #[cfg(feature = "cuda")]
 mod cuda_impl;
