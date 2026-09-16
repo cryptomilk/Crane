@@ -60,12 +60,6 @@ use sampling::SamplingBuffers;
 use scheduler::{Scheduler, SchedulerOutput};
 use sequence::{Sequence, SequenceStatus};
 
-/// Maximum number of prompt tokens fed to a single `forward_step` during
-/// prefill. Larger prompts are split into chunks of this size so each forward
-/// step's intermediate state (causal-mask allocation, attention logits, GDN
-/// recurrent scratch) stays bounded. See [`InferenceEngine::step_prefill`].
-const PREFILL_CHUNK_SIZE: usize = 2048;
-
 /// Whether to log every tool-call grammar state transition and the
 /// resulting next-token mask (`CRANE_GRAMMAR_TRACE=1`).
 ///
@@ -131,6 +125,12 @@ pub struct InferenceEngine {
     stats: Arc<EngineStats>,
     /// How many tokens to decode for one sequence before switching.
     decode_tokens_per_seq: usize,
+    /// Maximum number of prompt tokens fed to a single `forward_step` during
+    /// prefill (see `--prefill-chunk-size`). Larger prompts are split into
+    /// chunks of this size so each forward step's intermediate state
+    /// (causal-mask allocation, attention logits, GDN recurrent scratch)
+    /// stays bounded. See [`InferenceEngine::step_prefill`].
+    prefill_chunk_size: usize,
     /// Engine start time for uptime calculation.
     start_time: Instant,
     /// Step counter for periodic stats logging.
@@ -168,6 +168,7 @@ impl InferenceEngine {
         model: Box<dyn ModelBackend>,
         max_concurrent: usize,
         decode_tokens_per_seq: usize,
+        prefill_chunk_size: usize,
         memory_config: MemoryConfig,
         uses_xml_tool_format: bool,
     ) -> (Self, EngineHandle) {
@@ -211,6 +212,7 @@ impl InferenceEngine {
             num_layers,
             stats: stats.clone(),
             decode_tokens_per_seq: decode_tokens_per_seq.max(1),
+            prefill_chunk_size: prefill_chunk_size.max(1),
             start_time: Instant::now(),
             step_counter: 0,
             sampling_buffers: SamplingBuffers::new(),
@@ -281,8 +283,11 @@ impl InferenceEngine {
             }
         }
         info!(
-            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, max_seq_len={})",
-            self.scheduler.max_running, self.decode_tokens_per_seq, max_seq_len_str,
+            "Engine started (max_concurrent={}, decode_tokens_per_seq={}, prefill_chunk_size={}, max_seq_len={})",
+            self.scheduler.max_running,
+            self.decode_tokens_per_seq,
+            self.prefill_chunk_size,
+            max_seq_len_str,
         );
 
         // Install candle's private, affinity-pinned rayon pool for the
@@ -885,7 +890,9 @@ impl InferenceEngine {
         let mut logits = None;
         let mut processed = 0usize;
         while processed < prompt_len {
-            let chunk_end = (processed + PREFILL_CHUNK_SIZE).min(prompt_len);
+            let chunk_end = processed
+                .saturating_add(self.prefill_chunk_size)
+                .min(prompt_len);
             let chunk = &input_ids[processed..chunk_end];
             let chunk_start_pos = start_pos + processed;
             logits = match self.model.forward_step(chunk, chunk_start_pos) {
@@ -968,7 +975,7 @@ impl InferenceEngine {
         info!(
             id = %seq_id,
             prompt_len,
-            prefill_chunks = prompt_len.div_ceil(PREFILL_CHUNK_SIZE),
+            prefill_chunks = prompt_len.div_ceil(self.prefill_chunk_size),
             prefill_ms = prefill_us / 1000,
             prefill_tok_s = format!("{:.1}", prefill_tok_s),
             "Prefill complete, first token generated",
