@@ -1690,8 +1690,16 @@ impl Qwen3Model {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(input_ids.device());
 
+        // Outermost pass boundary for `CRANE_PROF=1`: covers the whole
+        // forward (embedding lookup through `decode`), mirroring
+        // `qwen3_5::prefill::forward`'s use of the same timer.
+        let timer = crate::ops::prof::pass(seq_len);
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
-        self.decode(hidden_states, seq_len, start_pos, input_ids.device())
+        let out = self.decode(hidden_states, seq_len, start_pos, input_ids.device());
+        if let Some(timer) = timer {
+            timer.finish(input_ids.device());
+        }
+        out
     }
 
     /// Same as [`Self::forward`], but starting from a caller-supplied
@@ -1715,8 +1723,13 @@ impl Qwen3Model {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(inputs_embeds.device());
 
+        let timer = crate::ops::prof::pass(seq_len);
         let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
-        self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device())
+        let out = self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device());
+        if let Some(timer) = timer {
+            timer.finish(inputs_embeds.device());
+        }
+        out
     }
 
     /// Shared decoder body: rotary embeddings, causal mask, transformer
