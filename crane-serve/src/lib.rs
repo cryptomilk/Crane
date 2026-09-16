@@ -59,6 +59,18 @@ pub struct Args {
     pub max_concurrent: usize,
     #[arg(long, default_value_t = 16)]
     pub decode_tokens_per_seq: usize,
+    /// How many prompt tokens to process per forward pass. Long prompts
+    /// are automatically split into chunks of this size. Lowering it
+    /// reduces GPU memory usage during prompt processing (useful for long
+    /// prompts on memory-constrained GPUs), but may slightly slow down
+    /// prompt ingestion. Most users can leave this at the default.
+    ///
+    /// Qwen 3.5 models additionally re-chunk within each of these chunks
+    /// via their own `CRANE_PREFILL_CHUNK` env var (default 512), to bound
+    /// the attention matrix size of their full-attention layers; this flag
+    /// does not affect that inner chunk size.
+    #[arg(long, default_value_t = 2048)]
+    pub prefill_chunk_size: usize,
     #[arg(long, default_value = "auto")]
     pub format: String,
     /// In-situ quantization level for safetensors checkpoints (e.g. q4k,
@@ -1412,6 +1424,7 @@ pub async fn run(mut args: Args) -> Result<()> {
             backend,
             args.max_concurrent,
             args.decode_tokens_per_seq,
+            args.prefill_chunk_size,
             memory_config,
             engine::model_factory::uses_xml_tool_format(&args.model_path),
         );
@@ -1420,8 +1433,8 @@ pub async fn run(mut args: Args) -> Result<()> {
             .spawn(move || engine.run())
             .expect("Failed to spawn engine thread");
         info!(
-            "Inference engine started (max_concurrent={}, decode_tokens_per_seq={})",
-            args.max_concurrent, args.decode_tokens_per_seq
+            "Inference engine started (max_concurrent={}, decode_tokens_per_seq={}, prefill_chunk_size={})",
+            args.max_concurrent, args.decode_tokens_per_seq, args.prefill_chunk_size
         );
         (
             Some(handle),
