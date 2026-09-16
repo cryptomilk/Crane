@@ -21,9 +21,11 @@
 //! backend dispatch internally):
 //! - [`snake`] — fused Snake periodic activation
 //! - [`atan2`] — fused two-argument arctangent
+//! - [`topk_moe`] — fused top-K `MoE` routing (softmax + top-K + normalize)
 
 pub mod atan2;
 pub mod snake;
+pub mod topk_moe;
 
 #[cfg(feature = "cuda")]
 mod cuda_impl;

@@ -752,17 +752,11 @@ impl Module for SparseMoeBlock {
         let (topk_ids, topk_weights) =
             prof::timed(Span::MoeRouter, || -> Result<(Tensor, Tensor)> {
                 let logits = self.gate.forward(&xs_f32)?;
-                let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-                let topk_ids = probs
-                    .arg_sort_last_dim(false)?
-                    .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-                    .contiguous()?;
-                let mut topk_weights = probs.gather(&topk_ids, D::Minus1)?;
-                if self.norm_topk_prob {
-                    let sum = topk_weights.sum_keepdim(D::Minus1)?;
-                    topk_weights = topk_weights.broadcast_div(&sum)?;
-                }
-                Ok((topk_ids, topk_weights))
+                crate::ops::fused_ops::topk_moe::topk_moe_routing(
+                    &logits,
+                    self.num_experts_per_tok,
+                    self.norm_topk_prob,
+                )
             })?;
 
         // Fused GPU MoE dispatch (Phase 8a, CUDA/ROCm only): 3 kernel
