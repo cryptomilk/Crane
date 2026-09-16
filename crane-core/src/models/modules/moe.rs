@@ -34,15 +34,23 @@ pub struct MoeConfig {
 ///
 /// A `SiLU`-gated MLP identical in shape to a dense Qwen3 `Mlp`, but sized to
 /// `moe_intermediate_size` rather than the model's dense `intermediate_size`.
-#[allow(clippy::struct_field_names)]
 pub struct MoeExpert {
-    gate_proj: LinearLayer,
-    up_proj: LinearLayer,
+    /// Fused gate+up projection, `(2 * moe_intermediate_size, hidden_size)`.
+    /// The first half of the output is the gate projection, the second half
+    /// is up (see [`fuse_quantized_qtensors`]). Fusing the two into one
+    /// matmul halves the kernel launches this step needs.
+    gate_up_proj: LinearLayer,
     down_proj: LinearLayer,
+    /// Output size of the gate/up half, i.e. `moe_intermediate_size`. Needed
+    /// to split `gate_up_proj`'s fused output back into gate and up halves.
+    intermediate_size: usize,
 }
 
 impl MoeExpert {
     /// Create an expert from a safetensors checkpoint.
+    ///
+    /// Fuses the separately-stored `gate_proj` and `up_proj` weights into a
+    /// single `gate_up_proj` via `Tensor::cat`.
     ///
     /// # Arguments
     /// * `hidden_size` - Model hidden dimension (input/output size)
@@ -57,15 +65,19 @@ impl MoeExpert {
         let gate_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
         let up_proj = linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
         let down_proj = linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+        let gate_up_weight = Tensor::cat(&[gate_proj.weight(), up_proj.weight()], 0)?;
         Ok(Self {
-            gate_proj: LinearLayer::Standard(gate_proj),
-            up_proj: LinearLayer::Standard(up_proj),
+            gate_up_proj: LinearLayer::Standard(Linear::new(gate_up_weight, None)),
             down_proj: LinearLayer::Standard(down_proj),
+            intermediate_size,
         })
     }
 
     /// Create an expert from a GGUF checkpoint using the per-expert tensor
     /// layout (`blk.{layer_idx}.ffn_gate.{expert_idx}.weight`, etc.).
+    ///
+    /// Fuses the separately-stored gate and up `QTensor`s into a single
+    /// `gate_up_proj` via [`fuse_quantized_qtensors`].
     ///
     /// # Arguments
     /// * `gg` - GGUF reader
@@ -83,51 +95,59 @@ impl MoeExpert {
         device: &Device,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
-        let gate_proj = gg.linear_on(&format!("{prefix}.ffn_gate.{expert_idx}.weight"), device)?;
-        let up_proj = gg.linear_on(&format!("{prefix}.ffn_up.{expert_idx}.weight"), device)?;
+        let gate_qt = gg.tensor_on(&format!("{prefix}.ffn_gate.{expert_idx}.weight"), device)?;
+        let up_qt = gg.tensor_on(&format!("{prefix}.ffn_up.{expert_idx}.weight"), device)?;
+        let intermediate_size = gate_qt.shape().dims()[0];
         let down_proj = gg.linear_on(&format!("{prefix}.ffn_down.{expert_idx}.weight"), device)?;
+        let gate_up_qt = fuse_quantized_qtensors(&gate_qt, &up_qt, device)?;
+        let gate_up_proj = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(gate_up_qt))?);
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size,
         })
     }
 
     /// Build an expert directly from already-loaded projections.
     ///
     /// Used by [`SparseMoeBlock::new_from_gguf`] for the packed GGUF expert
-    /// layout, where the three projections come from byte-slicing a shared
-    /// 3D tensor rather than loading per-expert tensors.
-    fn from_layers(gate_proj: LinearLayer, up_proj: LinearLayer, down_proj: LinearLayer) -> Self {
+    /// layout, where the projections come from byte-slicing a shared 3D
+    /// tensor rather than loading per-expert tensors.
+    fn from_layers(
+        gate_up_proj: LinearLayer,
+        down_proj: LinearLayer,
+        intermediate_size: usize,
+    ) -> Self {
         Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size,
         }
     }
 
-    /// Moves all three projections to `device`, in `dtype`. See
+    /// Moves both projections to `device`, in `dtype`. See
     /// [`LinearLayer::to_device`] for the `Quantized` dequantization
     /// tradeoff this implies and why `dtype` must match the model's
     /// compute dtype.
     ///
     /// # Errors
     ///
-    /// Returns an error if any projection's device transfer fails.
+    /// Returns an error if either projection's device transfer fails.
     pub fn to_device(&self, device: &Device, dtype: DType) -> Result<Self> {
         Ok(Self {
-            gate_proj: self.gate_proj.to_device(device, dtype)?,
-            up_proj: self.up_proj.to_device(device, dtype)?,
+            gate_up_proj: self.gate_up_proj.to_device(device, dtype)?,
             down_proj: self.down_proj.to_device(device, dtype)?,
+            intermediate_size: self.intermediate_size,
         })
     }
 }
 
 impl Module for MoeExpert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?;
+        let gate_up = self.gate_up_proj.forward(xs)?;
+        let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
         let gate = Activation::Silu.forward(&gate)?;
-        let up = self.up_proj.forward(xs)?;
         self.down_proj.forward(&(gate * up)?)
     }
 }
@@ -145,18 +165,15 @@ pub struct SparseMoeBlock {
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     expert_device: Device,
-    /// Packed `(num_experts, moe_intermediate, hidden)` gate-projection
-    /// weights for the fused `indexed_moe_forward` dispatch path (CUDA/ROCm
-    /// only). `Some` only when [`supports_fused_moe`] held for every packed
-    /// projection at load time; `experts` is left empty in that case since
-    /// the fused path replaces the per-expert loop entirely (see
-    /// [`load_packed_experts`]'s doc comment on why both aren't kept).
-    packed_gate_exps: Option<Arc<QTensor>>,
-    /// Packed `(num_experts, moe_intermediate, hidden)` up-projection
-    /// weights. See [`Self::packed_gate_exps`].
-    packed_up_exps: Option<Arc<QTensor>>,
+    /// Packed `(num_experts, 2 * moe_intermediate, hidden)` fused gate+up
+    /// projection weights for the fused `indexed_moe_forward` dispatch path
+    /// (CUDA/ROCm only). `Some` only when [`supports_fused_moe`] held for
+    /// every packed projection at load time; `experts` is left empty in
+    /// that case since the fused path replaces the per-expert loop entirely
+    /// (see [`load_packed_experts`]'s doc comment on why both aren't kept).
+    packed_gate_up_exps: Option<Arc<QTensor>>,
     /// Packed `(num_experts, hidden, moe_intermediate)` down-projection
-    /// weights. See [`Self::packed_gate_exps`].
+    /// weights. See [`Self::packed_gate_up_exps`].
     packed_down_exps: Option<Arc<QTensor>>,
 }
 
@@ -200,8 +217,7 @@ impl SparseMoeBlock {
             num_experts_per_tok: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
             expert_device: expert_device.clone(),
-            packed_gate_exps: None,
-            packed_up_exps: None,
+            packed_gate_up_exps: None,
             packed_down_exps: None,
         })
     }
@@ -236,8 +252,9 @@ impl SparseMoeBlock {
         let gate = LinearLayer::Standard(Linear::new(gate_weight, None));
 
         let packed_name = format!("{prefix}.ffn_gate_exps.weight");
-        let (experts, packed_gate_exps, packed_up_exps, packed_down_exps) =
-            if gg.contains_tensor(&packed_name) {
+        let fused_packed_name = format!("{prefix}.ffn_gate_up_exps.weight");
+        let (experts, packed_gate_up_exps, packed_down_exps) =
+            if gg.contains_tensor(&packed_name) || gg.contains_tensor(&fused_packed_name) {
                 Self::load_packed_experts(gg, &prefix, config.num_experts, expert_device)?
             } else {
                 let experts = (0..config.num_experts)
@@ -245,7 +262,7 @@ impl SparseMoeBlock {
                         MoeExpert::new_from_gguf(gg, layer_idx, expert_idx, expert_device)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                (experts, None, None, None)
+                (experts, None, None)
             };
 
         Ok(Self {
@@ -254,8 +271,7 @@ impl SparseMoeBlock {
             num_experts_per_tok: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
             expert_device: expert_device.clone(),
-            packed_gate_exps,
-            packed_up_exps,
+            packed_gate_up_exps,
             packed_down_exps,
         })
     }
@@ -264,13 +280,21 @@ impl SparseMoeBlock {
     /// projection is a single 3D tensor `[num_experts, out, in]` covering all
     /// experts, loaded onto `expert_device`.
     ///
-    /// When [`supports_fused_moe`] holds for every projection's quant type
-    /// (CUDA/`ROCm`, `Q2K`-`Q6K` or `Q8_0`), the packed tensors are kept intact and
-    /// returned directly for Phase 8a's `indexed_moe_forward` dispatch, with
-    /// an empty `Vec<MoeExpert>`. Keeping both the packed and per-expert
-    /// copies would double GPU memory for expert weights. Otherwise (CPU,
-    /// Metal, or an unsupported quant type), falls back to byte-slicing each
-    /// packed tensor into per-expert 2D `QTensor`s without dequantizing.
+    /// Gate and up are always fused into one `[num_experts, 2*out, in]`
+    /// tensor before further processing: either loaded directly from a
+    /// pre-fused `ffn_gate_up_exps` tensor (some GGUF converters emit this),
+    /// or by fusing separate `ffn_gate_exps`/`ffn_up_exps` tensors via
+    /// [`fuse_packed_qtensors`]. This halves the matmul kernel launches
+    /// `SparseMoeBlock::forward` needs for that step.
+    ///
+    /// When [`supports_fused_moe`] holds for the fused gate+up and down
+    /// projections' quant types (CUDA/`ROCm`, `Q2K`-`Q6K` or `Q8_0`), the
+    /// packed tensors are kept intact and returned directly for Phase 8a's
+    /// `indexed_moe_forward` dispatch, with an empty `Vec<MoeExpert>`.
+    /// Keeping both the packed and per-expert copies would double GPU
+    /// memory for expert weights. Otherwise (CPU, Metal, or an unsupported
+    /// quant type), falls back to byte-slicing each packed tensor into
+    /// per-expert 2D `QTensor`s without dequantizing.
     ///
     /// Expert boundaries align with quantization block boundaries for every
     /// standard GGML block size (a Qwen3-Coder-30B-A3B expert is
@@ -291,62 +315,51 @@ impl SparseMoeBlock {
         prefix: &str,
         num_experts: usize,
         expert_device: &Device,
-    ) -> Result<(
-        Vec<MoeExpert>,
-        Option<Arc<QTensor>>,
-        Option<Arc<QTensor>>,
-        Option<Arc<QTensor>>,
-    )> {
-        let gate_packed = gg.tensor_on(&format!("{prefix}.ffn_gate_exps.weight"), expert_device)?;
-        let up_packed = gg.tensor_on(&format!("{prefix}.ffn_up_exps.weight"), expert_device)?;
+    ) -> Result<(Vec<MoeExpert>, Option<Arc<QTensor>>, Option<Arc<QTensor>>)> {
         let down_packed = gg.tensor_on(&format!("{prefix}.ffn_down_exps.weight"), expert_device)?;
-
-        // Shape is [num_experts, out_dim, in_dim]; gate/up share one shape,
-        // down has its own (in_dim/out_dim swapped relative to gate/up).
-        let gate_dims = gate_packed.shape().dims();
-        if gate_dims[0] != num_experts {
-            candle_core::bail!(
-                "{prefix}: config num_experts={num_experts} does not match packed tensor's expert dim {}",
-                gate_dims[0]
-            );
-        }
-        let (gate_up_out, gate_up_in) = (gate_dims[1], gate_dims[2]);
-        let down_dims = down_packed.shape().dims();
+        let down_dims = down_packed.shape().dims().to_vec();
         let (down_out, down_in) = (down_dims[1], down_dims[2]);
-
-        let gate_dtype = gate_packed.dtype();
-        let up_dtype = up_packed.dtype();
         let down_dtype = down_packed.dtype();
 
-        if supports_fused_moe(expert_device, gate_dtype)
-            && supports_fused_moe(expert_device, up_dtype)
+        let fused_name = format!("{prefix}.ffn_gate_up_exps.weight");
+        let gate_up_packed = if gg.contains_tensor(&fused_name) {
+            gg.tensor_on(&fused_name, expert_device)?
+        } else {
+            let gate_packed =
+                gg.tensor_on(&format!("{prefix}.ffn_gate_exps.weight"), expert_device)?;
+            let up_packed = gg.tensor_on(&format!("{prefix}.ffn_up_exps.weight"), expert_device)?;
+            fuse_packed_qtensors(&gate_packed, &up_packed, expert_device)?
+        };
+
+        // Shape is [num_experts, out_dim, in_dim].
+        let gate_up_dims = gate_up_packed.shape().dims();
+        if gate_up_dims[0] != num_experts {
+            candle_core::bail!(
+                "{prefix}: config num_experts={num_experts} does not match packed tensor's expert dim {}",
+                gate_up_dims[0]
+            );
+        }
+        let (gate_up_out, gate_up_in) = (gate_up_dims[1], gate_up_dims[2]);
+        let gate_up_dtype = gate_up_packed.dtype();
+
+        if supports_fused_moe(expert_device, gate_up_dtype)
             && supports_fused_moe(expert_device, down_dtype)
         {
             return Ok((
                 Vec::new(),
-                Some(Arc::new(gate_packed)),
-                Some(Arc::new(up_packed)),
+                Some(Arc::new(gate_up_packed)),
                 Some(Arc::new(down_packed)),
             ));
         }
 
-        let gate_raw = gate_packed.data()?;
-        let up_raw = up_packed.data()?;
+        let gate_up_raw = gate_up_packed.data()?;
         let down_raw = down_packed.data()?;
 
         let experts = (0..num_experts)
             .map(|i| {
-                let gate_qt = slice_packed_qtensor(
-                    &gate_raw,
-                    gate_dtype,
-                    i,
-                    gate_up_out,
-                    gate_up_in,
-                    expert_device,
-                )?;
-                let up_qt = slice_packed_qtensor(
-                    &up_raw,
-                    up_dtype,
+                let gate_up_qt = slice_packed_qtensor(
+                    &gate_up_raw,
+                    gate_up_dtype,
                     i,
                     gate_up_out,
                     gate_up_in,
@@ -361,13 +374,13 @@ impl SparseMoeBlock {
                     expert_device,
                 )?;
                 Ok(MoeExpert::from_layers(
-                    LinearLayer::Quantized(QMatMul::from_arc(Arc::new(gate_qt))?),
-                    LinearLayer::Quantized(QMatMul::from_arc(Arc::new(up_qt))?),
+                    LinearLayer::Quantized(QMatMul::from_arc(Arc::new(gate_up_qt))?),
                     LinearLayer::Quantized(QMatMul::from_arc(Arc::new(down_qt))?),
+                    gate_up_out / 2,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((experts, None, None, None))
+        Ok((experts, None, None))
     }
 
     /// Moves every expert's weights to `device`, in `dtype`, updating
@@ -389,9 +402,7 @@ impl SparseMoeBlock {
             return Ok(());
         }
         debug_assert!(
-            self.packed_gate_exps.is_none()
-                && self.packed_up_exps.is_none()
-                && self.packed_down_exps.is_none(),
+            self.packed_gate_up_exps.is_none() && self.packed_down_exps.is_none(),
             "promote_experts_to called on a block with packed tensors; \
              the fused path's packed QTensors would not be migrated"
         );
@@ -463,38 +474,40 @@ impl SparseMoeBlock {
         Ok(())
     }
 
-    /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a): three
-    /// kernel launches (gate, up, down) against the packed 3D expert
+    /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a/10): two
+    /// kernel launches (gate+up, down) against the packed 3D expert
     /// tensors, instead of a per-expert `index_select`/`forward`/`index_add`
     /// loop. `topk_ids`/`topk_weights` stay on-device throughout.
     ///
-    /// `xs_f32` is `(num_tokens, hidden_size)`. For the gate/up projections,
+    /// `xs_f32` is `(num_tokens, hidden_size)`. For the gate+up projection,
     /// every routed expert of a token shares the same input row
     /// (`indexed_moe_forward`'s `input_dim1 == 1` case), so `xs_f32` is
-    /// unsqueezed to `(num_tokens, 1, hidden_size)`. For the down
-    /// projection, each routed expert has its own intermediate activation
-    /// (`input_dim1 == topk`), which the `(num_tokens, topk,
-    /// moe_intermediate_size)` `hidden` tensor already matches.
+    /// unsqueezed to `(num_tokens, 1, hidden_size)`. Its fused output,
+    /// `(num_tokens, topk, 2*moe_intermediate_size)`, is split back into
+    /// gate and up halves. For the down projection, each routed expert has
+    /// its own intermediate activation (`input_dim1 == topk`), which the
+    /// `(num_tokens, topk, moe_intermediate_size)` `hidden` tensor already
+    /// matches.
     ///
     /// # Errors
     ///
     /// Returns an error if any `indexed_moe_forward` call fails (e.g. a
     /// device/dtype mismatch) or if a tensor op fails.
-    #[allow(clippy::too_many_arguments)]
     fn fused_forward(
         xs_f32: &Tensor,
         topk_ids: &Tensor,
         topk_weights: &Tensor,
-        gate_exps: &QTensor,
-        up_exps: &QTensor,
+        gate_up_exps: &QTensor,
         down_exps: &QTensor,
         original_dtype: DType,
         original_dims: &[usize],
     ) -> Result<Tensor> {
+        let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
         let xs_3d = xs_f32.unsqueeze(1)?.contiguous()?;
-        let gate_out = gate_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
-        let up_out = up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
-        let hidden = (Activation::Silu.forward(&gate_out)? * up_out)?.contiguous()?;
+        let gate_up_out = gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
+        let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
+        let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
+        let hidden = (Activation::Silu.forward(&gate)? * up)?.contiguous()?;
         let down_out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
 
         Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
@@ -588,6 +601,112 @@ fn slice_packed_qtensor(
     )
 }
 
+/// Fuses two 2D `[rows, cols]` `QTensor`s (e.g. one expert's gate and up
+/// projections) into a single `[2*rows, cols]` `QTensor` by concatenating
+/// their raw quantized bytes, without dequantizing. Valid because each
+/// tensor's rows are laid out as whole quantization blocks: appending `b`'s
+/// bytes after `a`'s produces exactly the byte layout `qtensor_from_ggml`
+/// expects for a `[a_rows + b_rows, cols]` tensor.
+///
+/// # Errors
+///
+/// Returns an error if `a` and `b` have different quant dtypes or column
+/// counts, or if `qtensor_from_ggml` fails.
+fn fuse_quantized_qtensors(a: &QTensor, b: &QTensor, device: &Device) -> Result<QTensor> {
+    if a.dtype() != b.dtype() {
+        candle_core::bail!(
+            "fuse_quantized_qtensors: mismatched dtypes {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        );
+    }
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    if a_dims[1] != b_dims[1] {
+        candle_core::bail!(
+            "fuse_quantized_qtensors: mismatched column counts {} vs {}",
+            a_dims[1],
+            b_dims[1]
+        );
+    }
+    let a_raw = a.data()?;
+    let b_raw = b.data()?;
+    let mut fused = Vec::with_capacity(a_raw.len() + b_raw.len());
+    fused.extend_from_slice(&a_raw);
+    fused.extend_from_slice(&b_raw);
+    qtensor_from_ggml(
+        a.dtype(),
+        &fused,
+        vec![a_dims[0] + b_dims[0], a_dims[1]],
+        device,
+    )
+}
+
+/// Fuses two packed 3D `[num_experts, n, k]` `QTensor`s (e.g. `gate_exps`
+/// and `up_exps`) into a single `[num_experts, 2*n, k]` `QTensor`, without
+/// dequantizing.
+///
+/// Unlike [`fuse_quantized_qtensors`], the two source tensors' bytes can't
+/// simply be concatenated end-to-end: that would order all of `a`'s experts
+/// before all of `b`'s, giving a `[2*num_experts, n, k]` layout instead of
+/// the `[num_experts, 2*n, k]` one `indexed_moe_forward`'s per-expert stride
+/// arithmetic expects. Instead, each expert's bytes are interleaved: `a`'s
+/// slice for expert `i` followed by `b`'s slice for expert `i`, for every
+/// `i`.
+///
+/// # Errors
+///
+/// Returns an error if `a` and `b` have different quant dtypes, expert
+/// counts, or `k` dimensions; if either tensor's per-expert element count
+/// isn't a whole number of quantization blocks; or if `qtensor_from_ggml`
+/// fails.
+fn fuse_packed_qtensors(a: &QTensor, b: &QTensor, device: &Device) -> Result<QTensor> {
+    if a.dtype() != b.dtype() {
+        candle_core::bail!(
+            "fuse_packed_qtensors: mismatched dtypes {:?} vs {:?}",
+            a.dtype(),
+            b.dtype()
+        );
+    }
+    let a_dims = a.shape().dims();
+    let b_dims = b.shape().dims();
+    if a_dims[0] != b_dims[0] || a_dims[2] != b_dims[2] {
+        candle_core::bail!("fuse_packed_qtensors: shape mismatch {a_dims:?} vs {b_dims:?}");
+    }
+    let num_experts = a_dims[0];
+    let block_size = a.dtype().block_size();
+    let a_expert_elems = a_dims[1] * a_dims[2];
+    let b_expert_elems = b_dims[1] * b_dims[2];
+    if !a_expert_elems.is_multiple_of(block_size) || !b_expert_elems.is_multiple_of(block_size) {
+        candle_core::bail!(
+            "fuse_packed_qtensors: expert element counts {a_expert_elems}/{b_expert_elems} \
+             not divisible by block size {block_size}"
+        );
+    }
+    let a_raw = a.data()?;
+    let b_raw = b.data()?;
+    if !a_raw.len().is_multiple_of(num_experts) || !b_raw.len().is_multiple_of(num_experts) {
+        candle_core::bail!(
+            "fuse_packed_qtensors: raw byte lengths {}/{} not divisible by expert count {num_experts}",
+            a_raw.len(),
+            b_raw.len(),
+        );
+    }
+    let bytes_per_expert_a = a_raw.len() / num_experts;
+    let bytes_per_expert_b = b_raw.len() / num_experts;
+    let mut fused = Vec::with_capacity(a_raw.len() + b_raw.len());
+    for i in 0..num_experts {
+        fused.extend_from_slice(&a_raw[i * bytes_per_expert_a..(i + 1) * bytes_per_expert_a]);
+        fused.extend_from_slice(&b_raw[i * bytes_per_expert_b..(i + 1) * bytes_per_expert_b]);
+    }
+    qtensor_from_ggml(
+        a.dtype(),
+        &fused,
+        vec![num_experts, a_dims[1] + b_dims[1], a_dims[2]],
+        device,
+    )
+}
+
 /// Copies a [`LinearLayer`] to `device`, preserving quantization.
 ///
 /// Unlike [`LinearLayer::to_device`] (which dequantizes `Quantized`
@@ -636,18 +755,18 @@ fn copy_linear_to_device(layer: &LinearLayer, device: &Device) -> Result<LinearL
     }
 }
 
-/// Copies all three of an [`MoeExpert`]'s projections to `device` via
+/// Copies both of an [`MoeExpert`]'s projections to `device` via
 /// [`copy_linear_to_device`], for use as a short-lived GPU-resident copy
 /// of a CPU-offloaded expert (see [`SparseMoeBlock::forward`]).
 ///
 /// # Errors
 ///
-/// Returns an error if any projection's device transfer fails.
+/// Returns an error if either projection's device transfer fails.
 fn copy_expert_to_device(expert: &MoeExpert, device: &Device) -> Result<MoeExpert> {
     Ok(MoeExpert::from_layers(
-        copy_linear_to_device(&expert.gate_proj, device)?,
-        copy_linear_to_device(&expert.up_proj, device)?,
+        copy_linear_to_device(&expert.gate_up_proj, device)?,
         copy_linear_to_device(&expert.down_proj, device)?,
+        expert.intermediate_size,
     ))
 }
 
@@ -695,10 +814,10 @@ fn stack_projection(
 
 /// Attempts single-shot batched promotion of `experts` to `device` in
 /// `dtype`: all experts' same projection stacked into one tensor and
-/// transferred with one device allocation per projection (3 total)
-/// instead of one per expert projection (`3 * experts.len()`).
+/// transferred with one device allocation per projection (2 total)
+/// instead of one per expert projection (`2 * experts.len()`).
 ///
-/// Exists because transferring `3 * num_experts` small tensors
+/// Exists because transferring `2 * num_experts` small tensors
 /// individually (`SparseMoeBlock::promote_experts_to`'s per-expert
 /// fallback loop below) measured a fixed ~1MB overhead per allocation on
 /// ROCm — ~0.4G of pure overhead on top of the tensors' actual combined
@@ -714,10 +833,7 @@ fn batched_promote(
     if experts.is_empty() {
         return Ok(None);
     }
-    let Some(gate_all) = stack_projection(experts, device, dtype, |e| &e.gate_proj)? else {
-        return Ok(None);
-    };
-    let Some(up_all) = stack_projection(experts, device, dtype, |e| &e.up_proj)? else {
+    let Some(gate_up_all) = stack_projection(experts, device, dtype, |e| &e.gate_up_proj)? else {
         return Ok(None);
     };
     let Some(down_all) = stack_projection(experts, device, dtype, |e| &e.down_proj)? else {
@@ -725,19 +841,20 @@ fn batched_promote(
     };
     if let Some((free, mem_total)) = query_gpu_memory(device) {
         log::debug!(
-            "batched promotion to {:?}: {} experts transferred in 3 allocations, free={}, total={}",
+            "batched promotion to {:?}: {} experts transferred in 2 allocations, free={}, total={}",
             device.location(),
             experts.len(),
             format_budget(free),
             format_budget(mem_total),
         );
     }
+    let intermediate_size = experts[0].intermediate_size;
     (0..experts.len())
         .map(|i| {
             Ok(MoeExpert::from_layers(
-                LinearLayer::Standard(Linear::new(narrow_packed_expert(&gate_all, i)?, None)),
-                LinearLayer::Standard(Linear::new(narrow_packed_expert(&up_all, i)?, None)),
+                LinearLayer::Standard(Linear::new(narrow_packed_expert(&gate_up_all, i)?, None)),
                 LinearLayer::Standard(Linear::new(narrow_packed_expert(&down_all, i)?, None)),
+                intermediate_size,
             ))
         })
         .collect::<Result<Vec<_>>>()
@@ -764,23 +881,20 @@ impl Module for SparseMoeBlock {
                 )
             })?;
 
-        // Fused GPU MoE dispatch (Phase 8a, CUDA/ROCm only): 3 kernel
-        // launches (gate, up, down) instead of the per-expert loop below,
+        // Fused GPU MoE dispatch (Phase 8a/10, CUDA/ROCm only): 2 kernel
+        // launches (gate+up, down) instead of the per-expert loop below,
         // with `topk_ids`/`topk_weights` staying on-device throughout (no
         // CPU sync). Only set when `load_packed_experts` found every packed
         // projection's quant type eligible; see `supports_fused_moe`.
-        if let (Some(gate_exps), Some(up_exps), Some(down_exps)) = (
-            &self.packed_gate_exps,
-            &self.packed_up_exps,
-            &self.packed_down_exps,
-        ) {
+        if let (Some(gate_up_exps), Some(down_exps)) =
+            (&self.packed_gate_up_exps, &self.packed_down_exps)
+        {
             return prof::timed(Span::MoeFused, || {
                 Self::fused_forward(
                     &xs_f32,
                     &topk_ids,
                     &topk_weights,
-                    gate_exps,
-                    up_exps,
+                    gate_up_exps,
                     down_exps,
                     original_dtype,
                     &original_dims,
@@ -1156,6 +1270,96 @@ mod tests {
         }
     }
 
+    // GgmlDType::F32 quantization is lossless, so this exercises the real
+    // byte-concat path with exact value comparisons.
+    #[test]
+    fn test_fuse_quantized_qtensors() {
+        use candle_core::quantized::GgmlDType;
+
+        // gate: [rows=2, cols=4] filled with 1.0; up: [rows=3, cols=4] filled
+        // with 2.0. Different row counts to catch a bug that assumes equal
+        // sizes.
+        let device = &Device::Cpu;
+        let gate_tensor = Tensor::from_vec(vec![1.0f32; 2 * 4], (2, 4), device).expect("gate");
+        let up_tensor = Tensor::from_vec(vec![2.0f32; 3 * 4], (3, 4), device).expect("up");
+        let gate = QTensor::quantize(&gate_tensor, GgmlDType::F32).expect("quantize gate");
+        let up = QTensor::quantize(&up_tensor, GgmlDType::F32).expect("quantize up");
+
+        let fused = fuse_quantized_qtensors(&gate, &up, device).expect("fuse");
+        assert_eq!(fused.shape().dims(), &[5, 4]);
+        assert_eq!(fused.dtype(), GgmlDType::F32);
+
+        let vals = fused
+            .dequantize(device)
+            .expect("dequantize")
+            .to_vec2::<f32>()
+            .expect("to_vec2");
+        for row in &vals[0..2] {
+            assert!(row.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        }
+        for row in &vals[2..5] {
+            assert!(row.iter().all(|&v| (v - 2.0).abs() < 1e-6));
+        }
+    }
+
+    // GgmlDType::F32 quantization is lossless, so this exercises the real
+    // per-expert byte-interleaving path with exact value comparisons.
+    #[test]
+    fn test_fuse_packed_qtensors() {
+        use candle_core::quantized::GgmlDType;
+
+        // [num_experts=3, out=2, in=4]; expert i's gate slice is filled with
+        // (i+1), up slice with 10*(i+1), so a mis-interleaved expert
+        // boundary is trivially detectable.
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3, 2, 4);
+        let gate_data: Vec<f32> = (0..num_experts * out_dim * in_dim)
+            .map(|idx| ((idx / (out_dim * in_dim)) + 1) as f32)
+            .collect();
+        let up_data: Vec<f32> = gate_data.iter().map(|v| v * 10.0).collect();
+        let gate_tensor =
+            Tensor::from_vec(gate_data, (num_experts, out_dim, in_dim), device).expect("gate");
+        let up_tensor =
+            Tensor::from_vec(up_data, (num_experts, out_dim, in_dim), device).expect("up");
+        let gate = QTensor::quantize(&gate_tensor, GgmlDType::F32).expect("quantize gate");
+        let up = QTensor::quantize(&up_tensor, GgmlDType::F32).expect("quantize up");
+
+        let fused = fuse_packed_qtensors(&gate, &up, device).expect("fuse");
+        assert_eq!(fused.shape().dims(), &[num_experts, 2 * out_dim, in_dim]);
+        let raw = fused.data().expect("raw bytes");
+
+        for expert_idx in 0..num_experts {
+            let sliced = slice_packed_qtensor(
+                &raw,
+                GgmlDType::F32,
+                expert_idx,
+                2 * out_dim,
+                in_dim,
+                device,
+            )
+            .expect("slice");
+            let vals = sliced
+                .dequantize(device)
+                .expect("dequantize")
+                .to_vec2::<f32>()
+                .expect("to_vec2");
+            let expected_gate = (expert_idx + 1) as f32;
+            let expected_up = expected_gate * 10.0;
+            for row in &vals[0..out_dim] {
+                assert!(
+                    row.iter().all(|&v| (v - expected_gate).abs() < 1e-6),
+                    "expert {expert_idx} gate half: got {row:?}, expected all {expected_gate}"
+                );
+            }
+            for row in &vals[out_dim..2 * out_dim] {
+                assert!(
+                    row.iter().all(|&v| (v - expected_up).abs() < 1e-6),
+                    "expert {expert_idx} up half: got {row:?}, expected all {expected_up}"
+                );
+            }
+        }
+    }
+
     // `combine_expert_outputs` is plain candle-core tensor arithmetic (no
     // CUDA/ROCm dependency), so it can be verified on CPU even though
     // `indexed_moe_forward` itself cannot.
@@ -1271,28 +1475,192 @@ mod tests {
         let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
         let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
 
-        let (experts, packed_gate, packed_up, packed_down) =
+        let (experts, packed_gate_up, packed_down) =
             SparseMoeBlock::load_packed_experts(&mut gg, "blk.0", num_experts, &device)
                 .expect("load_packed_experts");
 
         assert_eq!(experts.len(), num_experts);
         assert!(
-            packed_gate.is_none() && packed_up.is_none() && packed_down.is_none(),
+            packed_gate_up.is_none() && packed_down.is_none(),
             "CPU device is never fused-eligible, so per-expert slicing must run"
         );
         for expert in &experts {
             assert!(
-                matches!(expert.gate_proj, LinearLayer::Quantized(_)),
-                "gate_proj must stay Quantized"
-            );
-            assert!(
-                matches!(expert.up_proj, LinearLayer::Quantized(_)),
-                "up_proj must stay Quantized"
+                matches!(expert.gate_up_proj, LinearLayer::Quantized(_)),
+                "gate_up_proj must stay Quantized"
             );
             assert!(
                 matches!(expert.down_proj, LinearLayer::Quantized(_)),
                 "down_proj must stay Quantized"
             );
+        }
+    }
+
+    // A pre-fused `ffn_gate_up_exps` tensor (some GGUF converters emit this)
+    // must be detected and used directly, without also requiring separate
+    // `ffn_gate_exps`/`ffn_up_exps` tensors to be present. Expert i's gate
+    // half is filled with a distinct value and its up half with another, so
+    // a gate/up half swap (or any other ordering mismatch) in the externally
+    // pre-fused tensor changes the forward-pass output instead of silently
+    // passing, unlike an all-ones fill.
+    #[test]
+    fn load_packed_experts_uses_pre_fused_gate_up_tensor() {
+        use candle_core::quantized::GgmlDType;
+        use std::io::Cursor;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let (num_experts, out_dim, in_dim) = (2usize, 4usize, 8usize);
+
+        let mut gate_up_data = Vec::with_capacity(num_experts * 2 * out_dim * in_dim);
+        let mut down_data = Vec::with_capacity(num_experts * in_dim * out_dim);
+        for expert_idx in 0..num_experts {
+            let gate_val = (expert_idx + 1) as f32 * 0.1;
+            let up_val = gate_val * 3.0;
+            gate_up_data.extend(std::iter::repeat_n(gate_val, out_dim * in_dim));
+            gate_up_data.extend(std::iter::repeat_n(up_val, out_dim * in_dim));
+            down_data.extend(std::iter::repeat_n(gate_val, in_dim * out_dim));
+        }
+
+        let mut writer = Cursor::new(Vec::new());
+        // Pre-fused: out dim is already 2*out_dim (gate half + up half).
+        let gate_up_tensor =
+            Tensor::from_vec(gate_up_data, (num_experts, 2 * out_dim, in_dim), &device)
+                .expect("gate_up tensor");
+        let gate_up = QTensor::quantize(&gate_up_tensor, GgmlDType::F32).expect("quantize gate_up");
+        let down_tensor = Tensor::from_vec(down_data, (num_experts, in_dim, out_dim), &device)
+            .expect("down tensor");
+        let down = QTensor::quantize(&down_tensor, GgmlDType::F32).expect("quantize down");
+        candle_core::quantized::gguf_file::write(
+            &mut writer,
+            &[],
+            &[
+                ("blk.0.ffn_gate_up_exps.weight", &gate_up),
+                ("blk.0.ffn_down_exps.weight", &down),
+            ],
+        )
+        .expect("write gguf");
+
+        writer.set_position(0);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
+        let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
+
+        let (experts, packed_gate_up, packed_down) =
+            SparseMoeBlock::load_packed_experts(&mut gg, "blk.0", num_experts, &device)
+                .expect("load_packed_experts");
+
+        assert_eq!(experts.len(), num_experts);
+        assert!(packed_gate_up.is_none() && packed_down.is_none());
+
+        // Every weight in each projection is a constant, so for an all-ones
+        // input of length `in_dim`, gate(x)/up(x)/down(y) are all the sum of
+        // `in_dim` (or `out_dim`) copies of that constant.
+        let x = Tensor::ones((1, in_dim), dtype, &device).expect("input");
+        for (expert_idx, expert) in experts.iter().enumerate() {
+            assert_eq!(expert.intermediate_size, out_dim);
+            let gate_val = (expert_idx + 1) as f32 * 0.1;
+            let up_val = gate_val * 3.0;
+            let down_val = gate_val;
+            let gate_out = gate_val * in_dim as f32;
+            let up_out = up_val * in_dim as f32;
+            let silu_gate = gate_out / (1.0 + (-gate_out).exp());
+            let expected = out_dim as f32 * silu_gate * up_out * down_val;
+
+            let got = expert
+                .forward(&x)
+                .expect("forward")
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1::<f32>()
+                .expect("to_vec1");
+            for v in got {
+                assert!(
+                    (v - expected).abs() < 1e-4,
+                    "expert {expert_idx}: got {v}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    // Verifies `MoeExpert::new_from_gguf` fuses the per-expert gate/up
+    // tensors into a numerically correct `gate_up_proj`: the fused forward
+    // pass must match manually computing `silu(gate(x)) * up(x)` from the
+    // separately-loaded, unfused weights. GgmlDType::F32 quantization is
+    // lossless, so this is an exact comparison.
+    #[test]
+    fn moe_expert_new_from_gguf_fuses_gate_up_correctly() {
+        use candle_core::quantized::GgmlDType;
+        use std::io::Cursor;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let (hidden, intermediate) = (4usize, 2usize);
+
+        let gate_data: Vec<f32> = (0..intermediate * hidden)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let up_data: Vec<f32> = gate_data.iter().map(|v| v * 3.0).collect();
+        let down_data: Vec<f32> = (0..hidden * intermediate)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        let gate_tensor =
+            Tensor::from_vec(gate_data, (intermediate, hidden), &device).expect("gate");
+        let up_tensor = Tensor::from_vec(up_data, (intermediate, hidden), &device).expect("up");
+        let down_tensor =
+            Tensor::from_vec(down_data, (hidden, intermediate), &device).expect("down");
+        let gate_qt = QTensor::quantize(&gate_tensor, GgmlDType::F32).expect("quantize gate");
+        let up_qt = QTensor::quantize(&up_tensor, GgmlDType::F32).expect("quantize up");
+        let down_qt = QTensor::quantize(&down_tensor, GgmlDType::F32).expect("quantize down");
+
+        let mut writer = Cursor::new(Vec::new());
+        candle_core::quantized::gguf_file::write(
+            &mut writer,
+            &[],
+            &[
+                ("blk.0.ffn_gate.0.weight", &gate_qt),
+                ("blk.0.ffn_up.0.weight", &up_qt),
+                ("blk.0.ffn_down.0.weight", &down_qt),
+            ],
+        )
+        .expect("write gguf");
+        writer.set_position(0);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
+        let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
+
+        let expert = MoeExpert::new_from_gguf(&mut gg, 0, 0, &device).expect("new_from_gguf");
+
+        let x = Tensor::new(&[1.0f32, 0.5, -0.5, 2.0], &device)
+            .expect("tensor")
+            .reshape((1, hidden))
+            .expect("reshape");
+        let got = expert
+            .forward(&x)
+            .expect("forward")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // Manually compute silu(gate(x)) * up(x) @ down using the unfused weight
+        // layers directly.
+        let gate_layer = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(gate_qt)).unwrap());
+        let up_layer = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(up_qt)).unwrap());
+        let down_layer = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(down_qt)).unwrap());
+        let gate_out = Activation::Silu
+            .forward(&gate_layer.forward(&x).unwrap())
+            .unwrap();
+        let up_out = up_layer.forward(&x).unwrap();
+        let expected = down_layer
+            .forward(&(gate_out * up_out).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert!((g - e).abs() < 1e-5, "got {got:?}, expected {expected:?}");
         }
     }
 
@@ -1398,8 +1766,8 @@ mod tests {
         );
     }
 
-    // Verifies `copy_expert_to_device` preserves quantization on all three
-    // projections rather than dequantizing any of them.
+    // Verifies `copy_expert_to_device` preserves quantization on both
+    // projections rather than dequantizing either of them.
     #[test]
     fn copy_expert_to_device_quantized_stays_quantized() {
         use candle_core::quantized::GgmlDType;
@@ -1412,15 +1780,11 @@ mod tests {
             let qt = QTensor::quantize(&weight, GgmlDType::Q8_0).unwrap();
             LinearLayer::Quantized(QMatMul::from_arc(Arc::new(qt)).unwrap())
         };
-        let expert = MoeExpert::from_layers(make_quantized(), make_quantized(), make_quantized());
+        let expert = MoeExpert::from_layers(make_quantized(), make_quantized(), 2);
 
         let copied = copy_expert_to_device(&expert, &Device::Cpu).expect("copy");
         assert!(matches!(
-            copied.gate_proj,
-            LinearLayer::Quantized(QMatMul::QTensor(_))
-        ));
-        assert!(matches!(
-            copied.up_proj,
+            copied.gate_up_proj,
             LinearLayer::Quantized(QMatMul::QTensor(_))
         ));
         assert!(matches!(
@@ -1629,8 +1993,8 @@ mod tests {
         let quantized = LinearLayer::Quantized(QMatMul::from_arc(Arc::new(qt)).unwrap());
         let expert = MoeExpert::from_layers(
             quantized,
-            LinearLayer::Standard(Linear::new(weight.clone(), None)),
             LinearLayer::Standard(Linear::new(weight, None)),
+            2,
         );
 
         let result = batched_promote(std::slice::from_ref(&expert), &Device::Cpu, DType::F32)
@@ -1646,11 +2010,8 @@ mod tests {
         let weight = Tensor::from_vec(vec![1.0f32; 4], (2, 2), &Device::Cpu).unwrap();
         let bias = Tensor::zeros(2, DType::F32, &Device::Cpu).unwrap();
         let biased = LinearLayer::Standard(Linear::new(weight.clone(), Some(bias)));
-        let expert = MoeExpert::from_layers(
-            biased,
-            LinearLayer::Standard(Linear::new(weight.clone(), None)),
-            LinearLayer::Standard(Linear::new(weight, None)),
-        );
+        let expert =
+            MoeExpert::from_layers(biased, LinearLayer::Standard(Linear::new(weight, None)), 2);
 
         let result = batched_promote(std::slice::from_ref(&expert), &Device::Cpu, DType::F32)
             .expect("batched_promote should not error, just decline");
