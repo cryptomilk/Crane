@@ -51,6 +51,7 @@ use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
+use crate::utils::prof::{self, Span};
 use ribo::utils::log;
 
 // Reuse the polymorphic linear layer and the shared GGUF loader.
@@ -810,20 +811,25 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = hidden_states;
-        let hidden_states = self.input_layernorm.forward(hidden_states)?;
-        let hidden_states = self
-            .self_attn
-            .forward(&hidden_states, cos, sin, attention_mask)?;
-        residual + hidden_states
+        let hidden_states = prof::timed(Span::BlockNorm, || {
+            self.input_layernorm.forward(hidden_states)
+        })?;
+        let hidden_states = prof::timed(Span::Attn, || {
+            self.self_attn
+                .forward(&hidden_states, cos, sin, attention_mask)
+        })?;
+        prof::timed(Span::Resid, || residual + hidden_states)
     }
 
     /// MLP half: post-attention layernorm, dense/`MoE` MLP, residual add.
     /// See [`Self::forward_attn`] for why this is split out.
     fn forward_mlp(&self, hidden_states: &Tensor) -> Result<Tensor> {
         let residual = hidden_states;
-        let hidden_states = self.post_attention_layernorm.forward(hidden_states)?;
-        let hidden_states = self.mlp.forward(&hidden_states)?;
-        residual + hidden_states
+        let hidden_states = prof::timed(Span::BlockNorm, || {
+            self.post_attention_layernorm.forward(hidden_states)
+        })?;
+        let hidden_states = prof::timed(Span::Mlp, || self.mlp.forward(&hidden_states))?;
+        prof::timed(Span::Resid, || residual + hidden_states)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -1373,8 +1379,9 @@ impl Qwen3Model {
         // Outermost pass boundary for `CRANE_PROF=1`: covers the whole
         // forward (embedding lookup through `decode`), mirroring
         // `qwen3_5::prefill::forward`'s use of the same timer.
-        let timer = crate::utils::prof::pass(seq_len);
-        let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
+        let timer = prof::pass(seq_len);
+        let hidden_states = prof::timed(Span::Embed, || self.embed_tokens.forward(input_ids))?
+            .to_dtype(self.dtype)?;
         let out = self.decode(hidden_states, seq_len, start_pos, input_ids.device());
         if let Some(timer) = timer {
             timer.finish(input_ids.device());
@@ -1403,7 +1410,7 @@ impl Qwen3Model {
         #[cfg(feature = "cuda")]
         let _event_guard = EventTrackingGuard::disable(inputs_embeds.device());
 
-        let timer = crate::utils::prof::pass(seq_len);
+        let timer = prof::pass(seq_len);
         let hidden_states = inputs_embeds.to_dtype(self.dtype)?;
         let out = self.decode(hidden_states, seq_len, start_pos, inputs_embeds.device());
         if let Some(timer) = timer {
@@ -1487,7 +1494,7 @@ impl Qwen3Model {
             }
         }
 
-        let hidden_states = self.norm.forward(&hidden_states)?;
+        let hidden_states = prof::timed(Span::Head, || self.norm.forward(&hidden_states))?;
         // Cheap to stash: Tensor is Arc-backed, so this is a refcount bump,
         // not a data copy. Lets callers that need the post-norm hidden
         // states (e.g. MiniCPM-o's TTS conditioning, which needs every
@@ -1502,10 +1509,12 @@ impl Qwen3Model {
             hidden_states.dim(1),
         );
         let logits = if prune_last {
-            self.lm_head.forward_logits(&hidden_states)?
+            prof::timed(Span::Head, || self.lm_head.forward_logits(&hidden_states))?
         } else {
-            self.lm_head
-                .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)?
+            prof::timed(Span::Head, || {
+                self.lm_head
+                    .forward_logits(&hidden_states.narrow(1, seq_len - 1, 1)?)
+            })?
         };
         Ok(logits)
     }
