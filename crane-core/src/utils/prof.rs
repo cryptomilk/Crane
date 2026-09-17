@@ -51,7 +51,7 @@ macro_rules! prof_log {
 /// The variants form four non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
-/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeFused`] partition
+/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
 /// [`Span::Mlp`] for `MoE` layers. Each tier is reported on its own line and
 /// should sum to its parent.
 #[derive(Clone, Copy)]
@@ -80,19 +80,25 @@ pub enum Span {
     MoeExpert,
     /// Fused `indexed_moe_forward` dispatch path (CUDA/ROCm).
     MoeFused,
+    /// Everything else in `SparseMoeBlock::forward` not covered by the other
+    /// Tier2b spans: the input reshape/F32 cast, the `topk_ids`/`topk_weights`
+    /// device-to-host sync and the per-expert token/weight list build that
+    /// follows it, the per-expert `Tensor::new`/`index_select` calls, and the
+    /// final output dtype cast and reshape.
+    MoeMisc,
 }
 
-const NUM_SPANS: usize = 19;
+const NUM_SPANS: usize = 20;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
-const TIER2_MOE: std::ops::Range<usize> = 15..19;
+const TIER2_MOE: std::ops::Range<usize> = 15..20;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
     "proj", "conv", "qkv", "recur", "finish", //
     "prep", "launch", "post", //
-    "router", "to_dev", "expert", "fused",
+    "router", "to_dev", "expert", "fused", "misc",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];

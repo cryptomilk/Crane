@@ -822,8 +822,11 @@ impl Module for SparseMoeBlock {
             candle_core::bail!("SparseMoeBlock input must have at least one dimension");
         };
         let original_dtype = xs.dtype();
-        let xs_flat = xs.reshape(((), hidden_size))?;
-        let xs_f32 = xs_flat.to_dtype(DType::F32)?;
+        let (xs_flat, xs_f32) = prof::timed(Span::MoeMisc, || -> Result<(Tensor, Tensor)> {
+            let xs_flat = xs.reshape(((), hidden_size))?;
+            let xs_f32 = xs_flat.to_dtype(DType::F32)?;
+            Ok((xs_flat, xs_f32))
+        })?;
 
         let (topk_ids, topk_weights) =
             prof::timed(Span::MoeRouter, || -> Result<(Tensor, Tensor)> {
@@ -861,20 +864,24 @@ impl Module for SparseMoeBlock {
         // are heap-allocated fresh each call. This is the fallback path for
         // CPU, Metal, and unsupported quant types; the fused path above
         // avoids both the sync and the allocations on CUDA/ROCm.
-        let topk_ids = topk_ids.to_vec2::<u32>()?;
-        let topk_weights = topk_weights.to_vec2::<f32>()?;
+        let (token_lists, weight_lists) = prof::timed(Span::MoeMisc, || -> Result<_> {
+            let topk_ids = topk_ids.to_vec2::<u32>()?;
+            let topk_weights = topk_weights.to_vec2::<f32>()?;
 
-        let mut token_lists: Vec<Vec<u32>> = vec![Vec::new(); self.experts.len()];
-        let mut weight_lists: Vec<Vec<f32>> = vec![Vec::new(); self.experts.len()];
-        for (token_idx, (ids, weights)) in topk_ids.iter().zip(topk_weights.iter()).enumerate() {
-            // Token counts (batch * seq_len) never approach u32::MAX.
-            #[allow(clippy::cast_possible_truncation)]
-            let token_idx = token_idx as u32;
-            for (&expert_idx, &weight) in ids.iter().zip(weights.iter()) {
-                token_lists[expert_idx as usize].push(token_idx);
-                weight_lists[expert_idx as usize].push(weight);
+            let mut token_lists: Vec<Vec<u32>> = vec![Vec::new(); self.experts.len()];
+            let mut weight_lists: Vec<Vec<f32>> = vec![Vec::new(); self.experts.len()];
+            for (token_idx, (ids, weights)) in topk_ids.iter().zip(topk_weights.iter()).enumerate()
+            {
+                // Token counts (batch * seq_len) never approach u32::MAX.
+                #[allow(clippy::cast_possible_truncation)]
+                let token_idx = token_idx as u32;
+                for (&expert_idx, &weight) in ids.iter().zip(weights.iter()) {
+                    token_lists[expert_idx as usize].push(token_idx);
+                    weight_lists[expert_idx as usize].push(weight);
+                }
             }
-        }
+            Ok((token_lists, weight_lists))
+        })?;
 
         // `Device::Cpu` is a unit variant, so this cross-device branch is only
         // exercised (and only exercisable in tests) on multi-device hardware.
@@ -915,8 +922,12 @@ impl Module for SparseMoeBlock {
             if tokens.is_empty() {
                 continue;
             }
-            let token_ids = Tensor::new(tokens.as_slice(), input_device)?;
-            let selected = xs_input.index_select(&token_ids, 0)?;
+            let (token_ids, selected) =
+                prof::timed(Span::MoeMisc, || -> Result<(Tensor, Tensor)> {
+                    let token_ids = Tensor::new(tokens.as_slice(), input_device)?;
+                    let selected = xs_input.index_select(&token_ids, 0)?;
+                    Ok((token_ids, selected))
+                })?;
             let expert_out = if same_device {
                 prof::timed(Span::MoeExpert, || -> Result<Tensor> {
                     if quantized_experts {
@@ -945,12 +956,14 @@ impl Module for SparseMoeBlock {
                 output.index_add(&token_ids, &scaled, 0)
             })?;
         }
-        let output = if output.dtype() == original_dtype {
-            output
-        } else {
-            output.to_dtype(original_dtype)?
-        };
-        output.reshape(original_dims)
+        prof::timed(Span::MoeMisc, || -> Result<Tensor> {
+            let output = if output.dtype() == original_dtype {
+                output
+            } else {
+                output.to_dtype(original_dtype)?
+            };
+            output.reshape(original_dims)
+        })
     }
 }
 
