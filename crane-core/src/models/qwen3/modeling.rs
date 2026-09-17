@@ -1698,6 +1698,9 @@ impl Qwen3Model {
         attention_mask: Option<&Tensor>,
         _batch_kv_info: Option<(&[usize], usize)>,
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let _event_guard = EventTrackingGuard::disable(input_ids.device());
+
         let hidden_states = self.embed_tokens.forward(input_ids)?.to_dtype(self.dtype)?;
 
         let max_pos = positions.iter().copied().max().unwrap_or(0) + 1;
