@@ -719,79 +719,6 @@ fn fuse_packed_qtensors(a: &QTensor, b: &QTensor, device: &Device) -> Result<QTe
     )
 }
 
-/// Copies a [`LinearLayer`] to `device`, preserving quantization.
-///
-/// Unlike [`LinearLayer::to_device`] (which dequantizes `Quantized`
-/// variants to promote an expert permanently), this rebuilds a
-/// `QMatMul::QTensor` from its raw quantized bytes on `device` using the
-/// same `qtensor_from_ggml` reconstruction technique as
-/// [`slice_packed_qtensor`], so a routed expert's temporary copy still runs
-/// through the target device's quantized matmul kernels instead of a dense
-/// GEMM. Used by [`SparseMoeBlock::forward`] to copy only the routed
-/// experts' weights to the input device for each call, rather than moving
-/// the hidden state to `expert_device`.
-///
-/// Unlike [`LinearLayer::to_device`], this does not cast to a target dtype:
-/// the `Quantized` path's `forward` handles F32 conversion internally, and
-/// the `Standard` path assumes weights are already in the model's compute
-/// dtype (true for all current callers, since experts are loaded in the
-/// compute dtype at model-load time).
-///
-/// Note: `QTensor::data()` on CUDA storage copies bytes to the host, so for
-/// GPU-to-GPU offload this results in a D2H2D round-trip through host
-/// memory. Acceptable for the primary use case (CPU-offloaded experts
-/// copied to GPU).
-///
-/// # Errors
-///
-/// Returns an error if the device transfer or `QTensor` reconstruction
-/// fails.
-fn copy_linear_to_device(layer: &LinearLayer, device: &Device) -> Result<LinearLayer> {
-    match layer {
-        LinearLayer::Standard(l) => {
-            let weight = l.weight().to_device(device)?;
-            let bias = l.bias().map(|b| b.to_device(device)).transpose()?;
-            Ok(LinearLayer::Standard(Linear::new(weight, bias)))
-        },
-        LinearLayer::Quantized(q) => {
-            let matmul = match &q.matmul {
-                QMatMul::QTensor(qt) => {
-                    let raw = qt.data()?;
-                    let new_qt =
-                        qtensor_from_ggml(qt.dtype(), &raw, qt.shape().dims().to_vec(), device)?;
-                    QMatMul::from_arc(Arc::new(new_qt))?
-                },
-                QMatMul::Tensor(t) => QMatMul::Tensor(t.to_device(device)?),
-                QMatMul::TensorF16(t) => QMatMul::TensorF16(t.to_device(device)?),
-            };
-            match q.bias.as_ref().map(|b| b.to_device(device)).transpose()? {
-                Some(bias) => Ok(LinearLayer::quantized_with_bias(matmul, bias)),
-                None => Ok(LinearLayer::quantized(matmul)),
-            }
-        },
-        LinearLayer::Ternary(_) => {
-            candle_core::bail!(
-                "copying a Ternary-quantized expert to another device is not supported"
-            )
-        },
-    }
-}
-
-/// Copies both of an [`MoeExpert`]'s projections to `device` via
-/// [`copy_linear_to_device`], for use as a short-lived GPU-resident copy
-/// of a CPU-offloaded expert (see [`SparseMoeBlock::forward`]).
-///
-/// # Errors
-///
-/// Returns an error if either projection's device transfer fails.
-fn copy_expert_to_device(expert: &MoeExpert, device: &Device) -> Result<MoeExpert> {
-    Ok(MoeExpert::from_layers(
-        copy_linear_to_device(&expert.gate_up_proj, device)?,
-        copy_linear_to_device(&expert.down_proj, device)?,
-        expert.intermediate_size,
-    ))
-}
-
 /// Narrows one expert's view out of an already-promoted, single-owner
 /// `[num_experts, out, in]` tensor, without forcing a copy.
 ///
@@ -950,37 +877,36 @@ impl Module for SparseMoeBlock {
         let same_device = xs_flat.device().location() == self.expert_device.location();
         let input_device = xs_flat.device();
 
-        // The hidden state stays on `input_device` throughout: rather than
-        // moving it to `expert_device` (Root Cause #4's device-transfer
-        // cost, and a total mismatch for CPU-offloaded experts since GPU
-        // matmuls vastly outrun CPU ones), only the handful of routed
-        // experts' weights are copied to `input_device` per call, each
-        // copy dropped at the end of its loop iteration.
+        // For a cross-device expert (CPU-resident weights, GPU input, or
+        // vice versa), only the tiny per-expert activation slice
+        // (`selected` -- 1-8 rows during decode) moves to `expert_device`
+        // and back; the matmul itself runs where the weights already
+        // live, rather than copying the full weight tensors to
+        // `input_device` every call.
         //
         // `MoeToDevice` and `MoeExpert` are timed as separate, non-nested
         // spans per expert (rather than one span wrapping the whole loop):
         // both are Tier2b siblings, and `prof::timed` never subtracts a
         // span's children, so nesting one inside the other would double-
-        // count the copy time into `MoeExpert`'s bucket too.
+        // count time into the wrong bucket.
         let mut output = Tensor::zeros(xs_flat.dims(), xs_flat.dtype(), input_device)?;
         for (expert_idx, expert) in self.experts.iter().enumerate() {
             let tokens = &token_lists[expert_idx];
             if tokens.is_empty() {
                 continue;
             }
-            let copied_expert;
-            let expert = if same_device {
-                expert
+            let token_ids = Tensor::new(tokens.as_slice(), input_device)?;
+            let selected = xs_flat.index_select(&token_ids, 0)?;
+            let expert_out = if same_device {
+                prof::timed(Span::MoeExpert, || expert.forward(&selected))?
             } else {
-                copied_expert = prof::timed(Span::MoeToDevice, || {
-                    copy_expert_to_device(expert, input_device)
+                let expert_in = prof::timed(Span::MoeToDevice, || {
+                    selected.to_device(&self.expert_device)
                 })?;
-                &copied_expert
+                let expert_out = prof::timed(Span::MoeExpert, || expert.forward(&expert_in))?;
+                prof::timed(Span::MoeToDevice, || expert_out.to_device(input_device))?
             };
             output = prof::timed(Span::MoeExpert, || -> Result<Tensor> {
-                let token_ids = Tensor::new(tokens.as_slice(), input_device)?;
-                let selected = xs_flat.index_select(&token_ids, 0)?;
-                let expert_out = expert.forward(&selected)?;
                 let weights = Tensor::new(weight_lists[expert_idx].as_slice(), input_device)?
                     .reshape((tokens.len(), 1))?
                     .to_dtype(expert_out.dtype())?;
@@ -1686,64 +1612,14 @@ mod tests {
         }
     }
 
-    // Verifies `copy_linear_to_device` on a `Standard` layer (CPU->CPU
-    // here, same constructibility limitation noted throughout this file)
-    // preserves forward-pass output.
+    // Verifies `MoeExpert::to_device` preserves forward-pass output. Only
+    // CPU->CPU is exercisable without real GPU hardware (matching this
+    // file's existing note that cross-device dispatch is CPU-only in unit
+    // tests), but this still exercises the actual per-projection transfer
+    // loop, unlike `SparseMoeBlock::promote_experts_to`'s same-device
+    // early-return short-circuit tested separately below.
     #[test]
-    fn copy_linear_to_device_standard_preserves_output() {
-        let weight = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu).unwrap();
-        let layer = LinearLayer::Standard(Linear::new(weight, None));
-        let x = Tensor::new(&[1.0f32, 0.5], &Device::Cpu)
-            .unwrap()
-            .reshape((1, 2))
-            .unwrap();
-        let before = layer.forward(&x).unwrap();
-
-        let copied = copy_linear_to_device(&layer, &Device::Cpu).unwrap();
-        assert!(matches!(copied, LinearLayer::Standard(_)));
-        let after = copied.forward(&x).unwrap();
-
-        assert_eq!(
-            before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        );
-    }
-
-    // Unlike `LinearLayer::to_device`, `copy_linear_to_device` must keep a
-    // `Quantized(QMatMul::QTensor)` layer quantized rather than
-    // dequantizing it to `Standard` -- that's the entire point of Phase 6's
-    // routed-only expert copy.
-    #[test]
-    fn copy_linear_to_device_quantized_stays_quantized() {
-        use candle_core::quantized::GgmlDType;
-
-        // Q8_0 (block_size=32), unlike F32, is not auto-dequantized by
-        // `QMatMul::from_arc` -- F32/F16/BF16 always dequantize to
-        // `QMatMul::Tensor`, which would make this test pass vacuously.
-        let weight = Tensor::from_vec(vec![1.0f32; 2 * 32], (2, 32), &Device::Cpu).unwrap();
-        let qt = QTensor::quantize(&weight, GgmlDType::Q8_0).unwrap();
-        let layer = LinearLayer::quantized(QMatMul::from_arc(Arc::new(qt)).unwrap());
-        let x = Tensor::from_vec(vec![1.0f32; 32], (1, 32), &Device::Cpu).unwrap();
-        let before = layer.forward(&x).unwrap();
-
-        let copied = copy_linear_to_device(&layer, &Device::Cpu).unwrap();
-        assert!(
-            matches!(&copied, LinearLayer::Quantized(q) if matches!(q.matmul, QMatMul::QTensor(_))),
-            "copy must stay Quantized(QTensor), not dequantize"
-        );
-        let after = copied.forward(&x).unwrap();
-
-        let before_vals = before.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let after_vals = after.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (b, a) in before_vals.iter().zip(after_vals.iter()) {
-            assert!((b - a).abs() < 1e-4, "before={b} after={a}");
-        }
-    }
-
-    // Verifies `copy_expert_to_device` (CPU->CPU) preserves forward-pass
-    // output across all three projections.
-    #[test]
-    fn copy_expert_to_device_preserves_output() {
+    fn moe_expert_to_device_preserves_output() {
         let vb = identity_vb(8);
         let expert = MoeExpert::new(8, 8, vb).expect("new");
         let x = Tensor::arange(0f32, 8f32, &Device::Cpu)
@@ -1752,8 +1628,10 @@ mod tests {
             .expect("reshape");
         let before = expert.forward(&x).expect("forward");
 
-        let copied = copy_expert_to_device(&expert, &Device::Cpu).expect("copy");
-        let after = copied.forward(&x).expect("forward");
+        let moved = expert
+            .to_device(&Device::Cpu, DType::F32)
+            .expect("to_device");
+        let after = moved.forward(&x).expect("forward");
 
         assert_eq!(
             before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -1784,33 +1662,6 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap(),
         );
-    }
-
-    // Verifies `copy_expert_to_device` preserves quantization on both
-    // projections rather than dequantizing either of them.
-    #[test]
-    fn copy_expert_to_device_quantized_stays_quantized() {
-        use candle_core::quantized::GgmlDType;
-
-        // Q8_0 (block_size=32), unlike F32, is not auto-dequantized by
-        // `QMatMul::from_arc` -- F32/F16/BF16 always dequantize to
-        // `QMatMul::Tensor`, which would make this test pass vacuously.
-        let make_quantized = || {
-            let weight = Tensor::from_vec(vec![1.0f32; 2 * 32], (2, 32), &Device::Cpu).unwrap();
-            let qt = QTensor::quantize(&weight, GgmlDType::Q8_0).unwrap();
-            LinearLayer::quantized(QMatMul::from_arc(Arc::new(qt)).unwrap())
-        };
-        let expert = MoeExpert::from_layers(make_quantized(), make_quantized(), 2);
-
-        let copied = copy_expert_to_device(&expert, &Device::Cpu).expect("copy");
-        assert!(matches!(
-            &copied.gate_up_proj,
-            LinearLayer::Quantized(q) if matches!(q.matmul, QMatMul::QTensor(_))
-        ));
-        assert!(matches!(
-            &copied.down_proj,
-            LinearLayer::Quantized(q) if matches!(q.matmul, QMatMul::QTensor(_))
-        ));
     }
 
     // Router weight key is "gate.weight" (VarBuilder::pp("gate")); expert keys
@@ -2267,32 +2118,6 @@ mod tests {
         let y = moe.forward(&x).expect("forward");
         assert_eq!(y.dtype(), DType::F16);
         assert_eq!(y.dims(), &[3, hidden]);
-    }
-
-    // Verifies `MoeExpert::to_device` preserves forward-pass output. Only
-    // CPU->CPU is exercisable without real GPU hardware, but this still
-    // exercises the actual per-projection transfer loop, unlike
-    // `SparseMoeBlock::promote_experts_to`'s same-device early-return
-    // short-circuit tested separately below.
-    #[test]
-    fn moe_expert_to_device_preserves_output() {
-        let vb = identity_vb(8);
-        let expert = MoeExpert::new(8, 8, vb).expect("new");
-        let x = Tensor::arange(0f32, 8f32, &Device::Cpu)
-            .expect("arange")
-            .reshape((1, 8))
-            .expect("reshape");
-        let before = expert.forward(&x).expect("forward");
-
-        let moved = expert
-            .to_device(&Device::Cpu, DType::F32)
-            .expect("to_device");
-        let after = moved.forward(&x).expect("forward");
-
-        assert_eq!(
-            before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-        );
     }
 
     #[test]
