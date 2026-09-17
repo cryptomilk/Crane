@@ -161,6 +161,11 @@ impl MoeExpert {
         let gate = Activation::Silu.forward(&gate)?;
         self.down_proj.forward_f32(&(gate * up)?)
     }
+
+    /// Whether this expert's projections are stored as quantized weights.
+    fn is_quantized(&self) -> bool {
+        matches!(self.gate_up_proj, LinearLayer::Quantized(_))
+    }
 }
 
 impl Module for MoeExpert {
@@ -889,38 +894,62 @@ impl Module for SparseMoeBlock {
         // both are Tier2b siblings, and `prof::timed` never subtracts a
         // span's children, so nesting one inside the other would double-
         // count time into the wrong bucket.
-        let mut output = Tensor::zeros(xs_flat.dims(), xs_flat.dtype(), input_device)?;
+        //
+        // Accumulation happens in F32 regardless of `original_dtype`, with a
+        // single cast back to `original_dtype` once after the loop instead
+        // of per-expert. Quantized experts route through `forward_f32`
+        // (their input is already `xs_f32`, so no per-expert cast is
+        // needed either way it's dispatched) since `QMatMul` computes in F32
+        // internally and `forward_f32` skips the intermediate cast back to
+        // `original_dtype` that `LinearLayer::forward` would otherwise do.
+        // Standard (unquantized) experts stay on `forward` in their native
+        // dtype and only the small output gets cast to F32: `forward_f32`
+        // would instead recast the *entire weight matrix* to F32 on every
+        // call, which is far more expensive than the round-trip it's meant
+        // to avoid.
+        let quantized_experts = self.experts.first().is_some_and(MoeExpert::is_quantized);
+        let xs_input = if quantized_experts { &xs_f32 } else { &xs_flat };
+        let mut output = Tensor::zeros(xs_flat.dims(), DType::F32, input_device)?;
         for (expert_idx, expert) in self.experts.iter().enumerate() {
             let tokens = &token_lists[expert_idx];
             if tokens.is_empty() {
                 continue;
             }
             let token_ids = Tensor::new(tokens.as_slice(), input_device)?;
-            let selected = xs_flat.index_select(&token_ids, 0)?;
+            let selected = xs_input.index_select(&token_ids, 0)?;
             let expert_out = if same_device {
-                prof::timed(Span::MoeExpert, || expert.forward(&selected))?
+                prof::timed(Span::MoeExpert, || -> Result<Tensor> {
+                    if quantized_experts {
+                        expert.forward_f32(&selected)
+                    } else {
+                        expert.forward(&selected)?.to_dtype(DType::F32)
+                    }
+                })?
             } else {
                 let expert_in = prof::timed(Span::MoeToDevice, || {
                     selected.to_device(&self.expert_device)
                 })?;
-                let expert_out = prof::timed(Span::MoeExpert, || expert.forward(&expert_in))?;
+                let expert_out = prof::timed(Span::MoeExpert, || -> Result<Tensor> {
+                    if quantized_experts {
+                        expert.forward_f32(&expert_in)
+                    } else {
+                        expert.forward(&expert_in)?.to_dtype(DType::F32)
+                    }
+                })?;
                 prof::timed(Span::MoeToDevice, || expert_out.to_device(input_device))?
             };
             output = prof::timed(Span::MoeExpert, || -> Result<Tensor> {
                 let weights = Tensor::new(weight_lists[expert_idx].as_slice(), input_device)?
-                    .reshape((tokens.len(), 1))?
-                    .to_dtype(expert_out.dtype())?;
+                    .reshape((tokens.len(), 1))?;
                 let scaled = expert_out.broadcast_mul(&weights)?;
                 output.index_add(&token_ids, &scaled, 0)
             })?;
         }
-        if output.dtype() != original_dtype {
-            candle_core::bail!(
-                "MoE output dtype {:?} differs from input dtype {:?}",
-                output.dtype(),
-                original_dtype,
-            );
-        }
+        let output = if output.dtype() == original_dtype {
+            output
+        } else {
+            output.to_dtype(original_dtype)?
+        };
         output.reshape(original_dims)
     }
 }
@@ -1661,6 +1690,107 @@ mod tests {
                 .unwrap()
                 .to_vec1::<f32>()
                 .unwrap(),
+        );
+    }
+
+    // Manual perf comparison for the same-device quantized-expert dispatch
+    // fixed alongside `quantized_experts` in `SparseMoeBlock::forward`:
+    // `forward` (cast to F32, matmul, cast back to `original_dtype`) versus
+    // `forward_f32` (cast to F32, matmul, stay F32) on a BF16/F16-sized
+    // expert. Runs on CUDA/ROCm when built with that feature (matching
+    // `Qwen3Model::from_gguf_with_kv_kind`'s device -> dtype selection),
+    // CPU otherwise. Timing-based, so `#[ignore]`d by default; run with:
+    //   cargo test -p crane-core --release --features rocm \
+    //     same_device_quantized_forward_f32_avoids_round_trip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn same_device_quantized_forward_f32_avoids_round_trip() {
+        use candle_core::quantized::GgmlDType;
+        use std::io::Cursor;
+        use std::time::Instant;
+
+        #[cfg(feature = "cuda")]
+        let (device, activation_dtype) = (Device::new_cuda(0).expect("cuda device"), DType::BF16);
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        let (device, activation_dtype) = (Device::new_rocm(0).expect("rocm device"), DType::F16);
+        // CPU never runs this dtype in production (`from_gguf_with_kv_kind`
+        // always picks F32 there); F16 here only to exercise the same
+        // round-trip this benchmark is measuring.
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        let (device, activation_dtype) = (Device::Cpu, DType::F16);
+
+        let cpu = Device::Cpu;
+        let dtype = DType::F32;
+        let (hidden, intermediate, batch) = (2048usize, 768usize, 8usize);
+
+        let gate_data: Vec<f32> = (0..intermediate * hidden)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let up_data: Vec<f32> = gate_data.iter().map(|v| v * 0.5).collect();
+        let down_data: Vec<f32> = (0..hidden * intermediate)
+            .map(|i| ((i as f32) * 0.001).cos())
+            .collect();
+
+        // Block quantization runs on CPU; `MoeExpert::new_from_gguf` below
+        // loads the resulting GGUF bytes onto `device`, same as production
+        // GGUF loading assigning an expert to an arbitrary device.
+        let gate_tensor = Tensor::from_vec(gate_data, (intermediate, hidden), &cpu).expect("gate");
+        let up_tensor = Tensor::from_vec(up_data, (intermediate, hidden), &cpu).expect("up");
+        let down_tensor = Tensor::from_vec(down_data, (hidden, intermediate), &cpu).expect("down");
+        let gate_qt = QTensor::quantize(&gate_tensor, GgmlDType::Q8_0).expect("quantize gate");
+        let up_qt = QTensor::quantize(&up_tensor, GgmlDType::Q8_0).expect("quantize up");
+        let down_qt = QTensor::quantize(&down_tensor, GgmlDType::Q8_0).expect("quantize down");
+
+        let mut writer = Cursor::new(Vec::new());
+        candle_core::quantized::gguf_file::write(
+            &mut writer,
+            &[],
+            &[
+                ("blk.0.ffn_gate.0.weight", &gate_qt),
+                ("blk.0.ffn_up.0.weight", &up_qt),
+                ("blk.0.ffn_down.0.weight", &down_qt),
+            ],
+        )
+        .expect("write gguf");
+        writer.set_position(0);
+        let ct = candle_core::quantized::gguf_file::Content::read(&mut writer).expect("read gguf");
+        let mut gg = Gguf::new(ct, writer, device.clone(), dtype);
+        let expert = MoeExpert::new_from_gguf(&mut gg, 0, 0, &device).expect("new_from_gguf");
+
+        // Per-expert token count during decode: top-8 routing selects up to
+        // `num_experts_per_tok` tokens per expert per step.
+        let x = Tensor::randn(0f32, 1.0, (batch, hidden), &device)
+            .expect("randn")
+            .to_dtype(activation_dtype)
+            .expect("to_dtype activation_dtype");
+
+        let old_path = || -> Result<Tensor> { expert.forward(&x)?.to_dtype(DType::F32) };
+        let new_path = || -> Result<Tensor> { expert.forward_f32(&x) };
+
+        for _ in 0..10 {
+            let _ = old_path().expect("warmup old_path");
+            let _ = new_path().expect("warmup new_path");
+        }
+        device.synchronize().expect("sync after warmup");
+
+        let iters = 200;
+        let t = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(old_path().expect("old_path"));
+        }
+        device.synchronize().expect("sync after old_path");
+        let old_ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+
+        let t = Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(new_path().expect("new_path"));
+        }
+        device.synchronize().expect("sync after new_path");
+        let new_ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+
+        println!(
+            "same_device quantized expert (hidden={hidden}, intermediate={intermediate}, batch={batch}, device={device:?}): \
+             forward+to_dtype(F32) = {old_ms:.4} ms/iter, forward_f32 = {new_ms:.4} ms/iter"
         );
     }
 
