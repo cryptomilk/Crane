@@ -142,6 +142,25 @@ impl MoeExpert {
             intermediate_size: self.intermediate_size,
         })
     }
+
+    /// Runs the expert's forward pass entirely in F32, regardless of the
+    /// stored weight dtype. If `xs` is not F32, each projection casts it
+    /// internally via [`LinearLayer::forward_f32`].
+    ///
+    /// Same gate/up split and `SiLU` logic as [`Module::forward`], routed
+    /// through [`LinearLayer::forward_f32`] instead of `forward` so no
+    /// intermediate BF16/F16 casts happen inside either projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either projection's matmul fails.
+    pub fn forward_f32(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate_up = self.gate_up_proj.forward_f32(xs)?;
+        let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+        let gate = Activation::Silu.forward(&gate)?;
+        self.down_proj.forward_f32(&(gate * up)?)
+    }
 }
 
 impl Module for MoeExpert {
@@ -1739,6 +1758,31 @@ mod tests {
         assert_eq!(
             before.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             after.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+    }
+
+    // Verifies `MoeExpert::forward_f32` matches `Module::forward` output
+    // when given F32 input.
+    #[test]
+    fn forward_f32_matches_forward_on_f32_input() {
+        let vb = identity_vb(8);
+        let expert = MoeExpert::new(8, 8, vb).expect("new");
+        let x = Tensor::arange(0f32, 8f32, &Device::Cpu)
+            .expect("arange")
+            .reshape((1, 8))
+            .expect("reshape");
+
+        let via_forward = expert.forward(&x).expect("forward");
+        let via_forward_f32 = expert.forward_f32(&x).expect("forward_f32");
+
+        assert_eq!(via_forward_f32.dtype(), DType::F32);
+        assert_eq!(
+            via_forward.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            via_forward_f32
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
         );
     }
 
