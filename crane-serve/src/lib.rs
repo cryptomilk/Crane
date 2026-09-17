@@ -28,7 +28,7 @@ use crane_core::utils::DeviceExt;
 use tracing::{info, warn};
 
 use chat_template::ChatTemplateProcessor;
-use crane_core::device::DeviceAssignment;
+use crane_core::device::{DeviceAssignment, format_budget, query_gpu_memory};
 use engine::backend::ExpertPromotionPolicy;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
@@ -288,11 +288,11 @@ fn log_hardware_info(device: &candle_core::Device, device_name: &str) {
     );
 
     if !matches!(device.location(), candle_core::DeviceLocation::Cpu) {
-        let (_, vram_total) = engine::memory::query_gpu_memory_usage(device);
+        let vram_total = query_gpu_memory(device).map_or(0, |(_, total)| total);
         if vram_total > 0 {
             info!(
                 device = %device_name,
-                vram_total = %engine::memory::format_bytes_engine(vram_total),
+                vram_total = %format_budget(vram_total),
                 "hardware: gpu"
             );
         } else {
@@ -1697,7 +1697,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         // intentionally, so that function stays independently callable (and
         // testable) without relying on the caller to have already checked.
         if memory_config.max_seq_len == 0 && memory_config.gpu_memory_limit_bytes > 0 {
-            let physical_total = MemoryConfig::query_total_gpu_memory(&device);
+            let physical_total = query_gpu_memory(&device).map_or(0, |(_, total)| total);
             // The engine caps max_concurrent to 1 when the backend doesn't
             // support KV-cache swapping (see InferenceEngine::new). Use the
             // same effective value here so the derivation divides the VRAM
@@ -1720,8 +1720,8 @@ pub async fn run(mut args: Args) -> Result<()> {
                     info!(
                         "max_seq_len unset with gpu_memory_limit set; auto-derived {derived} \
                          tokens from physical_vram={}, baseline={}",
-                        engine::memory::format_bytes_engine(physical_total),
-                        engine::memory::format_bytes_engine(memory_config.baseline_gpu_bytes),
+                        format_budget(physical_total),
+                        format_budget(memory_config.baseline_gpu_bytes),
                     );
                     memory_config.max_seq_len = derived;
                     args.max_seq_len = derived;
@@ -1768,9 +1768,9 @@ pub async fn run(mut args: Args) -> Result<()> {
             if memory_config.gpu_memory_limit_bytes == 0 {
                 "unlimited".to_string()
             } else {
-                engine::memory::format_bytes_engine(memory_config.gpu_memory_limit_bytes)
+                format_budget(memory_config.gpu_memory_limit_bytes)
             },
-            engine::memory::format_bytes_engine(baseline_gpu)
+            format_budget(baseline_gpu)
         );
         let (engine, handle) = InferenceEngine::new(
             backend,
