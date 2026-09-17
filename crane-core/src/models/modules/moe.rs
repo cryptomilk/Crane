@@ -5,9 +5,15 @@ use crate::models::hunyuan_dense::modeling::Gguf;
 use crate::ops::linear::LinearLayer;
 use crate::utils::DeviceExt;
 use crate::utils::prof::{self, Span};
-use candle_core::quantized::{GgmlDType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
+use candle_core::quantized::k_quants::{
+    BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K, BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K,
+    BlockQ8_0, BlockQ8_1, BlockQ8K,
+};
+use candle_core::quantized::{GgmlDType, GgmlType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
+use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias};
+use half::{bf16, f16};
 use ribo::utils::log;
 use std::io::{Read, Seek};
 use std::sync::Arc;
@@ -550,6 +556,657 @@ impl SparseMoeBlock {
         let summed = weighted.sum(1)?;
         summed.to_dtype(original_dtype)?.reshape(original_dims)
     }
+}
+
+/// Reinterprets a byte slice as a slice of `T`, without copying.
+///
+/// `data` always originates from a `QTensor`'s CPU-resident storage (see
+/// `QTensor::data`), which is backed by a `Vec<T>` -- so its pointer is
+/// already aligned for `T` and its length is a whole number of `T`s. Both
+/// are asserted rather than assumed.
+fn as_quantized_slice<T: GgmlType>(data: &[u8]) -> &[T] {
+    let size = std::mem::size_of::<T>();
+    assert_eq!(
+        data.len() % size,
+        0,
+        "quantized data length {} is not a multiple of element size {size}",
+        data.len()
+    );
+    let ptr = data.as_ptr();
+    assert_eq!(
+        (ptr as usize) % std::mem::align_of::<T>(),
+        0,
+        "quantized data pointer is not aligned for the target element type"
+    );
+    // SAFETY: length and alignment checked above; `data` is a read-only
+    // borrow so the returned slice cannot outlive it or alias a mutable
+    // reference.
+    unsafe { std::slice::from_raw_parts(ptr.cast::<T>(), data.len() / size) }
+}
+
+/// Validated shape dimensions extracted from `cpu_indexed_moe_forward`'s
+/// inputs by [`validate_moe_forward_shapes`].
+struct MoeForwardDims {
+    num_experts: usize,
+    out_dim: usize,
+    in_dim: usize,
+    tokens: usize,
+    input_dim1: usize,
+    topk: usize,
+}
+
+/// Validates `packed_weights`/`xs` shapes against an already-known
+/// `(tokens, topk)` pair, typically sourced from a [`MoeRouting`].
+///
+/// # Errors
+///
+/// Returns an error if `xs` is not F32; if `packed_weights` is not 3-D or
+/// `xs` is not 3-D; if `xs`'s hidden dim does not match the packed weight
+/// tensor's `in_dim`; if `xs` dim\[0\] does not match `tokens`; or if `xs`
+/// dim\[1\] is neither `1` nor `topk`.
+fn validate_moe_forward_dims(
+    packed_weights: &QTensor,
+    xs: &Tensor,
+    tokens: usize,
+    topk: usize,
+) -> Result<MoeForwardDims> {
+    if xs.dtype() != DType::F32 {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs must be F32, got {:?}",
+            xs.dtype()
+        );
+    }
+
+    let weight_dims = packed_weights.shape().dims();
+    if weight_dims.len() != 3 {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: packed_weights must be 3-D \
+             [num_experts, out_dim, in_dim], got {}-D {:?}",
+            weight_dims.len(),
+            weight_dims
+        );
+    }
+    let (num_experts, out_dim, in_dim) = (weight_dims[0], weight_dims[1], weight_dims[2]);
+
+    let xs_dims = xs.dims();
+    if xs_dims.len() != 3 {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs must be 3-D [tokens, input_dim1, in_dim], \
+             got {}-D {:?}",
+            xs_dims.len(),
+            xs_dims
+        );
+    }
+    let (xs_tokens, input_dim1, xs_hidden) = (xs_dims[0], xs_dims[1], xs_dims[2]);
+    if xs_hidden != in_dim {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs hidden dim {xs_hidden} does not match weight in_dim {in_dim}"
+        );
+    }
+    if xs_tokens != tokens {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs dim[0] ({xs_tokens}) does not match \
+             topk_ids dim[0] ({tokens})"
+        );
+    }
+    if input_dim1 != 1 && input_dim1 != topk {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs dim[1] must be 1 (shared input) or \
+             topk ({topk}, per-slot input), got {input_dim1}",
+        );
+    }
+
+    Ok(MoeForwardDims {
+        num_experts,
+        out_dim,
+        in_dim,
+        tokens,
+        input_dim1,
+        topk,
+    })
+}
+
+/// Per-expert lists of routed `(token, slot)` pairs, indexed by expert id.
+type MoeTokenLists = Vec<Vec<(usize, usize)>>;
+
+/// Pre-computed token-to-expert routing for [`cpu_indexed_moe_forward`].
+///
+/// Built once per `topk_ids` via [`MoeRouting::compute`] and shared across
+/// both the `gate_up` and down projection calls of a decode step, since both
+/// route the same `topk_ids` and would otherwise redo identical grouping
+/// work. Its buffers keep their heap capacity across calls to `compute`, so
+/// reusing one `MoeRouting` across steps avoids reallocating on the decode
+/// hot path.
+#[derive(Default)]
+pub struct MoeRouting {
+    token_lists: MoeTokenLists,
+    active_experts: Vec<usize>,
+    topk_ids_flat: Vec<u32>,
+    /// Cumulative sum of `token_lists[e].len()` over `active_experts`, one
+    /// longer than `active_experts` (a leading `0`). Shared by both
+    /// `dispatch_moe_quads` calls of a decode step instead of being rebuilt
+    /// per call.
+    pair_prefix: Vec<usize>,
+    num_experts: usize,
+    tokens: usize,
+    topk: usize,
+}
+
+impl MoeRouting {
+    /// Creates an empty routing with no buffers allocated yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Groups `topk_ids` (`[tokens, topk]` `u32`) by routed expert.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `topk_ids` is not 2-D, if any of its values is
+    /// `>= num_experts`, or if any tensor op fails.
+    pub fn compute(&mut self, topk_ids: &Tensor, num_experts: usize) -> Result<()> {
+        if topk_ids.dims().len() != 2 {
+            candle_core::bail!(
+                "MoeRouting::compute: topk_ids must be 2-D [tokens, topk], got {}-D {:?}",
+                topk_ids.dims().len(),
+                topk_ids.dims()
+            );
+        }
+        let (tokens, topk) = (topk_ids.dims()[0], topk_ids.dims()[1]);
+
+        self.topk_ids_flat.clear();
+        self.topk_ids_flat
+            .extend(topk_ids.flatten_all()?.to_vec1::<u32>()?);
+
+        group_tokens_by_expert(
+            &self.topk_ids_flat,
+            num_experts,
+            tokens,
+            topk,
+            &mut self.token_lists,
+            &mut self.active_experts,
+        )?;
+
+        self.pair_prefix.clear();
+        self.pair_prefix.push(0usize);
+        let mut prev = 0usize;
+        for &e in &self.active_experts {
+            prev += self.token_lists[e].len();
+            self.pair_prefix.push(prev);
+        }
+
+        self.num_experts = num_experts;
+        self.tokens = tokens;
+        self.topk = topk;
+        Ok(())
+    }
+}
+
+/// CPU-side batched `MoE` dispatch: the CPU equivalent of
+/// `QTensor::indexed_moe_forward`, which is CUDA/`ROCm`-only. Replaces the
+/// per-expert loop's serialized matmuls (one `BarrierPool` dispatch per
+/// expert) with a single merged dispatch across every routed expert's
+/// output columns.
+///
+/// `packed_weights` is a CPU-resident `[num_experts, out_dim, in_dim]`
+/// `QTensor`. `xs` is F32 with shape `[tokens, input_dim1, in_dim]`:
+/// `input_dim1` is `1` when every routed expert of a token shares the same
+/// input row (the gate+up projection), or `topk` when each routed expert has
+/// its own row (the down projection, fed the per-expert intermediate
+/// activation). `routing` must already be computed (via
+/// [`MoeRouting::compute`]) for `packed_weights`' expert count; callers
+/// doing both projections for one decode step should compute it once and
+/// pass it to both calls.
+///
+/// Returns an F32 tensor of shape `[tokens, topk, out_dim]`.
+///
+/// # Errors
+///
+/// Returns an error if `xs` is not F32; if `packed_weights` is not 3-D or
+/// `xs` is not 3-D; if `xs` dim\[1\] is neither `1` nor `topk`; if `xs`'s
+/// hidden dim does not match the packed weight tensor's `in_dim`; if `xs`
+/// dim\[0\] does not match `routing`'s token count; if `routing` was computed
+/// for a different expert count than `packed_weights` has; if `packed_weights`
+/// or `xs` is not CPU-resident; if `in_dim` is not a multiple of the
+/// quantization block size; if the packed weight data length is inconsistent
+/// with the computed per-expert byte count; or if any tensor op fails.
+///
+/// # Panics
+///
+/// May panic if the packed weight tensor's raw bytes are not correctly
+/// aligned for the underlying quantization block type, or if the byte
+/// count per expert is not an exact multiple of the block's in-memory
+/// size. These are internal invariants of `QTensor` construction and
+/// should not be triggered by well-formed inputs.
+pub fn cpu_indexed_moe_forward(
+    packed_weights: &QTensor,
+    xs: &Tensor,
+    routing: &MoeRouting,
+) -> Result<Tensor> {
+    let dims = validate_moe_forward_dims(packed_weights, xs, routing.tokens, routing.topk)?;
+    if dims.num_experts != routing.num_experts {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: routing was computed for {} experts, \
+             but packed_weights has {} experts",
+            routing.num_experts,
+            dims.num_experts
+        );
+    }
+    if !packed_weights.device().is_cpu() {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: packed_weights must be CPU-resident, got {:?}",
+            packed_weights.device()
+        );
+    }
+    if !xs.device().is_cpu() {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: xs must be CPU-resident, got {:?}",
+            xs.device()
+        );
+    }
+
+    // Small per-step copy (decode-step `xs` is `[tokens, 1|topk, in_dim]`,
+    // typically a single token); candle has no zero-copy accessor for a
+    // contiguous CPU tensor's raw `f32` slice.
+    let xs_flat = xs.flatten_all()?.to_vec1::<f32>()?;
+
+    let dtype = packed_weights.dtype();
+    let block_size = dtype.block_size();
+    let type_size = dtype.type_size();
+    if !dims.in_dim.is_multiple_of(block_size) {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: in_dim {} is not a multiple of block size {block_size}",
+            dims.in_dim,
+        );
+    }
+    let bytes_per_expert = dims.out_dim * dims.in_dim / block_size * type_size;
+    let k_in_blocks = dims.in_dim.div_ceil(block_size);
+
+    let weight_data = packed_weights.data()?;
+    if weight_data.len() != bytes_per_expert * dims.num_experts {
+        candle_core::bail!(
+            "cpu_indexed_moe_forward: packed weight data length {} does not match \
+             expected {} ({} experts x {bytes_per_expert} bytes)",
+            weight_data.len(),
+            bytes_per_expert * dims.num_experts,
+            dims.num_experts,
+        );
+    }
+
+    macro_rules! dispatch {
+        ($block:ty) => {
+            batched_moe_matmul::<$block>(
+                &weight_data,
+                bytes_per_expert,
+                k_in_blocks,
+                &xs_flat,
+                routing,
+                &dims,
+            )
+        };
+    }
+    let dst = match dtype {
+        GgmlDType::F32 => dispatch!(f32),
+        GgmlDType::F16 => dispatch!(f16),
+        GgmlDType::BF16 => dispatch!(bf16),
+        GgmlDType::Q4_0 => dispatch!(BlockQ4_0),
+        GgmlDType::Q4_1 => dispatch!(BlockQ4_1),
+        GgmlDType::Q5_0 => dispatch!(BlockQ5_0),
+        GgmlDType::Q5_1 => dispatch!(BlockQ5_1),
+        GgmlDType::Q8_0 => dispatch!(BlockQ8_0),
+        GgmlDType::Q8_1 => dispatch!(BlockQ8_1),
+        GgmlDType::Q2K => dispatch!(BlockQ2K),
+        GgmlDType::Q3K => dispatch!(BlockQ3K),
+        GgmlDType::Q4K => dispatch!(BlockQ4K),
+        GgmlDType::Q5K => dispatch!(BlockQ5K),
+        GgmlDType::Q6K => dispatch!(BlockQ6K),
+        GgmlDType::Q8K => dispatch!(BlockQ8K),
+    };
+
+    Tensor::from_vec(dst, (dims.tokens, dims.topk, dims.out_dim), &Device::Cpu)
+}
+
+/// Groups every `(token, slot)` pair by its routed expert into `token_lists`
+/// (indexed by expert id, empty for unrouted experts) and `active_experts`
+/// (the sorted list of experts with at least one routed pair). Both are
+/// cleared and refilled in place, reusing their existing heap capacity
+/// across calls instead of reallocating.
+///
+/// # Errors
+///
+/// Returns an error if any `topk_ids` value is `>= num_experts`.
+fn group_tokens_by_expert(
+    topk_ids: &[u32],
+    num_experts: usize,
+    tokens: usize,
+    topk: usize,
+    token_lists: &mut MoeTokenLists,
+    active_experts: &mut Vec<usize>,
+) -> Result<()> {
+    if token_lists.len() != num_experts {
+        token_lists.resize_with(num_experts, Vec::new);
+    }
+    for list in token_lists.iter_mut() {
+        list.clear();
+    }
+    for t in 0..tokens {
+        for s in 0..topk {
+            let expert_idx = topk_ids[t * topk + s] as usize;
+            if expert_idx >= num_experts {
+                candle_core::bail!(
+                    "cpu_indexed_moe_forward: topk_ids[{t}, {s}] = {expert_idx} \
+                     exceeds num_experts ({num_experts})",
+                );
+            }
+            token_lists[expert_idx].push((t, s));
+        }
+    }
+    active_experts.clear();
+    active_experts.extend((0..num_experts).filter(|&e| !token_lists[e].is_empty()));
+    Ok(())
+}
+
+/// Quantizes every unique input row into `T::VecDotType` blocks once, into
+/// `scratch` (resized as needed), so experts sharing an input row (relevant
+/// when `input_dim1 == 1`, i.e. the gate+up projection) reuse the same
+/// quantized copy instead of re-quantizing per routed expert.
+///
+/// Rows are independent, so the block-quantized path (`DIRECT_COPY ==
+/// false`, i.e. every K-quant weight type) splits them across
+/// [`barrier_pool`] the same way [`dispatch_moe_quads`] splits output
+/// columns. Left serial, this loop runs on one thread while every other
+/// pool worker sits idle waiting for the matmul dispatch that follows it,
+/// which is what caps overall CPU utilization well under 100% despite the
+/// matmul itself being fully parallel.
+fn quantize_lhs_rows<'a, T: GgmlType>(
+    xs: &[f32],
+    num_rows: usize,
+    in_dim: usize,
+    k_in_blocks: usize,
+    scratch: &'a mut Vec<u64>,
+) -> &'a [T::VecDotType] {
+    let elem_size = std::mem::size_of::<T::VecDotType>();
+    let scratch_len = (num_rows * k_in_blocks * elem_size).div_ceil(8);
+    if scratch.len() < scratch_len {
+        scratch.resize(scratch_len, 0);
+    }
+    let lhs_ptr = scratch.as_mut_ptr().cast::<T::VecDotType>() as usize;
+    if T::DIRECT_COPY {
+        // SAFETY: u64 alignment (8 bytes) covers every `VecDotType` block
+        // type; the buffer holds exactly `num_rows * k_in_blocks` elements.
+        let lhs_b: &'a mut [T::VecDotType] = unsafe {
+            std::slice::from_raw_parts_mut(lhs_ptr as *mut T::VecDotType, num_rows * k_in_blocks)
+        };
+        T::VecDotType::direct_copy(xs, lhs_b);
+    } else if num_rows > 0 {
+        let pool = barrier_pool();
+        let n_total = pool.n_workers() + 1;
+        let rows_per_thread = num_rows.div_ceil(n_total);
+        pool.execute(|tid| {
+            let start = tid * rows_per_thread;
+            if start >= num_rows {
+                return;
+            }
+            let end = num_rows.min(start + rows_per_thread);
+            // SAFETY: each thread only ever touches rows in its own
+            // exclusively-owned `start..end` range, computed from `tid`
+            // the same way `dispatch_moe_quads` partitions its flat index
+            // space, so no two threads ever write the same row.
+            let lhs_b: &mut [T::VecDotType] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    lhs_ptr as *mut T::VecDotType,
+                    num_rows * k_in_blocks,
+                )
+            };
+            for row_idx in start..end {
+                let src = &xs[row_idx * in_dim..(row_idx + 1) * in_dim];
+                let dst_row = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                T::VecDotType::from_float(src, dst_row);
+            }
+        });
+    }
+    // SAFETY: every row in `0..num_rows` has now been written, either by
+    // `direct_copy` or by the parallel loop above.
+    unsafe { std::slice::from_raw_parts(lhs_ptr as *const T::VecDotType, num_rows * k_in_blocks) }
+}
+
+/// Shared read-only context for the batched `MoE` matmul dispatch
+/// functions. Bundles the parameters that [`dispatch_moe_quads`] and
+/// [`moe_tail_columns`] both need, so those functions don't need a long
+/// individually-listed argument list.
+struct MoeMatmulCtx<'a> {
+    weight_data: &'a [u8],
+    bytes_per_expert: usize,
+    k_in_blocks: usize,
+    token_lists: &'a [Vec<(usize, usize)>],
+    active_experts: &'a [usize],
+    /// Precomputed by [`MoeRouting::compute`]; see that field's doc comment.
+    pair_prefix: &'a [usize],
+    input_dim1: usize,
+    topk: usize,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+/// Single static-merged [`barrier_pool`] dispatch across every routed
+/// `(token, slot)` pair's output-column quads (`out_dim & !3` columns, in
+/// groups of 4).
+///
+/// The flat work space is `total_routed_pairs * quads_per_expert`, where
+/// `total_routed_pairs` is `tokens * topk` -- fixed regardless of how
+/// routing is distributed across experts, since every routed pair belongs
+/// to exactly one expert. Splitting this space evenly across threads
+/// therefore gives every thread the same amount of real `vec_dot_4` work
+/// no matter how skewed real-world routing is (a handful of "hot" experts
+/// taking far more tokens than the rest, which is the common case, not
+/// the exception, once routing comes from a real trained gate rather than
+/// a synthetic uniform distribution). Partitioning by
+/// `active_experts.len() * quads_per_expert` instead would implicitly
+/// treat every active expert as equal-sized work regardless of how many
+/// tokens it actually received, leaving some threads with far more real
+/// work than others under skewed routing while the rest sat idle.
+fn dispatch_moe_quads<T: GgmlType>(
+    ctx: &MoeMatmulCtx<'_>,
+    lhs_b: &[T::VecDotType],
+    quads_per_expert: usize,
+    dst: &mut [f32],
+) {
+    if ctx.active_experts.is_empty() || quads_per_expert == 0 {
+        return;
+    }
+    let pair_prefix = ctx.pair_prefix;
+    let total_pairs = pair_prefix[ctx.active_experts.len()];
+    let total_items = total_pairs * quads_per_expert;
+    if total_items == 0 {
+        return;
+    }
+    let pool = barrier_pool();
+    let n_total = pool.n_workers() + 1;
+    let items_per_thread = total_items.div_ceil(n_total);
+    let dst_ptr = dst.as_mut_ptr() as usize;
+
+    pool.execute(|tid| {
+        let start = tid * items_per_thread;
+        if start >= total_items {
+            return;
+        }
+        let end = total_items.min((tid + 1) * items_per_thread);
+        let dst_ptr = dst_ptr as *mut f32;
+
+        // Find the active-expert segment containing this thread's first
+        // pair once via binary search; subsequent iterations only ever
+        // advance forward through `pair_prefix` (checked below), since
+        // `pair_idx` increases monotonically within one thread's range.
+        // `start_pair < total_pairs` always holds here (`start <
+        // total_items` was checked above), so `Ok(i)` can only land on one
+        // of the first `active_experts.len()` prefix entries, never the
+        // final (`total_pairs`) one.
+        let start_pair = start / quads_per_expert;
+        let mut active_idx = match pair_prefix.binary_search(&start_pair) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        };
+        let mut expert_idx = ctx.active_experts[active_idx];
+        let mut expert_rhs: &[T] = as_quantized_slice(
+            &ctx.weight_data
+                [expert_idx * ctx.bytes_per_expert..(expert_idx + 1) * ctx.bytes_per_expert],
+        );
+
+        for flat_idx in start..end {
+            let pair_idx = flat_idx / quads_per_expert;
+            let quad_idx = flat_idx % quads_per_expert;
+            let col = quad_idx * 4;
+
+            while pair_idx >= pair_prefix[active_idx + 1] {
+                active_idx += 1;
+                expert_idx = ctx.active_experts[active_idx];
+                expert_rhs = as_quantized_slice(
+                    &ctx.weight_data[expert_idx * ctx.bytes_per_expert
+                        ..(expert_idx + 1) * ctx.bytes_per_expert],
+                );
+            }
+            let local_pair = pair_idx - pair_prefix[active_idx];
+            let (t, s) = ctx.token_lists[expert_idx][local_pair];
+
+            let w0 = &expert_rhs[col * ctx.k_in_blocks..(col + 1) * ctx.k_in_blocks];
+            let w1 = &expert_rhs[(col + 1) * ctx.k_in_blocks..(col + 2) * ctx.k_in_blocks];
+            let w2 = &expert_rhs[(col + 2) * ctx.k_in_blocks..(col + 3) * ctx.k_in_blocks];
+            let w3 = &expert_rhs[(col + 3) * ctx.k_in_blocks..(col + 4) * ctx.k_in_blocks];
+
+            let lhs_row_idx = if ctx.input_dim1 == 1 {
+                t
+            } else {
+                t * ctx.topk + s
+            };
+            let lhs_row =
+                &lhs_b[lhs_row_idx * ctx.k_in_blocks..(lhs_row_idx + 1) * ctx.k_in_blocks];
+            let (d0, d1, d2, d3) = T::vec_dot_4(ctx.in_dim, w0, w1, w2, w3, lhs_row);
+
+            let out_offset = (t * ctx.topk + s) * ctx.out_dim + col;
+            // SAFETY: each (t, s, col) triple is written by exactly one
+            // thread. (t, s) is routed to exactly one expert (this loop's
+            // `expert_idx`), and `col` falls in this thread's
+            // exclusively-owned `flat_idx` range, so no other thread's
+            // iteration ever targets this `out_offset`.
+            unsafe {
+                let base = dst_ptr.add(out_offset);
+                *base = d0;
+                *base.add(1) = d1;
+                *base.add(2) = d2;
+                *base.add(3) = d3;
+            }
+        }
+    });
+}
+
+/// Handles the 0..=3 output columns left over when `out_dim` isn't a
+/// multiple of 4, sequentially on the calling thread -- same
+/// `vec_dot_2`/`vec_dot` split as `k_quants::matmul`'s tail handling.
+fn moe_tail_columns<T: GgmlType>(
+    ctx: &MoeMatmulCtx<'_>,
+    lhs_b: &[T::VecDotType],
+    n_quad: usize,
+    dst: &mut [f32],
+) {
+    let n_tail = ctx.out_dim - n_quad;
+    if n_tail == 0 {
+        return;
+    }
+    for &expert_idx in ctx.active_experts {
+        let expert_bytes = &ctx.weight_data
+            [expert_idx * ctx.bytes_per_expert..(expert_idx + 1) * ctx.bytes_per_expert];
+        let expert_rhs: &[T] = as_quantized_slice(expert_bytes);
+        for &(t, s) in &ctx.token_lists[expert_idx] {
+            let lhs_row_idx = if ctx.input_dim1 == 1 {
+                t
+            } else {
+                t * ctx.topk + s
+            };
+            let lhs_row =
+                &lhs_b[lhs_row_idx * ctx.k_in_blocks..(lhs_row_idx + 1) * ctx.k_in_blocks];
+            let out_offset = (t * ctx.topk + s) * ctx.out_dim + n_quad;
+            if n_tail >= 2 {
+                let col = n_quad;
+                let w0 = &expert_rhs[col * ctx.k_in_blocks..(col + 1) * ctx.k_in_blocks];
+                let w1 = &expert_rhs[(col + 1) * ctx.k_in_blocks..(col + 2) * ctx.k_in_blocks];
+                let (d0, d1) = T::vec_dot_2(ctx.in_dim, w0, w1, lhs_row);
+                dst[out_offset] = d0;
+                dst[out_offset + 1] = d1;
+            }
+            if n_tail & 1 == 1 {
+                let col = ctx.out_dim - 1;
+                let w = &expert_rhs[col * ctx.k_in_blocks..(col + 1) * ctx.k_in_blocks];
+                dst[out_offset + n_tail - 1] = T::vec_dot(ctx.in_dim, w, lhs_row);
+            }
+        }
+    }
+}
+
+// Thread-local scratch buffer reused across calls to avoid per-matmul heap
+// allocation of the quantized LHS. Mirrors `k_quants::matmul`'s pattern.
+// Using u64 ensures sufficient alignment regardless of `T::VecDotType`.
+thread_local! {
+    static MOE_LHS_SCRATCH: std::cell::RefCell<Vec<u64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Core batched matmul for one projection across every routed expert,
+/// dispatched from [`cpu_indexed_moe_forward`] after `GgmlDType` matching.
+///
+/// Mirrors `k_quants::matmul`'s LHS-quantization and `vec_dot_4` pattern,
+/// but flattens every active expert's output-column quads into a single
+/// index space and issues one [`barrier_pool`] dispatch for the whole
+/// projection, instead of one dispatch per expert. LHS rows are quantized
+/// once and shared across every expert a row is routed to (relevant when
+/// `input_dim1 == 1`, i.e. the gate+up projection, where all `topk` routed
+/// experts for a token share the same input row). `routing` supplies the
+/// token-to-expert grouping, already computed by the caller.
+fn batched_moe_matmul<T: GgmlType>(
+    weight_data: &[u8],
+    bytes_per_expert: usize,
+    k_in_blocks: usize,
+    xs: &[f32],
+    routing: &MoeRouting,
+    dims: &MoeForwardDims,
+) -> Vec<f32> {
+    let tokens = routing.tokens;
+    let topk = routing.topk;
+    let (input_dim1, in_dim, out_dim) = (dims.input_dim1, dims.in_dim, dims.out_dim);
+
+    let num_rows = if input_dim1 == 1 {
+        tokens
+    } else {
+        tokens * topk
+    };
+
+    // Output is zero-initialized so unrouted (token, slot) pairs stay zero.
+    let mut dst = vec![0.0f32; tokens * topk * out_dim];
+    let n_quad = out_dim & !3;
+    let quads_per_expert = n_quad / 4;
+
+    MOE_LHS_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let lhs_b = quantize_lhs_rows::<T>(xs, num_rows, in_dim, k_in_blocks, &mut scratch);
+
+        let ctx = MoeMatmulCtx {
+            weight_data,
+            bytes_per_expert,
+            k_in_blocks,
+            token_lists: &routing.token_lists,
+            active_experts: &routing.active_experts,
+            pair_prefix: &routing.pair_prefix,
+            input_dim1,
+            topk,
+            in_dim,
+            out_dim,
+        };
+
+        dispatch_moe_quads::<T>(&ctx, lhs_b, quads_per_expert, &mut dst);
+        moe_tail_columns::<T>(&ctx, lhs_b, n_quad, &mut dst);
+    });
+
+    dst
 }
 
 /// Whether `QTensor::indexed_moe_forward` (Phase 8a's fused `MoE` dispatch) is
@@ -2284,5 +2941,652 @@ mod tests {
             diff < 1e-8,
             "MlpOrMoe::Dense output should match direct expert forward, diff={diff}"
         );
+    }
+
+    /// Builds a packed `[num_experts, out_dim, in_dim]` `QTensor`, quantized
+    /// as `dtype`, where expert `i`'s weight matrix is filled with
+    /// `(i + 1) * 0.1`.
+    fn make_packed_experts(
+        num_experts: usize,
+        out_dim: usize,
+        in_dim: usize,
+        dtype: GgmlDType,
+        device: &Device,
+    ) -> QTensor {
+        let mut data = Vec::with_capacity(num_experts * out_dim * in_dim);
+        for e in 0..num_experts {
+            let val = (e + 1) as f32 * 0.1;
+            data.extend(std::iter::repeat_n(val, out_dim * in_dim));
+        }
+        let tensor = Tensor::from_vec(data, (num_experts, out_dim, in_dim), device)
+            .expect("packed weight tensor");
+        QTensor::quantize(&tensor, dtype).expect("quantize packed weights")
+    }
+
+    /// Computes a [`MoeRouting`] for `topk_ids`, for tests that only need
+    /// routing for a single `cpu_indexed_moe_forward` call.
+    fn make_routing(topk_ids: &Tensor, num_experts: usize) -> MoeRouting {
+        let mut routing = MoeRouting::new();
+        routing
+            .compute(topk_ids, num_experts)
+            .expect("compute routing");
+        routing
+    }
+
+    /// Reference implementation: for each `(token, slot)`, runs expert
+    /// `topk_ids[token, slot]`'s matmul directly against its input row via
+    /// `slice_packed_qtensor` + `QMatMul`, without any of
+    /// `cpu_indexed_moe_forward`'s batching. Returns a flat
+    /// `[tokens * topk * out_dim]` `Vec<f32>`.
+    fn reference_moe_forward(
+        packed: &QTensor,
+        xs: &[f32],
+        topk_ids: &[u32],
+        tokens: usize,
+        input_dim1: usize,
+        topk: usize,
+        in_dim: usize,
+        out_dim: usize,
+        device: &Device,
+    ) -> Vec<f32> {
+        let dtype = packed.dtype();
+        let raw = packed.data().expect("packed data");
+        let mut out = vec![0.0f32; tokens * topk * out_dim];
+        for t in 0..tokens {
+            for s in 0..topk {
+                let expert_idx = topk_ids[t * topk + s] as usize;
+                let row_idx = if input_dim1 == 1 { t } else { t * topk + s };
+                let row = Tensor::from_vec(
+                    xs[row_idx * in_dim..(row_idx + 1) * in_dim].to_vec(),
+                    (1, in_dim),
+                    device,
+                )
+                .expect("input row");
+                let sliced = slice_packed_qtensor(&raw, dtype, expert_idx, out_dim, in_dim, device)
+                    .expect("slice expert");
+                let qmm = QMatMul::from_arc(Arc::new(sliced)).expect("QMatMul");
+                let expected_row = qmm
+                    .forward(&row)
+                    .expect("expert forward")
+                    .flatten_all()
+                    .expect("flatten")
+                    .to_vec1::<f32>()
+                    .expect("to_vec1");
+                out[(t * topk + s) * out_dim..(t * topk + s + 1) * out_dim]
+                    .copy_from_slice(&expected_row);
+            }
+        }
+        out
+    }
+
+    // GgmlDType::F32 quantization is lossless, so `cpu_indexed_moe_forward`'s
+    // output can be compared exactly against per-expert reference matmuls.
+    // Exercises the `input_dim1 == 1` case (gate/up projection): every
+    // routed slot for a token shares the same input row.
+    #[test]
+    fn test_cpu_indexed_moe_forward_f32_exact_shared_input() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (4usize, 8usize, 4usize);
+        let (tokens, topk) = (3usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| (i as f32) * 0.05 - 1.0)
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % num_experts) as u32, ((t + 2) % num_experts) as u32])
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // Exercises the `input_dim1 == topk` case (down projection): each
+    // routed slot has its own input row (the per-expert intermediate
+    // activation).
+    #[test]
+    fn test_cpu_indexed_moe_forward_f32_exact_per_slot_input() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 6usize, 4usize);
+        let (tokens, topk) = (2usize, 3usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..tokens * topk * in_dim)
+            .map(|i| (i as f32) * 0.03 + 0.1)
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, topk, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens * topk)
+            .map(|i| (i % num_experts) as u32)
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            topk,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // GgmlDType::Q8_0 introduces real quantization error, unlike the lossless
+    // F32 tests above, so this uses a wider tolerance while still exercising
+    // the real quantize/dequantize `vec_dot_4` path with `BLCK_SIZE=32`.
+    #[test]
+    fn test_cpu_indexed_moe_forward_q8_0_tolerance() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (4usize, 32usize, 64usize);
+        let (tokens, topk) = (2usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::Q8_0, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| ((i as f32) * 0.01).sin())
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % num_experts) as u32, ((t + 1) % num_experts) as u32])
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 0.05,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // GgmlDType::Q4K is a K-quant super-block format (`BLCK_SIZE=256`,
+    // `DIRECT_COPY == false`), unlike Q8_0's flat block layout -- this
+    // exercises `quantize_lhs_rows`'s parallel `from_float` path and Q4K's
+    // super-block `vec_dot_4`, which is the format CPU-offloaded MoE experts
+    // most commonly ship as in practice.
+    #[test]
+    fn test_cpu_indexed_moe_forward_q4k_tolerance() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (4usize, 32usize, 256usize);
+        let (tokens, topk) = (2usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::Q4K, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| ((i as f32) * 0.01).sin())
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % num_experts) as u32, ((t + 1) % num_experts) as u32])
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 0.1,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // An expert with no routed tokens must leave its would-be output slots
+    // at zero, since `dst` is zero-initialized and unrouted experts never
+    // appear in `active_experts`.
+    #[test]
+    fn test_cpu_indexed_moe_forward_unrouted_expert_stays_zero() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 8usize, 4usize);
+        let (tokens, topk) = (2usize, 1usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim).map(|i| (i as f32) * 0.1).collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        // Every token routes to expert 0 only; experts 1 and 2 are unrouted.
+        let topk_ids_data: Vec<u32> = vec![0u32; tokens * topk];
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+        // Sanity: expert 0's output must actually be non-zero (otherwise
+        // this test would trivially pass with a broken kernel that always
+        // returns zeros).
+        assert!(got_vals.iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    // The primary decode use case: a single token routed to `topk` experts,
+    // all sharing the same input row.
+    #[test]
+    fn test_cpu_indexed_moe_forward_single_token_decode() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (8usize, 16usize, 8usize);
+        let (tokens, topk) = (1usize, 8usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..in_dim).map(|i| (i as f32) * 0.2 - 0.5).collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        // All experts routed exactly once, in order.
+        let topk_ids_data: Vec<u32> = (0..num_experts as u32).collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got_vals.iter().zip(expected.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "got {got_vals:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // `out_dim` not a multiple of 4 exercises the tail-column path
+    // (`vec_dot_2` for 2 remaining columns, `vec_dot` for 1) separately from
+    // the main quad loop. Tested at tail lengths 1, 2, and 3.
+    #[test]
+    fn test_cpu_indexed_moe_forward_tail_columns() {
+        let device = &Device::Cpu;
+        for out_dim in [5usize, 6, 7] {
+            let (num_experts, in_dim) = (3usize, 4usize);
+            let (tokens, topk) = (2usize, 2usize);
+
+            let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+            let xs_data: Vec<f32> = (0..tokens * in_dim).map(|i| (i as f32) * 0.07).collect();
+            let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+            let topk_ids_data: Vec<u32> = (0..tokens)
+                .flat_map(|t| [(t % num_experts) as u32, ((t + 1) % num_experts) as u32])
+                .collect();
+            let topk_ids =
+                Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+            let routing = make_routing(&topk_ids, num_experts);
+            let got =
+                cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+            let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+            let expected = reference_moe_forward(
+                &packed,
+                &xs_data,
+                &topk_ids_data,
+                tokens,
+                1,
+                topk,
+                in_dim,
+                out_dim,
+                device,
+            );
+            for (g, e) in got_vals.iter().zip(expected.iter()) {
+                assert!(
+                    (g - e).abs() < 1e-5,
+                    "out_dim={out_dim}: got {got_vals:?}, expected {expected:?}"
+                );
+            }
+        }
+    }
+
+    // Large enough (64 experts, out_dim=256 -> 4096 work items) to force
+    // `dispatch_moe_quads`'s barrier pool to split work across multiple
+    // worker threads, actually exercising the unsafe cross-thread `dst`
+    // write's exclusivity guarantee rather than running single-threaded.
+    #[test]
+    fn test_cpu_indexed_moe_forward_large_concurrency() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (64usize, 256usize, 128usize);
+        let (tokens, topk) = (4usize, 8usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| ((i as f32) * 0.001).sin())
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens * topk)
+            .map(|i| (i % num_experts) as u32)
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (i, (g, e)) in got_vals.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "mismatch at index {i}: got {g}, expected {e}"
+            );
+        }
+    }
+
+    // `dispatch_moe_quads` partitions its flat work space by actual
+    // routed-pair count rather than by `active_experts.len()`, so it must
+    // stay correct when routing is unbalanced (a handful of experts
+    // taking far more tokens than the rest) and pairs are visited out of
+    // per-expert order. This test's skewed routing (all of slot 0 routed
+    // to expert 0, the rest spread thinly) exercises that every pair
+    // still gets visited exactly once and lands in the correct output row.
+    #[test]
+    fn test_cpu_indexed_moe_forward_skewed_routing_matches_reference() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (16usize, 32usize, 16usize);
+        let (tokens, topk) = (40usize, 4usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..tokens * in_dim)
+            .map(|i| ((i as f32) * 0.037).cos())
+            .collect();
+        let xs = Tensor::from_vec(xs_data.clone(), (tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = (0..tokens)
+            .flat_map(|t| {
+                (0..topk).map(move |s| {
+                    if s == 0 {
+                        0
+                    } else {
+                        (1 + (t * 5 + s * 3) % (num_experts - 1)) as u32
+                    }
+                })
+            })
+            .collect();
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data.clone(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        let expected = reference_moe_forward(
+            &packed,
+            &xs_data,
+            &topk_ids_data,
+            tokens,
+            1,
+            topk,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (i, (g, e)) in got_vals.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-4,
+                "mismatch at index {i}: got {g}, expected {e}"
+            );
+        }
+    }
+
+    // Zero tokens means `active_experts` is empty, exercising the
+    // `total_items == 0` early return in `dispatch_moe_quads` directly
+    // (distinct from the unrouted-expert test, which still has active
+    // experts and non-empty token lists).
+    #[test]
+    fn test_cpu_indexed_moe_forward_zero_tokens() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 8usize, 4usize);
+        let (tokens, topk) = (0usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs = Tensor::from_vec(Vec::<f32>::new(), (tokens, 1, in_dim), device).expect("xs");
+        let topk_ids =
+            Tensor::from_vec(Vec::<u32>::new(), (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let got = cpu_indexed_moe_forward(&packed, &xs, &routing).expect("cpu_indexed_moe_forward");
+        assert_eq!(got.dims(), &[tokens, topk, out_dim]);
+        let got_vals = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(got_vals.is_empty());
+    }
+
+    // A `topk_ids` row count that doesn't match `xs`'s token count must
+    // return an error instead of `group_tokens_by_expert` indexing past the
+    // end of the flattened `topk_ids` buffer.
+    #[test]
+    fn test_cpu_indexed_moe_forward_mismatched_tokens() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 8usize, 4usize);
+        let (xs_tokens, topk_ids_tokens, topk) = (3usize, 2usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+
+        let xs_data: Vec<f32> = (0..xs_tokens * in_dim).map(|i| i as f32).collect();
+        let xs = Tensor::from_vec(xs_data, (xs_tokens, 1, in_dim), device).expect("xs");
+
+        let topk_ids_data: Vec<u32> = vec![0u32; topk_ids_tokens * topk];
+        let topk_ids =
+            Tensor::from_vec(topk_ids_data, (topk_ids_tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts);
+        let err = cpu_indexed_moe_forward(&packed, &xs, &routing)
+            .expect_err("mismatched token counts must error, not panic");
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // `MoeRouting` computed for a different expert count than `packed_weights`
+    // has must error, rather than let the matmul index the weight buffer
+    // with an expert id that was valid at grouping time but isn't now.
+    #[test]
+    fn test_cpu_indexed_moe_forward_routing_expert_count_mismatch() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 8usize, 4usize);
+        let (tokens, topk) = (2usize, 2usize);
+
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+        let xs_data: Vec<f32> = (0..tokens * in_dim).map(|i| i as f32).collect();
+        let xs = Tensor::from_vec(xs_data, (tokens, 1, in_dim), device).expect("xs");
+        let topk_ids_data: Vec<u32> = vec![0u32; tokens * topk];
+        let topk_ids = Tensor::from_vec(topk_ids_data, (tokens, topk), device).expect("topk_ids");
+
+        let routing = make_routing(&topk_ids, num_experts + 1);
+        let err = cpu_indexed_moe_forward(&packed, &xs, &routing)
+            .expect_err("expert count mismatch must error");
+        assert!(
+            err.to_string().contains("experts"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // A single `MoeRouting` reused across two different `topk_ids` (mirroring
+    // the gate_up/down-projection reuse it exists for) must produce correct
+    // results both times: `compute` must fully overwrite the prior call's
+    // grouping rather than leaking stale `token_lists`/`active_experts`
+    // entries left over from reusing their heap capacity.
+    #[test]
+    fn test_moe_routing_reuse() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (4usize, 8usize, 4usize);
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::F32, device);
+        let mut routing = MoeRouting::new();
+
+        let (tokens1, topk1) = (3usize, 2usize);
+        let xs1_data: Vec<f32> = (0..tokens1 * in_dim)
+            .map(|i| (i as f32) * 0.05 - 1.0)
+            .collect();
+        let xs1 = Tensor::from_vec(xs1_data.clone(), (tokens1, 1, in_dim), device).expect("xs1");
+        let topk_ids1_data: Vec<u32> = (0..tokens1)
+            .flat_map(|t| [(t % num_experts) as u32, ((t + 2) % num_experts) as u32])
+            .collect();
+        let topk_ids1 =
+            Tensor::from_vec(topk_ids1_data.clone(), (tokens1, topk1), device).expect("topk_ids1");
+        routing.compute(&topk_ids1, num_experts).expect("compute 1");
+        let got1 = cpu_indexed_moe_forward(&packed, &xs1, &routing).expect("forward 1");
+        let got1_vals = got1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected1 = reference_moe_forward(
+            &packed,
+            &xs1_data,
+            &topk_ids1_data,
+            tokens1,
+            1,
+            topk1,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got1_vals.iter().zip(expected1.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "call 1: got {got1_vals:?}, expected {expected1:?}"
+            );
+        }
+
+        let (tokens2, topk2) = (2usize, 1usize);
+        let xs2_data: Vec<f32> = (0..tokens2 * in_dim)
+            .map(|i| (i as f32) * 0.1 + 0.3)
+            .collect();
+        let xs2 = Tensor::from_vec(xs2_data.clone(), (tokens2, 1, in_dim), device).expect("xs2");
+        let topk_ids2_data: Vec<u32> = vec![num_experts as u32 - 1; tokens2 * topk2];
+        let topk_ids2 =
+            Tensor::from_vec(topk_ids2_data.clone(), (tokens2, topk2), device).expect("topk_ids2");
+        routing.compute(&topk_ids2, num_experts).expect("compute 2");
+        let got2 = cpu_indexed_moe_forward(&packed, &xs2, &routing).expect("forward 2");
+        let got2_vals = got2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected2 = reference_moe_forward(
+            &packed,
+            &xs2_data,
+            &topk_ids2_data,
+            tokens2,
+            1,
+            topk2,
+            in_dim,
+            out_dim,
+            device,
+        );
+        for (g, e) in got2_vals.iter().zip(expected2.iter()) {
+            assert!(
+                (g - e).abs() < 1e-5,
+                "call 2: got {got2_vals:?}, expected {expected2:?}"
+            );
+        }
     }
 }
