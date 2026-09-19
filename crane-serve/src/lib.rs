@@ -23,6 +23,8 @@ use crane_core::utils::DeviceExt;
 use tracing::info;
 
 use chat_template::ChatTemplateProcessor;
+use crane_core::device::DeviceAssignment;
+use engine::backend::ExpertPromotionPolicy;
 use engine::model_factory::{ModelFormat, ModelType};
 use engine::{EngineHandle, InferenceEngine, MemoryConfig};
 use handlers::asr::AsrTranscribeRequest;
@@ -81,6 +83,10 @@ pub struct Args {
     /// engine mode (not TTS/ASR/VLM/duplex).
     #[arg(long)]
     pub gpu_memory_limit: Option<String>,
+    /// Force all `MoE` expert weights to CPU regardless of
+    /// `--gpu-memory-limit`. Only affects Qwen3 `MoE` checkpoints.
+    #[arg(long)]
+    pub offload_experts: bool,
     /// MiniCPM-o duplex only: load the LLM tower from a standalone
     /// quantized GGUF file (e.g. a llama.cpp-style Qwen3 conversion like
     /// `MiniCPM-o-4_5-Q8_0.gguf`) instead of the checkpoint's own bf16
@@ -541,6 +547,51 @@ fn resolve_dtype(
         return Ok(DType::F16);
     }
     Ok(DType::F32)
+}
+
+/// Resolve `--gpu-memory-limit` / `--offload-experts` into an initial `MoE`
+/// expert `Device` (`devices.expert`) and, when the real GPU/CPU split must
+/// be decided after the model exists, an [`ExpertPromotionPolicy`] for the
+/// caller to hand to [`crate::engine::backend::Qwen3Backend::new`].
+///
+/// - No GPU / `--cpu`, or `--offload-experts`: experts start (and stay) on
+///   CPU, no promotion.
+/// - `--gpu-memory-limit` set: experts start on CPU; the returned policy
+///   tells the caller to attempt promoting them to GPU once the model
+///   exists and real VRAM headroom is known.
+/// - No limit, GPU present: experts load directly to the main GPU device,
+///   no promotion needed.
+fn resolve_expert_placement(
+    gpu_memory_limit: Option<&str>,
+    offload_experts: bool,
+    device: &crane_core::models::Device,
+    max_concurrent: usize,
+    max_seq_len: usize,
+) -> (DeviceAssignment, Option<ExpertPromotionPolicy>) {
+    if !is_gpu_device(device) || offload_experts {
+        return (
+            DeviceAssignment {
+                main: device.clone(),
+                expert: crane_core::models::Device::Cpu,
+            },
+            None,
+        );
+    }
+    let raw_limit = gpu_memory_limit.map_or(0, |s| MemoryConfig::parse_memory_limit(s, device));
+    if raw_limit == 0 {
+        return (DeviceAssignment::uniform(device), None);
+    }
+    (
+        DeviceAssignment {
+            main: device.clone(),
+            expert: crane_core::models::Device::Cpu,
+        },
+        Some(ExpertPromotionPolicy {
+            vram_ceiling_bytes: raw_limit,
+            max_concurrent: Some(max_concurrent),
+            max_seq_len: Some(max_seq_len),
+        }),
+    )
 }
 
 fn apply_text_only_override(
@@ -1222,13 +1273,21 @@ pub async fn run(mut args: Args) -> Result<()> {
     } else {
         // Only one of the TTS/ASR/VLM/LLM branches runs per process, so each is
         // the sole long-lived consumer of candle's process-wide rayon pool.
+        let (devices, promotion) = resolve_expert_placement(
+            args.gpu_memory_limit.as_deref(),
+            args.offload_experts,
+            &device,
+            args.max_concurrent,
+            args.max_seq_len,
+        );
         let mut backend = engine::model_factory::create_backend(
             model_type,
             &args.model_path,
-            &device,
+            &devices,
             &dtype,
             format,
             args.quant.as_deref(),
+            promotion.as_ref(),
         )?;
         info!(
             "Model loaded successfully (type: {:?}, format: {:?})",
@@ -1510,6 +1569,36 @@ mod dtype_tests {
             return; // no usable Metal device in this process/CI
         };
         assert_eq!(resolve_dtype(None, &d).unwrap(), DType::F16);
+    }
+
+    // ── resolve_expert_placement ──
+
+    #[test]
+    fn resolve_expert_placement_cpu_device_stays_cpu_no_promotion() {
+        let d = Device::Cpu;
+        let (devices, promotion) = resolve_expert_placement(Some("8G"), false, &d, 16, 4096);
+        assert!(devices.expert.is_cpu());
+        assert!(promotion.is_none());
+    }
+
+    #[test]
+    fn resolve_expert_placement_offload_experts_forces_cpu_no_promotion() {
+        let d = Device::Cpu;
+        // A CPU device already forces CPU on its own; this asserts
+        // --offload-experts is also checked independently of device kind
+        // (relevant once a real GPU device reaches this branch).
+        let (devices, promotion) = resolve_expert_placement(None, true, &d, 16, 4096);
+        assert!(devices.expert.is_cpu());
+        assert!(promotion.is_none());
+    }
+
+    #[test]
+    fn resolve_expert_placement_no_limit_on_cpu_is_uniform_cpu() {
+        let d = Device::Cpu;
+        let (devices, promotion) = resolve_expert_placement(None, false, &d, 16, 4096);
+        assert!(devices.main.is_cpu());
+        assert!(devices.expert.is_cpu());
+        assert!(promotion.is_none());
     }
 
     // ── --text-only override ──

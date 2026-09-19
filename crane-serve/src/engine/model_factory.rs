@@ -12,8 +12,8 @@ use serde::Deserialize;
 use std::path::Path;
 
 use super::backend::{
-    Gemma4Backend, HunyuanBackend, Minicpm5Backend, ModelBackend, Qwen3_5Backend, Qwen3Backend,
-    Qwen25Backend,
+    ExpertPromotionPolicy, Gemma4Backend, HunyuanBackend, Minicpm5Backend, ModelBackend,
+    Qwen3_5Backend, Qwen3Backend, Qwen25Backend,
 };
 use crate::chat_template::{AutoChatTemplate, ChatTemplateProcessor, HunyuanChatTemplate};
 
@@ -516,14 +516,19 @@ fn resolve(model_type: ModelType, model_path: &str) -> ModelType {
 ///
 /// `quant` requests in-situ quantization of a safetensors checkpoint (e.g.
 /// `q4k`, `q8_0`); only backends that support it accept the flag.
+/// `devices.expert` and `promotion` are Qwen3-specific `MoE` expert
+/// placement inputs (see [`super::backend::Qwen3Backend::new`]); ignored by
+/// every other backend, which uses `devices.main` for everything.
 pub fn create_backend(
     model_type: ModelType,
     model_path: &str,
-    device: &Device,
+    devices: &DeviceAssignment,
     dtype: &DType,
     format: ModelFormat,
     quant: Option<&str>,
+    promotion: Option<&ExpertPromotionPolicy>,
 ) -> Result<Box<dyn ModelBackend>> {
+    let device = &devices.main;
     let model_type = resolve(model_type, model_path);
     tracing::info!("Creating backend: {:?}", model_type);
 
@@ -569,9 +574,7 @@ pub fn create_backend(
         },
         ModelType::Qwen25 => Ok(Box::new(Qwen25Backend::new(model_path, device, dtype)?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3Backend::new(
-            model_path,
-            &DeviceAssignment::uniform(device),
-            dtype,
+            model_path, devices, dtype, promotion,
         )?)),
         ModelType::Qwen3_5 => {
             let quant = quant

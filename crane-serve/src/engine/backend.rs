@@ -607,6 +607,21 @@ impl ModelBackend for Qwen3_5Backend {
 //  Qwen 3 Backend
 // ─────────────────────────────────────────────────────────────
 
+/// `MoE` expert GPU-promotion policy, resolved from CLI flags in
+/// `crane-serve/src/lib.rs`. Never enters `crane-core` — the model only
+/// sees the resolved scalars via `Model::promote_experts_to_gpu`.
+pub struct ExpertPromotionPolicy {
+    /// VRAM ceiling for expert weights, in bytes.
+    pub vram_ceiling_bytes: u64,
+    /// Maximum concurrent sequences the engine will serve, used to
+    /// estimate KV cache VRAM. `None` falls back to a conservative default.
+    pub max_concurrent: Option<usize>,
+    /// Maximum tokens (prompt + completion) per sequence, used to estimate
+    /// KV cache VRAM. `None` or `Some(0)` falls back to a conservative
+    /// default.
+    pub max_seq_len: Option<usize>,
+}
+
 pub struct Qwen3Backend {
     pub model: crane_core::models::qwen3::Model,
     #[allow(dead_code)]
@@ -614,11 +629,25 @@ pub struct Qwen3Backend {
 }
 
 impl Qwen3Backend {
+    /// `promotion` is `Some` only when `devices.expert` starts on CPU and
+    /// the runtime wants the model to attempt promoting experts to GPU
+    /// after construction, once real VRAM headroom is known.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the model fails to load from `model_path`.
-    pub fn new(model_path: &str, devices: &DeviceAssignment, dtype: &DType) -> Result<Self> {
-        let model = crane_core::models::qwen3::Model::new(model_path, devices, dtype)?;
+    /// Returns an error if the model fails to load from `model_path`, or if
+    /// expert promotion fails outright (not counting an out-of-memory
+    /// promotion attempt, which is caught and logged inside the model).
+    pub fn new(
+        model_path: &str,
+        devices: &DeviceAssignment,
+        dtype: &DType,
+        promotion: Option<&ExpertPromotionPolicy>,
+    ) -> Result<Self> {
+        let mut model = crane_core::models::qwen3::Model::new(model_path, devices, dtype)?;
+        if let Some(p) = promotion {
+            model.promote_experts_to_gpu(p.vram_ceiling_bytes, p.max_concurrent, p.max_seq_len)?;
+        }
         Ok(Self {
             model,
             dtype: *dtype,
