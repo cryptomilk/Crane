@@ -81,6 +81,44 @@ impl LinearLayer {
     pub fn quantized_with_bias(qmm: QMatMul, bias: Tensor) -> Self {
         Self::Quantized(QuantizedLinear::with_bias(qmm, bias))
     }
+
+    /// Moves this layer's weights to `device`, in `dtype`.
+    ///
+    /// `Standard` moves its tensors directly, casting to `dtype`. `QTensor`
+    /// has no device-transfer primitive, so `Quantized` dequantizes (via
+    /// `QMatMul::dequantize_f16`, then casts to `dtype`) and returns a
+    /// `Standard` layer on `device` — this loses the quantized memory
+    /// footprint for the moved weight, a deliberate tradeoff for promoting
+    /// an expert from CPU to GPU once real headroom is known (see
+    /// `Qwen3Model::promote_experts_to_gpu`). `dtype` must match the
+    /// model's compute dtype: candle's matmul requires both operands to
+    /// share a dtype, so a promoted weight left in the wrong dtype fails
+    /// on its very next forward pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dequantization, dtype cast, or device
+    /// transfer fails.
+    pub fn to_device(&self, device: &Device, dtype: DType) -> Result<LinearLayer> {
+        match self {
+            Self::Standard(l) => {
+                let weight = l.weight().to_device(device)?.to_dtype(dtype)?;
+                let bias = l
+                    .bias()
+                    .map(|b| b.to_device(device)?.to_dtype(dtype))
+                    .transpose()?;
+                Ok(Self::Standard(Linear::new(weight, bias)))
+            },
+            Self::Quantized(q) => {
+                let weight = q
+                    .matmul
+                    .dequantize_f16()?
+                    .to_device(device)?
+                    .to_dtype(dtype)?;
+                Ok(Self::Standard(Linear::new(weight, None)))
+            },
+        }
+    }
 }
 
 impl Module for LinearLayer {

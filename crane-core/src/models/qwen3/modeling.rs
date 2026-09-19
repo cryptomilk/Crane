@@ -44,13 +44,14 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 use std::io::{Read, Seek};
 
-use crate::device::DeviceAssignment;
+use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gpu_memory};
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
 use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::utils::DeviceExt;
+use ribo::utils::log;
 
 // Reuse the polymorphic linear layer and the shared GGUF loader.
 pub use crate::ops::linear::LinearLayer;
@@ -1089,6 +1090,166 @@ impl Qwen3Model {
         })
     }
 
+    /// Runs a probe forward pass to force GPU backends' lazy first-use
+    /// library initialization (rocBLAS/hipRAND/JIT-compiled kernels), then
+    /// live-queries free VRAM and greedily promotes CPU-placed `MoE` expert
+    /// layers to `main_device` up to `vram_ceiling_bytes` (minus
+    /// `runtime_reservation_bytes`). No-op for non-`MoE` checkpoints.
+    ///
+    /// A static pre-load VRAM estimate consistently undershoots real usage:
+    /// rocBLAS/hipRAND/CUDA JIT lazily initialize on first use, so the real
+    /// number is only visible once a forward pass actually runs. This is
+    /// why placement is decided here, after construction, rather than
+    /// while loading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a tensor op unrelated to the promotion
+    /// itself fails; an out-of-memory promotion attempt is caught and
+    /// logged instead — remaining layers just stay on CPU.
+    // One sequential pipeline (probe -> cost estimate -> budget -> promote)
+    // sharing local state (`gpu_location`, `layer_costs`) throughout;
+    // splitting it up would scatter that shared context across several
+    // small functions without simplifying the control flow itself.
+    #[allow(clippy::too_many_lines)]
+    pub fn promote_experts_to_gpu(
+        &mut self,
+        main_device: &Device,
+        vram_ceiling_bytes: u64,
+        runtime_reservation_bytes: u64,
+    ) -> Result<()> {
+        let Some(moe_config) = self.config.moe_config() else {
+            return Ok(());
+        };
+        if matches!(main_device, Device::Cpu) {
+            return Ok(());
+        }
+        let gpu_location = main_device.location();
+        log::info!(
+            "Expert placement: running probe forward pass + live VRAM query on {gpu_location:?} \
+             before deciding MoE GPU/CPU split (may take a few seconds)"
+        );
+        let probe_ids = Tensor::new(&[45u32, 546, 456], main_device)?.unsqueeze(0)?;
+        if let Err(e) = self.forward(&probe_ids, 0) {
+            self.clear_kv_cache();
+            log::warn!(
+                "expert-placement probe forward failed on {gpu_location:?} (non-fatal, all \
+                 experts stay on CPU): {e}"
+            );
+            return Ok(());
+        }
+        self.clear_kv_cache();
+
+        let is_moe_layer: Vec<bool> = self
+            .layers
+            .iter()
+            .map(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
+            .collect();
+        let total_moe_layers = is_moe_layer.iter().filter(|&&m| m).count();
+        // Every MoE layer in a Qwen3 checkpoint has identical expert-tensor
+        // shapes (3 projections per expert: gate, up, down), so this cost
+        // is uniform across MoE layers; non-MoE layers cost 0 so they never
+        // affect the greedy budget below.
+        let per_layer_cost = moe_config.num_experts as u64
+            * moe_config.moe_intermediate_size as u64
+            * self.config.hidden_size as u64
+            * 3
+            * self.dtype.size_in_bytes() as u64;
+        // Layers whose experts already live on `gpu_location` (e.g. a
+        // re-promotion pass after `max_seq_len` shrinks and frees headroom)
+        // cost 0: they're already promoted, so charging them again would
+        // waste budget on a no-op and starve layers still on CPU.
+        let layer_costs: Vec<u64> = self
+            .layers
+            .iter()
+            .map(|l| match &l.mlp {
+                MlpOrMoe::Moe(block) if block.expert_device().location() != gpu_location => {
+                    per_layer_cost
+                },
+                _ => 0,
+            })
+            .collect();
+        log::debug!(
+            "MoE layout: {total_moe_layers} layers, per-layer expert cost estimate={}",
+            format_budget(per_layer_cost),
+        );
+
+        let Some((free, total)) = query_gpu_memory(main_device) else {
+            log::warn!(
+                "No live VRAM query available for {gpu_location:?}; skipping expert promotion \
+                 (all experts stay on CPU)"
+            );
+            return Ok(());
+        };
+        let used = total.saturating_sub(free);
+        let ceiling = vram_ceiling_bytes.min(total);
+        let remaining = ceiling.saturating_sub(used);
+        let available = remaining.saturating_sub(runtime_reservation_bytes);
+        log::info!(
+            "Live VRAM on {gpu_location:?} after probe: free={}, total={}, used={}, \
+             available_for_experts={} (configured limit={})",
+            format_budget(free),
+            format_budget(total),
+            format_budget(used),
+            format_budget(available),
+            format_budget(vram_ceiling_bytes),
+        );
+
+        let promoted: std::collections::HashSet<usize> = greedy_fit_layers(&layer_costs, available)
+            .into_iter()
+            .filter(|&i| is_moe_layer[i])
+            .collect();
+        log::debug!(
+            "Attempting promotion of {} of {total_moe_layers} MoE layers to {gpu_location:?}: {:?}",
+            promoted.len(),
+            {
+                let mut sorted: Vec<usize> = promoted.iter().copied().collect();
+                sorted.sort_unstable();
+                sorted
+            },
+        );
+
+        // The greedy budget above is a heuristic upper bound on what to
+        // *attempt* — allocator fragmentation and per-expert allocation
+        // overhead mean actual usage can still exceed it even though
+        // `promote_experts_to` is itself atomic per layer. A failed
+        // promotion here (e.g. real GPU out-of-memory) must not abort
+        // model load: stop promoting further layers and leave the rest on
+        // CPU — degraded, not fatal.
+        let mut gpu_layers = 0usize;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if !promoted.contains(&i) {
+                continue;
+            }
+            let MlpOrMoe::Moe(block) = &mut layer.mlp else {
+                continue;
+            };
+            match block.promote_experts_to(main_device, self.dtype) {
+                Ok(()) => {
+                    gpu_layers += 1;
+                    log::debug!(
+                        "layer {i}: promoted to {gpu_location:?} (cost={})",
+                        format_budget(layer_costs[i]),
+                    );
+                },
+                Err(e) => {
+                    log::warn!(
+                        "expert promotion stopped at layer {i} on {gpu_location:?} (device \
+                         allocation failed, this and remaining layers stay on CPU): {e}"
+                    );
+                    break;
+                },
+            }
+        }
+
+        log::info!(
+            "Expert placement: {gpu_layers}/{total_moe_layers} MoE layers on {gpu_location:?}, \
+             {} on CPU",
+            total_moe_layers - gpu_layers,
+        );
+        Ok(())
+    }
+
     // ── Forward ─────────────────────────────────────────────────────────
 
     /// # Errors
@@ -1652,6 +1813,22 @@ mod tests {
                 .iter()
                 .all(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
         );
+    }
+
+    // On a CPU-only model, `promote_experts_to_gpu` must return `Ok(())`
+    // without panicking (no live VRAM query is possible on CPU, so it
+    // takes the early-return path before running the probe forward pass).
+    #[test]
+    fn test_promote_experts_to_gpu_is_noop_on_cpu() {
+        let cfg = moe_layer_config(2, None);
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut model = Qwen3Model::new(&cfg, vb, &device).expect("new");
+
+        model
+            .promote_experts_to_gpu(&device, 1 << 30, 0)
+            .expect("promote_experts_to_gpu");
     }
 
     fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {

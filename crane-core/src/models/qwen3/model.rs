@@ -268,6 +268,46 @@ impl Model {
             .extract_batch_kv(kv_lens, original_max_kv, rounds_done)
     }
 
+    /// Runs a probe forward pass, live-queries free VRAM, and promotes
+    /// CPU-placed `MoE` expert layers to this model's main device up to
+    /// `vram_ceiling_bytes` (minus a KV-cache reservation derived from
+    /// `max_concurrent`/`max_seq_len`). No-op for non-`MoE` checkpoints.
+    /// Caller decides whether to call this at all — that decision (and the
+    /// ceiling itself) is deployment policy, not something the model knows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if a tensor op unrelated to the promotion
+    /// itself fails; an out-of-memory promotion attempt is caught and
+    /// logged instead.
+    pub fn promote_experts_to_gpu(
+        &mut self,
+        vram_ceiling_bytes: u64,
+        max_concurrent: Option<usize>,
+        max_seq_len: Option<usize>,
+    ) -> Result<()> {
+        let config = self.inner.config();
+        let max_concurrent = max_concurrent.unwrap_or(1);
+        let effective_seq_len = max_seq_len
+            .filter(|&n| n > 0)
+            .unwrap_or(config.max_position_embeddings) as u64;
+        let kv_storage = max_concurrent as u64
+            * effective_seq_len
+            * 2
+            * config.num_hidden_layers as u64
+            * config.num_key_value_heads as u64
+            * config.head_dim() as u64
+            * self.dtype.size_in_bytes() as u64;
+        let runtime_reservation_bytes = crate::device::kv_vram_overhead(kv_storage, max_concurrent);
+
+        self.inner.promote_experts_to_gpu(
+            &self.device,
+            vram_ceiling_bytes,
+            runtime_reservation_bytes,
+        )?;
+        Ok(())
+    }
+
     pub fn warmup(&mut self) {
         if let Err(e) = self.generate(&[45, 546, 456], &GenerationConfig::with_max_tokens(5), None)
         {
