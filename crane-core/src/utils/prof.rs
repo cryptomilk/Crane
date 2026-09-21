@@ -78,14 +78,8 @@ pub enum Span {
     MoeRouter,
     MoeToDevice,
     MoeExpert,
-    /// Fused `indexed_moe_forward` dispatch path (CUDA/ROCm). CPU batched
-    /// dispatch uses [`MoeCpuBatched`] instead.
+    /// Fused `indexed_moe_forward` dispatch path (CUDA/ROCm).
     MoeFused,
-    /// CPU batched `cpu_indexed_moe_forward` dispatch path, including the
-    /// activation/routing-weight device transfers it requires when the
-    /// surrounding model runs on a different device than the CPU-resident
-    /// experts.
-    MoeCpuBatched,
     /// Everything else in `SparseMoeBlock::forward` not covered by the other
     /// Tier2b spans: the input reshape/F32 cast, the `topk_ids`/`topk_weights`
     /// device-to-host sync and the per-expert token/weight list build that
@@ -94,34 +88,17 @@ pub enum Span {
     MoeMisc,
 }
 
-const NUM_SPANS: usize = 21;
+const NUM_SPANS: usize = 20;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
-const TIER2_MOE: std::ops::Range<usize> = 15..21;
+const TIER2_MOE: std::ops::Range<usize> = 15..20;
 
 const NAMES: [&str; NUM_SPANS] = [
-    "embed",
-    "norm",
-    "attn",
-    "gdn",
-    "mlp",
-    "resid",
-    "head", //
-    "proj",
-    "conv",
-    "qkv",
-    "recur",
-    "finish", //
-    "prep",
-    "launch",
-    "post", //
-    "router",
-    "to_dev",
-    "expert",
-    "fused",
-    "cpu_batch",
-    "misc",
+    "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
+    "proj", "conv", "qkv", "recur", "finish", //
+    "prep", "launch", "post", //
+    "router", "to_dev", "expert", "fused", "misc",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];

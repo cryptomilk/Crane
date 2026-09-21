@@ -621,6 +621,13 @@ impl SparseMoeBlock {
     /// forward calls, to avoid reallocating its internal buffers on the
     /// decode hot path.
     ///
+    /// Timed internally via the same `MoeToDevice`/`MoeExpert`/`MoeMisc`
+    /// spans the per-expert loop below uses (not `MoeFused`, which stays
+    /// reserved for the true GPU `indexed_moe_forward` dispatch), so this
+    /// path's cost breaks down the same way the per-expert loop's does --
+    /// e.g. to isolate whether a slowdown is in the CPU/GPU activation
+    /// transfer or in the batched kernel's own compute.
+    ///
     /// # Errors
     ///
     /// Returns an error if the routing mutex is poisoned, if routing
@@ -640,28 +647,35 @@ impl SparseMoeBlock {
         let input_device = xs_f32.device();
         let num_experts = gate_up_exps.shape().dims()[0];
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
-        let xs_cpu = xs_f32.to_device(&Device::Cpu)?;
-        let topk_weights_cpu = topk_weights.to_device(&Device::Cpu)?;
+        let xs_cpu = prof::timed(Span::MoeToDevice, || xs_f32.to_device(&Device::Cpu))?;
+        let topk_weights_cpu =
+            prof::timed(Span::MoeToDevice, || topk_weights.to_device(&Device::Cpu))?;
 
         let Ok(mut routing) = self.routing.lock() else {
             candle_core::bail!("SparseMoeBlock::routing mutex poisoned");
         };
-        routing.compute(topk_ids, num_experts)?;
+        prof::timed(Span::MoeMisc, || routing.compute(topk_ids, num_experts))?;
         let xs_3d = xs_cpu.unsqueeze(1)?.contiguous()?;
-        let gate_up_out = cpu_indexed_moe_forward(gate_up_exps, &xs_3d, &routing)?;
+        let gate_up_out = prof::timed(Span::MoeExpert, || {
+            cpu_indexed_moe_forward(gate_up_exps, &xs_3d, &routing)
+        })?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
         let hidden = (Activation::Silu.forward(&gate)? * up)?.contiguous()?;
-        let down_out = cpu_indexed_moe_forward(down_exps, &hidden, &routing)?;
+        let down_out = prof::timed(Span::MoeExpert, || {
+            cpu_indexed_moe_forward(down_exps, &hidden, &routing)
+        })?;
         drop(routing);
 
-        let combined = Self::combine_expert_outputs(
-            &down_out,
-            &topk_weights_cpu,
-            original_dtype,
-            original_dims,
-        )?;
-        combined.to_device(input_device)
+        let combined = prof::timed(Span::MoeMisc, || {
+            Self::combine_expert_outputs(
+                &down_out,
+                &topk_weights_cpu,
+                original_dtype,
+                original_dims,
+            )
+        })?;
+        prof::timed(Span::MoeToDevice, || combined.to_device(input_device))
     }
 
     /// Dispatches to the packed-tensor batched `MoE` path (GPU fused via
@@ -700,18 +714,19 @@ impl SparseMoeBlock {
         // CPU batched dispatch: routing is pulled to host (unavoidable,
         // the kernel runs on CPU), but the per-expert loop's up to 336
         // individually-dispatched `to_device`/matmul calls collapse into 2
-        // merged dispatches.
-        Some(prof::timed(Span::MoeCpuBatched, || {
-            self.cpu_batched_forward(
-                xs_f32,
-                topk_ids,
-                topk_weights,
-                gate_up_exps,
-                down_exps,
-                original_dtype,
-                original_dims,
-            )
-        }))
+        // merged dispatches. Timed internally by `cpu_batched_forward`
+        // itself (not wrapped in `Span::MoeFused` here), so its cost
+        // breaks down into the same `to_dev`/`expert`/`misc` spans the
+        // per-expert loop below uses.
+        Some(self.cpu_batched_forward(
+            xs_f32,
+            topk_ids,
+            topk_weights,
+            gate_up_exps,
+            down_exps,
+            original_dtype,
+            original_dims,
+        ))
     }
 
     /// Weighted sum of per-expert outputs back to the original sequence shape.
