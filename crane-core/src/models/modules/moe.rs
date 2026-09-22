@@ -753,14 +753,17 @@ impl SparseMoeBlock {
         prof::timed(Span::MoeToDevice, || out.to_device(&input_device))
     }
 
-    /// Dispatches to the packed-tensor batched `MoE` path (GPU fused via
-    /// [`Self::fused_forward`], or CPU batched via
-    /// [`Self::cpu_batched_forward`]) when this block holds packed
-    /// tensors, returning `None` otherwise so the caller falls through to
-    /// the per-expert loop. `load_packed_experts` only keeps both packed
-    /// tensors (leaving `experts` empty) when the GPU fused path is
-    /// eligible ([`supports_fused_moe`]) or `expert_device` is CPU, so
-    /// this covers both.
+    /// Dispatches to the packed-tensor batched `MoE` path when this block
+    /// holds packed tensors, returning `None` otherwise so the caller falls
+    /// through to the per-expert loop. `load_packed_experts` only keeps
+    /// both packed tensors (leaving `experts` empty) when the GPU fused
+    /// path is eligible ([`supports_fused_moe`]) or `expert_device` is CPU,
+    /// so this covers both. Three outcomes: GPU fused via
+    /// [`Self::fused_forward`] when experts already live on GPU; GPU
+    /// offload via [`Self::gpu_offload_forward`] when experts are
+    /// CPU-resident but the batch is large enough
+    /// ([`moe_offload_min_batch`]) and the input device/quant type support
+    /// it; otherwise CPU batched via [`Self::cpu_batched_forward`].
     fn dispatch_packed(
         &self,
         xs_f32: &Tensor,
@@ -786,6 +789,32 @@ impl SparseMoeBlock {
                 )
             }));
         }
+        // GPU offload dispatch: CPU-resident experts, but the batch (e.g. a
+        // prefill chunk) is large enough that a one-time upload to the
+        // input's GPU device and a fused GPU matmul beats the CPU batched
+        // kernel. Requires the input to already be on a `MoE`-eligible GPU
+        // device (only reachable when the model's non-expert layers run on
+        // CUDA/ROCm and just the experts were placed on CPU) and both packed
+        // tensors' quant types to be `indexed_moe_forward`-eligible.
+        let input_device = xs_f32.device();
+        let tokens = xs_f32.dims()[0];
+        if self.expert_device.is_cpu()
+            && tokens >= moe_offload_min_batch()
+            && (input_device.is_cuda() || input_device.is_rocm())
+            && supports_fused_moe(input_device, gate_up_exps.dtype())
+            && supports_fused_moe(input_device, down_exps.dtype())
+        {
+            return Some(Self::gpu_offload_forward(
+                xs_f32,
+                topk_ids,
+                topk_weights,
+                gate_up_exps,
+                down_exps,
+                input_device,
+                original_dtype,
+                original_dims,
+            ));
+        }
         // CPU batched dispatch: routing is pulled to host (unavoidable,
         // the kernel runs on CPU), but the per-expert loop's up to 336
         // individually-dispatched `to_device`/matmul calls collapse into 2
@@ -804,31 +833,39 @@ impl SparseMoeBlock {
         ))
     }
 
-    /// Which of the three dispatch outcomes [`Self::forward`] takes for
-    /// this block's current state: [`Self::dispatch_packed`]'s two
-    /// branches (GPU fused / CPU batched), or its per-expert-loop fallback
-    /// when `dispatch_packed` returns `None`. Depends only on
-    /// `expert_device` and whether packed tensors are present, both fixed
-    /// at construction and only changed by [`Self::promote_experts_to`] --
-    /// never per forward call -- so this is safe to compute and log once
-    /// rather than on every decode/prefill step.
-    fn dispatch_kind(&self) -> &'static str {
+    /// Describes this block's `MoE` dispatch *placement policy*: which
+    /// device the packed experts live on, and (for CPU-resident packed
+    /// experts) the per-call token threshold above which
+    /// [`Self::dispatch_packed`] routes through [`Self::gpu_offload_forward`]
+    /// instead of [`Self::cpu_batched_forward`]. The placement itself
+    /// (`expert_device` and whether packed tensors are present) is fixed at
+    /// construction and only changed by [`Self::promote_experts_to`], so
+    /// it's safe to compute and log once rather than on every
+    /// decode/prefill step -- but note the actual per-call outcome for
+    /// CPU-resident packed experts still varies with `xs_f32`'s token
+    /// count, which this label surfaces rather than resolves.
+    fn dispatch_kind(&self) -> String {
         if self.packed_gate_up_exps.is_none() || self.packed_down_exps.is_none() {
-            "per-expert loop"
+            "per-expert loop".to_string()
         } else if self.expert_device.is_cuda() || self.expert_device.is_rocm() {
-            "GPU fused"
+            "GPU fused".to_string()
         } else {
-            "CPU batched"
+            format!(
+                "CPU batched (GPU offload >= {} tokens)",
+                moe_offload_min_batch()
+            )
         }
     }
 
-    /// Logs this block's `MoE` dispatch placement, identified by
+    /// Logs this block's `MoE` dispatch placement policy, identified by
     /// `layer_idx` so the decision for a specific decoder layer can be
     /// distinguished from the other layers' -- called once at construction
     /// and again whenever [`Self::promote_experts_to`] changes it, rather
-    /// than per forward call, since the decision itself doesn't vary
-    /// per-call. Fires only at construction and on the rare re-promotion
-    /// call, not per decode/prefill step, so `trace` is fine here.
+    /// than per forward call, since the placement policy itself doesn't
+    /// vary per-call (see [`Self::dispatch_kind`] for the per-call caveat
+    /// on CPU-resident packed experts). Fires only at construction and on
+    /// the rare re-promotion call, not per decode/prefill step, so `trace`
+    /// is fine here.
     fn log_dispatch_decision(&self) {
         let dtype = self
             .packed_gate_up_exps
@@ -1516,6 +1553,29 @@ fn batched_moe_matmul<T: GgmlType>(
     });
 
     dst
+}
+
+/// Minimum token count for [`SparseMoeBlock::dispatch_packed`] to route
+/// CPU-resident packed experts through [`SparseMoeBlock::gpu_offload_forward`]
+/// instead of [`SparseMoeBlock::cpu_batched_forward`]. Configurable via
+/// `CRANE_MOE_OFFLOAD_MIN_BATCH`; defaults to 32, matching the batch size at
+/// which GPU matmul throughput starts to outweigh the one-time `PCIe`
+/// upload cost of the packed expert tensors. Zero, negative, or unparseable
+/// values silently fall back to the default rather than disabling the
+/// threshold.
+fn moe_offload_min_batch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| parse_min_batch(std::env::var("CRANE_MOE_OFFLOAD_MIN_BATCH").ok().as_deref()))
+}
+
+/// Parses [`moe_offload_min_batch`]'s env var value, defaulting to 32 when
+/// `raw` is absent, unparseable, or not a positive integer. Split out from
+/// `moe_offload_min_batch` so this pure logic is unit-testable without
+/// mutating process env state against a `OnceLock`-cached value.
+fn parse_min_batch(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32)
 }
 
 /// Whether `QTensor::indexed_moe_forward` (Phase 8a's fused `MoE` dispatch) is
@@ -2514,6 +2574,42 @@ mod tests {
                 "unsupported dtype must never be fused-eligible: {dtype:?}"
             );
         }
+    }
+
+    // Verifies the absent-env-var case falls back to the documented default.
+    #[test]
+    fn parse_min_batch_default() {
+        assert_eq!(parse_min_batch(None), 32);
+    }
+
+    // Verifies a well-formed positive value is used as-is.
+    #[test]
+    fn parse_min_batch_valid() {
+        assert_eq!(parse_min_batch(Some("64")), 64);
+    }
+
+    // Verifies zero falls back to the default rather than disabling the threshold.
+    #[test]
+    fn parse_min_batch_zero_falls_back() {
+        assert_eq!(parse_min_batch(Some("0")), 32);
+    }
+
+    // Verifies a negative value falls back to the default.
+    #[test]
+    fn parse_min_batch_negative_falls_back() {
+        assert_eq!(parse_min_batch(Some("-1")), 32);
+    }
+
+    // Verifies an unparseable value falls back to the default.
+    #[test]
+    fn parse_min_batch_invalid_falls_back() {
+        assert_eq!(parse_min_batch(Some("abc")), 32);
+    }
+
+    // Verifies surrounding whitespace is trimmed before parsing.
+    #[test]
+    fn parse_min_batch_whitespace_trimmed() {
+        assert_eq!(parse_min_batch(Some("  128  ")), 128);
     }
 
     /// Verifies a packed CPU `gate_up`/`down` tensor pair against the
