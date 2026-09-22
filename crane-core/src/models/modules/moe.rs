@@ -693,6 +693,78 @@ impl SparseMoeBlock {
         prof::timed(Span::MoeToDevice, || combined.to_device(input_device))
     }
 
+    /// GPU-offloaded equivalent of [`Self::cpu_batched_forward`], for a
+    /// CPU-resident packed expert pair whose caller has decided the batch is
+    /// large enough that a one-time upload to `device` is worth paying to run
+    /// the batched matmul through [`Self::fused_forward`] instead of the CPU
+    /// kernel.
+    ///
+    /// The uploaded `QTensor` copies (`gate_up_gpu`/`down_gpu`) are locals:
+    /// they live only for this call and are dropped on return, so the
+    /// transient VRAM they occupy (one layer's packed gate+up and down
+    /// tensors) is freed immediately rather than held for the model's
+    /// lifetime.
+    ///
+    /// `xs_f32`, `topk_ids`, and `topk_weights` may already live on `device`
+    /// (the common case, when the rest of the model runs there and only
+    /// `MoE` experts are CPU-offloaded) or on any other device; either way
+    /// they're moved to `device` before dispatch, and the result is moved
+    /// back to `xs_f32`'s original device before returning, matching
+    /// `cpu_batched_forward`'s device contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either upload, any device transfer, or
+    /// `fused_forward` fails.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_offload_forward(
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_exps: &QTensor,
+        down_exps: &QTensor,
+        device: &Device,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        let input_device = xs_f32.device().clone();
+        let (gate_up_gpu, down_gpu) = prof::timed(Span::MoeToDevice, || -> Result<_> {
+            let gu_raw = gate_up_exps.data()?;
+            let dn_raw = down_exps.data()?;
+            let gate_up_gpu = qtensor_from_ggml(
+                gate_up_exps.dtype(),
+                &gu_raw,
+                gate_up_exps.shape().dims().to_vec(),
+                device,
+            )?;
+            let down_gpu = qtensor_from_ggml(
+                down_exps.dtype(),
+                &dn_raw,
+                down_exps.shape().dims().to_vec(),
+                device,
+            )?;
+            Ok((gate_up_gpu, down_gpu))
+        })?;
+
+        let xs_gpu = prof::timed(Span::MoeToDevice, || xs_f32.to_device(device))?;
+        let topk_ids_gpu = prof::timed(Span::MoeToDevice, || topk_ids.to_device(device))?;
+        let topk_weights_gpu = prof::timed(Span::MoeToDevice, || topk_weights.to_device(device))?;
+
+        let out = prof::timed(Span::MoeFused, || {
+            Self::fused_forward(
+                &xs_gpu,
+                &topk_ids_gpu,
+                &topk_weights_gpu,
+                &gate_up_gpu,
+                &down_gpu,
+                original_dtype,
+                original_dims,
+            )
+        })?;
+
+        prof::timed(Span::MoeToDevice, || out.to_device(&input_device))
+    }
+
     /// Dispatches to the packed-tensor batched `MoE` path (GPU fused via
     /// [`Self::fused_forward`], or CPU batched via
     /// [`Self::cpu_batched_forward`]) when this block holds packed
@@ -3095,6 +3167,81 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
+        for (e, g) in expected.iter().zip(got.iter()) {
+            assert!((e - g).abs() < 1e-4, "expected {expected:?}, got {got:?}");
+        }
+    }
+
+    // Verifies `SparseMoeBlock::gpu_offload_forward` (uploading a
+    // CPU-resident packed expert pair to a GPU device and dispatching
+    // through `fused_forward`) produces the same output as
+    // `cpu_batched_forward`, given identical weight data and routing.
+    // Requires a real CUDA/ROCm device (the underlying `indexed_moe_forward`
+    // has no CPU implementation), so `#[ignore]`d by default; run with:
+    //   cargo test -p crane-core --features cuda \
+    //     gpu_offload_forward_matches_cpu_batched -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn gpu_offload_forward_matches_cpu_batched() {
+        #[cfg(feature = "cuda")]
+        let device = Device::new_cuda(0).expect("cuda device");
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        let device = Device::new_rocm(0).expect("rocm device");
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+        let device = Device::Cpu;
+
+        let identity = vec![1.0f32, 0.0, 0.0, 1.0];
+        let scaled = |c: f32| vec![c, 0.0, 0.0, c];
+        let expert_data = vec![
+            (identity.clone(), scaled(1.0), identity.clone()),
+            (identity.clone(), scaled(3.0), identity.clone()),
+            (identity.clone(), scaled(2.0), identity.clone()),
+            (identity.clone(), scaled(5.0), identity.clone()),
+        ];
+        let gate_data = vec![
+            2.0, 0.0, //
+            -2.0, 0.0, //
+            1.5, 0.0, //
+            -1.5, 0.0,
+        ];
+        let moe = make_packed_sparse_moe(2, 2, 4, 2, false, gate_data, &expert_data);
+
+        let x = Tensor::new(&[1.0f32, 0.5, -0.5, 2.0], &Device::Cpu)
+            .expect("tensor")
+            .reshape((2, 2))
+            .expect("reshape");
+
+        let expected = moe
+            .forward(&x)
+            .expect("cpu batched forward")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let xs_f32 = x.to_dtype(DType::F32).expect("to_dtype");
+        let logits = moe.gate.forward(&xs_f32).expect("gate forward");
+        let (topk_ids, topk_weights) =
+            crate::ops::fused_ops::topk_moe::topk_moe_routing(&logits, 2, false).expect("routing");
+        let gate_up_exps = moe.packed_gate_up_exps.as_ref().expect("packed gate_up");
+        let down_exps = moe.packed_down_exps.as_ref().expect("packed down");
+
+        let got = SparseMoeBlock::gpu_offload_forward(
+            &xs_f32,
+            &topk_ids,
+            &topk_weights,
+            gate_up_exps,
+            down_exps,
+            &device,
+            DType::F32,
+            &[2, 2],
+        )
+        .expect("gpu_offload_forward")
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
         for (e, g) in expected.iter().zip(got.iter()) {
             assert!((e - g).abs() < 1e-4, "expected {expected:?}, got {got:?}");
         }
