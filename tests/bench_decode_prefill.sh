@@ -10,7 +10,7 @@
 # server you already have running (e.g. via `podman compose up`).
 #
 # Usage:
-#   ./tests/bench_decode_prefill.sh [decode|prefill|both] [host:port]
+#   ./tests/bench_decode_prefill.sh [decode|prefill|default|sweep] [host:port]
 #
 # Requires: curl, jq, bc
 
@@ -19,7 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.." || exit 1
 
-MODE="${1:-both}"
+MODE="${1:-default}"
 HOST="${2:-localhost:8080}"
 URL="http://$HOST/v1/chat/completions"
 
@@ -32,6 +32,13 @@ PREFILL_SOURCES=(
     "AGENTS.md"
     "crane-core/src/device.rs"
 )
+
+# Target prompt sizes (in repeated filler words, not exact tokens) for the
+# `sweep` mode. Chosen to straddle CRANE_MOE_OFFLOAD_MIN_BATCH's default of
+# 32 tokens so a paired run with the threshold forced above vs. below each
+# size shows the real crossover instead of guessing from a single data
+# point.
+SWEEP_WORD_COUNTS=(8 16 32 64 128)
 
 for dep in curl jq bc; do
     command -v "$dep" >/dev/null 2>&1 || {
@@ -120,16 +127,53 @@ run_prefill_bench() {
     echo "line for this request."
 }
 
+run_sweep_bench() {
+    echo "=== MoE offload threshold sweep ==="
+    echo "Fires one small prefill request per target size below. Start the"
+    echo "server once with CRANE_MOE_OFFLOAD_MIN_BATCH forced below every"
+    echo "size and once forced above every size (CRANE_PROF=1 CRANE_PROF_EVERY=1),"
+    echo "then compare tokens=/prefill_tok_s for matching sizes across the"
+    echo "two server logs."
+
+    local count payload response t0 t1 elapsed
+    for count in "${SWEEP_WORD_COUNTS[@]}"; do
+        payload=$(jq -n --argjson n "$count" '
+            {
+                model: "default",
+                messages: [{
+                    role: "user",
+                    content: (
+                        "Summarize the following in one word.\n\n"
+                        + ([range(0; $n)] | map("word") | join(" "))
+                    )
+                }],
+                max_tokens: 4,
+                temperature: 0,
+                stream: false
+            }')
+
+        t0=$(date +%s.%N)
+        response=$(curl -s "$URL" -H "Content-Type: application/json" -d "$payload")
+        t1=$(date +%s.%N)
+        elapsed=$(echo "$t1 - $t0" | bc)
+
+        echo "--- target words: $count ---"
+        echo "Wall time: ${elapsed}s"
+        echo "Response: $response"
+    done
+}
+
 case "$MODE" in
 decode) run_decode_bench ;;
 prefill) run_prefill_bench ;;
-both)
+default)
     run_decode_bench
     echo
     run_prefill_bench
     ;;
+sweep) run_sweep_bench ;;
 *)
-    echo "Usage: $0 [decode|prefill|both] [host:port]" >&2
+    echo "Usage: $0 [decode|prefill|default|sweep] [host:port]" >&2
     exit 1
     ;;
 esac
