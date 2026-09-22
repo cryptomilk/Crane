@@ -12,7 +12,9 @@ use candle_core::quantized::k_quants::{
 use candle_core::quantized::{GgmlDType, GgmlType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
 use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Result, Tensor};
-use candle_nn::{Activation, Linear, VarBuilder, linear_no_bias};
+#[cfg(test)]
+use candle_nn::Activation;
+use candle_nn::{Linear, VarBuilder, linear_no_bias};
 use half::{bf16, f16};
 use ribo::utils::log;
 use std::io::{Read, Seek};
@@ -164,8 +166,8 @@ impl MoeExpert {
         let gate_up = self.gate_up_proj.forward_f32(xs)?;
         let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
         let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        let gate = Activation::Silu.forward(&gate)?;
-        self.down_proj.forward_f32(&(gate * up)?)
+        self.down_proj
+            .forward_f32(&crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?)
     }
 
     /// Whether this expert's projections are stored as quantized weights.
@@ -179,8 +181,8 @@ impl Module for MoeExpert {
         let gate_up = self.gate_up_proj.forward(xs)?;
         let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
         let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        let gate = Activation::Silu.forward(&gate)?;
-        self.down_proj.forward(&(gate * up)?)
+        self.down_proj
+            .forward(&crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?)
     }
 }
 
@@ -608,7 +610,7 @@ impl SparseMoeBlock {
         let gate_up_out = gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
-        let hidden = (Activation::Silu.forward(&gate)? * up)?.contiguous()?;
+        let hidden = crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?;
         let down_out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
 
         Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
@@ -672,7 +674,7 @@ impl SparseMoeBlock {
         })?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
-        let hidden = (Activation::Silu.forward(&gate)? * up)?.contiguous()?;
+        let hidden = crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?;
         let down_out = prof::timed(Span::MoeExpert, || {
             cpu_indexed_moe_forward(down_exps, &hidden, &routing)
         })?;
