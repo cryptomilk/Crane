@@ -482,12 +482,8 @@ impl SparseMoeBlock {
             let dn_dtype = down.dtype();
             let promoted =
                 if supports_fused_moe(device, gu_dtype) && supports_fused_moe(device, dn_dtype) {
-                    let gu_shape = gate_up.shape().dims().to_vec();
-                    let dn_shape = down.shape().dims().to_vec();
-                    let gu_raw = gate_up.data()?;
-                    let dn_raw = down.data()?;
-                    let new_gate_up = qtensor_from_ggml(gu_dtype, &gu_raw, gu_shape, device)?;
-                    let new_down = qtensor_from_ggml(dn_dtype, &dn_raw, dn_shape, device)?;
+                    let new_gate_up = upload_qtensor(gate_up, device)?;
+                    let new_down = upload_qtensor(down, device)?;
                     (
                         Vec::new(),
                         Some(Arc::new(new_gate_up)),
@@ -727,22 +723,14 @@ impl SparseMoeBlock {
         original_dtype: DType,
         original_dims: &[usize],
     ) -> Result<Tensor> {
+        debug_assert!(
+            gate_up_exps.device().is_cpu() && down_exps.device().is_cpu(),
+            "gpu_offload_forward expects CPU-resident packed experts"
+        );
         let input_device = xs_f32.device().clone();
         let (gate_up_gpu, down_gpu) = prof::timed(Span::MoeToDevice, || -> Result<_> {
-            let gu_raw = gate_up_exps.data()?;
-            let dn_raw = down_exps.data()?;
-            let gate_up_gpu = qtensor_from_ggml(
-                gate_up_exps.dtype(),
-                &gu_raw,
-                gate_up_exps.shape().dims().to_vec(),
-                device,
-            )?;
-            let down_gpu = qtensor_from_ggml(
-                down_exps.dtype(),
-                &dn_raw,
-                down_exps.shape().dims().to_vec(),
-                device,
-            )?;
+            let gate_up_gpu = upload_qtensor(gate_up_exps, device)?;
+            let down_gpu = upload_qtensor(down_exps, device)?;
             Ok((gate_up_gpu, down_gpu))
         })?;
 
@@ -1547,6 +1535,21 @@ fn supports_fused_moe(device: &Device, ggml_dtype: GgmlDType) -> bool {
                 | GgmlDType::Q6K
                 | GgmlDType::Q8_0
         )
+}
+
+/// Uploads a packed `QTensor`'s raw quantized bytes to `device`, without
+/// dequantizing. Shared by [`SparseMoeBlock::promote_experts_to`]'s
+/// fused-eligible branch and [`SparseMoeBlock::gpu_offload_forward`], which
+/// both need to move a whole packed gate+up or down tensor onto a GPU
+/// device.
+///
+/// # Errors
+///
+/// Returns an error if fetching `src`'s raw bytes or `qtensor_from_ggml`
+/// fails.
+fn upload_qtensor(src: &QTensor, device: &Device) -> Result<QTensor> {
+    let raw = src.data()?;
+    qtensor_from_ggml(src.dtype(), &raw, src.shape().dims().to_vec(), device)
 }
 
 /// Byte-slice one expert's 2D weight out of a packed `[num_experts, out, in]`
@@ -3177,9 +3180,11 @@ mod tests {
     // through `fused_forward`) produces the same output as
     // `cpu_batched_forward`, given identical weight data and routing.
     // Requires a real CUDA/ROCm device (the underlying `indexed_moe_forward`
-    // has no CPU implementation), so `#[ignore]`d by default; run with:
+    // has no CPU implementation), so this is only compiled with one of those
+    // features enabled and `#[ignore]`d by default; run with:
     //   cargo test -p crane-core --features cuda \
     //     gpu_offload_forward_matches_cpu_batched -- --ignored --nocapture
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[test]
     #[ignore]
     fn gpu_offload_forward_matches_cpu_batched() {
@@ -3187,8 +3192,6 @@ mod tests {
         let device = Device::new_cuda(0).expect("cuda device");
         #[cfg(all(feature = "rocm", not(feature = "cuda")))]
         let device = Device::new_rocm(0).expect("rocm device");
-        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
-        let device = Device::Cpu;
 
         let identity = vec![1.0f32, 0.0, 0.0, 1.0];
         let scaled = |c: f32| vec![c, 0.0, 0.0, c];
