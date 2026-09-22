@@ -192,6 +192,9 @@ impl Module for MoeExpert {
 /// (`expert_device`), so that expert weights can be offloaded (e.g. to CPU)
 /// while the rest of the model stays on GPU.
 pub struct SparseMoeBlock {
+    /// Decoder layer index, used only to identify this block in dispatch
+    /// placement logging (see [`Self::log_dispatch_decision`]).
+    layer_idx: usize,
     gate: LinearLayer,
     experts: Vec<MoeExpert>,
     num_experts_per_tok: usize,
@@ -224,6 +227,8 @@ impl SparseMoeBlock {
     ///
     /// # Arguments
     /// * `config` - `MoE` layer configuration
+    /// * `layer_idx` - Decoder layer index (identifies this block in
+    ///   dispatch placement logging only)
     /// * `hidden_size` - Model hidden dimension
     /// * `vb` - `VarBuilder` scoped to this block (holds `gate` and `experts.{i}`)
     /// * `expert_device` - Device to place expert weights on
@@ -234,6 +239,7 @@ impl SparseMoeBlock {
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(
         config: &MoeConfig,
+        layer_idx: usize,
         hidden_size: usize,
         vb: VarBuilder,
         expert_device: &Device,
@@ -256,7 +262,8 @@ impl SparseMoeBlock {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
+        let block = Self {
+            layer_idx,
             gate: LinearLayer::Standard(gate),
             experts,
             num_experts_per_tok: config.num_experts_per_tok,
@@ -265,7 +272,9 @@ impl SparseMoeBlock {
             packed_gate_up_exps: None,
             packed_down_exps: None,
             routing: Mutex::new(MoeRouting::new()),
-        })
+        };
+        block.log_dispatch_decision();
+        Ok(block)
     }
 
     /// Create a `MoE` block from a GGUF checkpoint.
@@ -311,7 +320,8 @@ impl SparseMoeBlock {
                 (experts, None, None)
             };
 
-        Ok(Self {
+        let block = Self {
+            layer_idx,
             gate,
             experts,
             num_experts_per_tok: config.num_experts_per_tok,
@@ -320,7 +330,9 @@ impl SparseMoeBlock {
             packed_gate_up_exps,
             packed_down_exps,
             routing: Mutex::new(MoeRouting::new()),
-        })
+        };
+        block.log_dispatch_decision();
+        Ok(block)
     }
 
     /// Load the packed (Unsloth-style) `_exps` expert tensor layout: each
@@ -506,12 +518,14 @@ impl SparseMoeBlock {
             self.packed_gate_up_exps = promoted.1;
             self.packed_down_exps = promoted.2;
             self.expert_device = device.clone();
+            self.log_dispatch_decision();
             return Ok(());
         }
         match batched_promote(&self.experts, device, dtype) {
             Ok(Some(moved)) => {
                 self.experts = moved;
                 self.expert_device = device.clone();
+                self.log_dispatch_decision();
                 return Ok(());
             },
             Ok(None) => {},
@@ -555,6 +569,7 @@ impl SparseMoeBlock {
         }
         self.experts = moved;
         self.expert_device = device.clone();
+        self.log_dispatch_decision();
         Ok(())
     }
 
@@ -727,6 +742,44 @@ impl SparseMoeBlock {
             original_dtype,
             original_dims,
         ))
+    }
+
+    /// Which of the three dispatch outcomes [`Self::forward`] takes for
+    /// this block's current state: [`Self::dispatch_packed`]'s two
+    /// branches (GPU fused / CPU batched), or its per-expert-loop fallback
+    /// when `dispatch_packed` returns `None`. Depends only on
+    /// `expert_device` and whether packed tensors are present, both fixed
+    /// at construction and only changed by [`Self::promote_experts_to`] --
+    /// never per forward call -- so this is safe to compute and log once
+    /// rather than on every decode/prefill step.
+    fn dispatch_kind(&self) -> &'static str {
+        if self.packed_gate_up_exps.is_none() || self.packed_down_exps.is_none() {
+            "per-expert loop"
+        } else if self.expert_device.is_cuda() || self.expert_device.is_rocm() {
+            "GPU fused"
+        } else {
+            "CPU batched"
+        }
+    }
+
+    /// Logs this block's `MoE` dispatch placement, identified by
+    /// `layer_idx` so the decision for a specific decoder layer can be
+    /// distinguished from the other layers' -- called once at construction
+    /// and again whenever [`Self::promote_experts_to`] changes it, rather
+    /// than per forward call, since the decision itself doesn't vary
+    /// per-call. Fires only at construction and on the rare re-promotion
+    /// call, not per decode/prefill step, so `trace` is fine here.
+    fn log_dispatch_decision(&self) {
+        let dtype = self
+            .packed_gate_up_exps
+            .as_ref()
+            .map_or_else(|| "n/a".to_string(), |t| format!("{:?}", t.dtype()));
+        log::trace!(
+            "MoE layer {}: dispatch={}, expert_device={:?}, dtype={dtype}",
+            self.layer_idx,
+            self.dispatch_kind(),
+            self.expert_device,
+        );
     }
 
     /// Weighted sum of per-expert outputs back to the original sequence shape.
@@ -2880,7 +2933,7 @@ mod tests {
             norm_topk_prob,
             decoder_sparse_step: None,
         };
-        SparseMoeBlock::new(&config, hidden, vb, &Device::Cpu).expect("SparseMoeBlock::new")
+        SparseMoeBlock::new(&config, 0, hidden, vb, &Device::Cpu).expect("SparseMoeBlock::new")
     }
 
     /// Builds a packed-CPU `SparseMoeBlock` from the same `(gate, up,
@@ -2929,6 +2982,7 @@ mod tests {
         .expect("packed down");
 
         SparseMoeBlock {
+            layer_idx: 0,
             gate,
             experts: Vec::new(),
             num_experts_per_tok,
@@ -3467,7 +3521,7 @@ mod tests {
             norm_topk_prob: false,
             decoder_sparse_step: None,
         };
-        let moe = SparseMoeBlock::new(&config, hidden, vb, device).expect("SparseMoeBlock::new");
+        let moe = SparseMoeBlock::new(&config, 0, hidden, vb, device).expect("SparseMoeBlock::new");
 
         let x = Tensor::zeros((3, hidden), DType::F16, device).expect("zeros");
         let y = moe.forward(&x).expect("forward");
