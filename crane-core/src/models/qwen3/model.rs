@@ -16,7 +16,7 @@ use ribo::utils::log;
 use tokenizers::Tokenizer;
 
 use super::modeling::{BatchKvCache, Config, Qwen3Model};
-use crate::device::DeviceAssignment;
+use crate::device::{DeviceAssignment, format_budget};
 use crate::generation::GenerationConfig;
 use crate::generation::based::ModelForCausalLM;
 use crate::utils::token_output_stream::TokenOutputStream;
@@ -362,6 +362,16 @@ impl Model {
             * config.head_dim() as u64
             * self.dtype.size_in_bytes() as u64;
         let runtime_reservation_bytes = crate::device::kv_vram_overhead(kv_storage, max_concurrent);
+        log::trace!(
+            "KV reservation: vram_ceiling={}, max_concurrent={max_concurrent}, \
+             effective_seq_len={effective_seq_len}, kv_storage={} \
+             (batch_factor={}, safety_margin={}), runtime_reservation={}",
+            format_budget(vram_ceiling_bytes),
+            format_budget(kv_storage),
+            crate::device::kv_batch_factor(max_concurrent),
+            format_budget(crate::device::KV_SAFETY_MARGIN_BYTES),
+            format_budget(runtime_reservation_bytes),
+        );
 
         self.inner.promote_experts_to_gpu(
             &self.device,
