@@ -722,6 +722,7 @@ impl DecoderLayer {
         let mlp = match moe_config {
             Some(mc) if is_moe_layer => MlpOrMoe::Moe(SparseMoeBlock::new(
                 &mc,
+                layer_idx,
                 config.hidden_size,
                 vb.pp("mlp"),
                 expert_device,
