@@ -15,7 +15,7 @@
 //! runtime (see [`crate::ops::rocm`]). Callers broadcast `x`/`alpha` to
 //! matching shapes before calling `snake()`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
