@@ -15,7 +15,7 @@
 //! direct tensor method call. Callers broadcast `y`/`x` to matching shapes
 //! before calling `atan2()`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 use candle_core::DType;
 #[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
