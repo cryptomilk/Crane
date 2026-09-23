@@ -48,12 +48,21 @@ macro_rules! prof_log {
 
 /// One measured region of the forward pass.
 ///
-/// The variants form four non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
+/// The variants form five non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
-/// [`Span::GdnRecur`], and [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
-/// [`Span::Mlp`] for `MoE` layers. Each tier is reported on its own line and
-/// should sum to its parent.
+/// [`Span::GdnRecur`], [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
+/// [`Span::Mlp`] for `MoE` layers, and [`Span::MoeActivation`] times the
+/// `swiglu()` activation specifically, across every `MoE` dispatch path
+/// ([`Span::MoeFused`], the per-expert [`Span::MoeExpert`] loop, and
+/// `cpu_batched_forward`). Each of the first four tiers is reported on its
+/// own line and should sum to its parent. In the fused path and the
+/// per-expert loop, [`Span::MoeActivation`] is a subset of time already
+/// counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in `cpu_batched_forward`
+/// it runs between two separate [`Span::MoeExpert`] spans instead of inside
+/// either, so there it is additional time not counted by
+/// [`Span::MoeExpert`]. Either way it is reported for diagnostic purposes
+/// only and not summed into anything.
 #[derive(Clone, Copy)]
 pub enum Span {
     // Tier 1 — the whole pass.
@@ -86,19 +95,28 @@ pub enum Span {
     /// follows it, the per-expert `Tensor::new`/`index_select` calls, and the
     /// final output dtype cast and reshape.
     MoeMisc,
+    // Tier 3b: nested inside `MoeFused` or `MoeExpert` in the fused and
+    // per-expert-loop paths (a subset of that span's time, not additional
+    // time), but a sibling of the two `MoeExpert` spans in
+    // `cpu_batched_forward` (additional time there, not a subset).
+    /// Time spent inside the `swiglu()` activation specifically, isolated
+    /// from the matmuls around it so a slow `MoE` layer can be attributed to
+    /// the activation kernel or to the expert projections.
+    MoeActivation,
 }
 
-const NUM_SPANS: usize = 20;
+const NUM_SPANS: usize = 21;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
 const TIER2_MOE: std::ops::Range<usize> = 15..20;
+const TIER3_MOE: std::ops::Range<usize> = 20..21;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
     "proj", "conv", "qkv", "recur", "finish", //
     "prep", "launch", "post", //
-    "router", "to_dev", "expert", "fused", "misc",
+    "router", "to_dev", "expert", "fused", "misc", "swiglu",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -278,6 +296,7 @@ fn report(kind: usize, t: &Totals) {
         line(TIER2_MOE),
         sum(TIER2_MOE)
     );
+    log::trace!("[crane-prof]   moe_act: {}", line(TIER3_MOE));
 }
 
 #[cfg(test)]
@@ -297,7 +316,7 @@ mod tests {
         assert_eq!(SPAN_NS[Span::Embed as usize].load(Ordering::Relaxed), 0);
     }
 
-    /// The four tiers must partition the span list exactly — a span left out
+    /// The five tiers must partition the span list exactly — a span left out
     /// of every tier would be recorded and never reported.
     #[test]
     fn tiers_cover_every_span() {
@@ -305,7 +324,8 @@ mod tests {
         assert_eq!(TIER1.end, TIER2.start);
         assert_eq!(TIER2.end, TIER3.start);
         assert_eq!(TIER3.end, TIER2_MOE.start);
-        assert_eq!(TIER2_MOE.end, NUM_SPANS);
+        assert_eq!(TIER2_MOE.end, TIER3_MOE.start);
+        assert_eq!(TIER3_MOE.end, NUM_SPANS);
         assert_eq!(NAMES.len(), NUM_SPANS);
     }
 }
