@@ -166,8 +166,10 @@ impl MoeExpert {
         let gate_up = self.gate_up_proj.forward_f32(xs)?;
         let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
         let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        self.down_proj
-            .forward_f32(&crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?)
+        let hidden = prof::timed(Span::MoeActivation, || {
+            crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+        })?;
+        self.down_proj.forward_f32(&hidden)
     }
 
     /// Whether this expert's projections are stored as quantized weights.
@@ -181,8 +183,10 @@ impl Module for MoeExpert {
         let gate_up = self.gate_up_proj.forward(xs)?;
         let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
         let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        self.down_proj
-            .forward(&crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?)
+        let hidden = prof::timed(Span::MoeActivation, || {
+            crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+        })?;
+        self.down_proj.forward(&hidden)
     }
 }
 
@@ -610,7 +614,9 @@ impl SparseMoeBlock {
         let gate_up_out = gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
-        let hidden = crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?;
+        let hidden = prof::timed(Span::MoeActivation, || {
+            crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+        })?;
         let down_out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
 
         Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
@@ -637,9 +643,14 @@ impl SparseMoeBlock {
     /// Timed internally via the same `MoeToDevice`/`MoeExpert`/`MoeMisc`
     /// spans the per-expert loop below uses (not `MoeFused`, which stays
     /// reserved for the true GPU `indexed_moe_forward` dispatch), so this
-    /// path's cost breaks down the same way the per-expert loop's does --
-    /// e.g. to isolate whether a slowdown is in the CPU/GPU activation
-    /// transfer or in the batched kernel's own compute.
+    /// path's `to_dev`/`expert`/`misc` cost breaks down the same way the
+    /// per-expert loop's does -- e.g. to isolate whether a slowdown is in
+    /// the CPU/GPU activation transfer or in the batched kernel's own
+    /// compute. One difference from the per-expert loop: `MoeActivation`
+    /// (timing the `swiglu()` call below) runs between the two
+    /// `MoeExpert` spans here rather than nested inside one, so unlike the
+    /// per-expert loop, its time is additional on top of `MoeExpert`'s, not
+    /// a subset of it.
     ///
     /// # Errors
     ///
@@ -674,7 +685,9 @@ impl SparseMoeBlock {
         })?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
-        let hidden = crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?;
+        let hidden = prof::timed(Span::MoeActivation, || {
+            crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+        })?;
         let down_out = prof::timed(Span::MoeExpert, || {
             cpu_indexed_moe_forward(down_exps, &hidden, &routing)
         })?;
