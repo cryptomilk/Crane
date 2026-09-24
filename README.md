@@ -328,7 +328,7 @@ Current limitations:
 
 #### AMD ROCm in Docker (Strix Halo / gfx1151)
 
-`docker/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's ROCm 10
+`container/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's ROCm 10
 packages (builder: `kyuz0/amd-strix-halo-toolboxes:rocm-10.0`) and ships it on
 `fedora-minimal:44`. The root `compose.yaml` has one service per GPU backend, each
 behind a [profile](https://docs.docker.com/compose/how-tos/profiles/);
@@ -355,7 +355,7 @@ CRANE_PORT=8080
 ```
 
 With no profile selected, nothing starts. To build only the image:
-`docker build -f docker/rocm/Dockerfile -t localhost/crane-serve:rocm10 .` (the
+`docker build -f container/rocm/Dockerfile -t localhost/crane-serve:rocm10 .` (the
 context is the repo root).
 
 **ROCm micro-benchmarks in Docker.** The Dockerfile's optional `bench` target builds
