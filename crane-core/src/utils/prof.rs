@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use candle_core::Device;
-use ribo::utils::log::tracing;
+use ribo::utils::log::{self, tracing};
 
 /// Emit a line through `tracing` if the current subscriber would actually
 /// surface it at `INFO` for this module, otherwise `eprintln!` it directly.
@@ -52,11 +52,14 @@ macro_rules! prof_log {
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
 /// [`Span::GdnRecur`], [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
-/// [`Span::Mlp`] for `MoE` layers, and [`Span::MoeActivation`] times the
-/// `swiglu()` activation specifically, across every `MoE` dispatch path
-/// ([`Span::MoeFused`], the per-expert [`Span::MoeExpert`] loop, and
-/// `cpu_batched_forward`). Each of the first four tiers is reported on its
-/// own line and should sum to its parent. In the fused path and the
+/// [`Span::Mlp`] for `MoE` layers, and [`Span::MoeActivation`]/
+/// [`Span::MoeGateUp`]/[`Span::MoeDownProj`] time the `swiglu()` activation
+/// and the two `indexed_moe_forward` GEMMs specifically. `MoeActivation`
+/// applies across every `MoE` dispatch path ([`Span::MoeFused`], the
+/// per-expert [`Span::MoeExpert`] loop, and `cpu_batched_forward`);
+/// `MoeGateUp`/`MoeDownProj` apply only inside the fused path. Each of the
+/// first four tiers is reported on its own line and should sum to its
+/// parent. In the fused path and the
 /// per-expert loop, [`Span::MoeActivation`] is a subset of time already
 /// counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in `cpu_batched_forward`
 /// it runs between two separate [`Span::MoeExpert`] spans instead of inside
@@ -103,20 +106,47 @@ pub enum Span {
     /// from the matmuls around it so a slow `MoE` layer can be attributed to
     /// the activation kernel or to the expert projections.
     MoeActivation,
+    /// Time spent inside `fused_forward`'s gate+up `indexed_moe_forward`
+    /// call specifically, isolated from the down projection and activation
+    /// around it so a slow fused `MoE` layer can be attributed to a
+    /// specific GEMM. A subset of [`Span::MoeFused`]'s time.
+    MoeGateUp,
+    /// Time spent inside `fused_forward`'s down `indexed_moe_forward` call
+    /// specifically. A subset of [`Span::MoeFused`]'s time.
+    MoeDownProj,
 }
 
-const NUM_SPANS: usize = 21;
+const NUM_SPANS: usize = 23;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
 const TIER2_MOE: std::ops::Range<usize> = 15..20;
-const TIER3_MOE: std::ops::Range<usize> = 20..21;
+const TIER3_MOE: std::ops::Range<usize> = 20..23;
 
 const NAMES: [&str; NUM_SPANS] = [
-    "embed", "norm", "attn", "gdn", "mlp", "resid", "head", //
-    "proj", "conv", "qkv", "recur", "finish", //
-    "prep", "launch", "post", //
-    "router", "to_dev", "expert", "fused", "misc", "swiglu",
+    "embed",
+    "norm",
+    "attn",
+    "gdn",
+    "mlp",
+    "resid",
+    "head", //
+    "proj",
+    "conv",
+    "qkv",
+    "recur",
+    "finish", //
+    "prep",
+    "launch",
+    "post", //
+    "router",
+    "to_dev",
+    "expert",
+    "fused",
+    "misc", //
+    "swiglu",
+    "gate_up",
+    "down_proj",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -296,7 +326,7 @@ fn report(kind: usize, t: &Totals) {
         line(TIER2_MOE),
         sum(TIER2_MOE)
     );
-    log::trace!("[crane-prof]   moe_act: {}", line(TIER3_MOE));
+    log::trace!("[crane-prof]   moe_detail: {}", line(TIER3_MOE));
 }
 
 #[cfg(test)]
