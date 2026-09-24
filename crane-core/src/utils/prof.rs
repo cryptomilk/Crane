@@ -53,13 +53,15 @@ macro_rules! prof_log {
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
 /// [`Span::GdnRecur`], [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
 /// [`Span::Mlp`] for `MoE` layers, and [`Span::MoeActivation`]/
-/// [`Span::MoeGateUp`]/[`Span::MoeDownProj`] time the `swiglu()` activation
-/// and the two `indexed_moe_forward` GEMMs specifically. `MoeActivation`
-/// applies across every `MoE` dispatch path ([`Span::MoeFused`], the
-/// per-expert [`Span::MoeExpert`] loop, and `cpu_batched_forward`);
-/// `MoeGateUp`/`MoeDownProj` apply only inside the fused path. Each of the
-/// first four tiers is reported on its own line and should sum to its
-/// parent. In the fused path and the
+/// [`Span::MoeGateUp`]/[`Span::MoeDownProj`]/[`Span::MoeInputPrep`]/
+/// [`Span::MoeCombine`] time the `swiglu()` activation, the two
+/// `indexed_moe_forward` GEMMs, and the reshape/combine steps around them
+/// inside `fused_forward` specifically. `MoeActivation` applies across every
+/// `MoE` dispatch path ([`Span::MoeFused`], the per-expert
+/// [`Span::MoeExpert`] loop, and `cpu_batched_forward`); the other four
+/// apply only inside the fused path, and together with `MoeActivation`
+/// should sum to `MoeFused` there. Each of the first four tiers is reported
+/// on its own line and should sum to its parent. In the fused path and the
 /// per-expert loop, [`Span::MoeActivation`] is a subset of time already
 /// counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in `cpu_batched_forward`
 /// it runs between two separate [`Span::MoeExpert`] spans instead of inside
@@ -114,14 +116,27 @@ pub enum Span {
     /// Time spent inside `fused_forward`'s down `indexed_moe_forward` call
     /// specifically. A subset of [`Span::MoeFused`]'s time.
     MoeDownProj,
+    /// Time spent reshaping `fused_forward`'s input (`unsqueeze` +
+    /// `contiguous`) before the gate+up projection. A subset of
+    /// [`Span::MoeFused`]'s time.
+    MoeInputPrep,
+    /// Time spent inside `fused_forward`'s `combine_expert_outputs` call,
+    /// which reads the down-projection output to build the final weighted
+    /// sum. A subset of [`Span::MoeFused`]'s time. Added because
+    /// [`Span::MoeGateUp`]/[`Span::MoeDownProj`] measured near-zero even
+    /// though [`Span::MoeFused`] did not, indicating `indexed_moe_forward`'s
+    /// kernel launches are async and the GPU work they enqueue is only
+    /// actually waited on wherever the first following call reads real
+    /// output values -- this span checks whether that point is here.
+    MoeCombine,
 }
 
-const NUM_SPANS: usize = 23;
+const NUM_SPANS: usize = 25;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
 const TIER2_MOE: std::ops::Range<usize> = 15..20;
-const TIER3_MOE: std::ops::Range<usize> = 20..23;
+const TIER3_MOE: std::ops::Range<usize> = 20..25;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed",
@@ -147,6 +162,8 @@ const NAMES: [&str; NUM_SPANS] = [
     "swiglu",
     "gate_up",
     "down_proj",
+    "input_prep",
+    "combine",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];

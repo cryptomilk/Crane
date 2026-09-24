@@ -610,7 +610,7 @@ impl SparseMoeBlock {
         original_dims: &[usize],
     ) -> Result<Tensor> {
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
-        let xs_3d = xs_f32.unsqueeze(1)?.contiguous()?;
+        let xs_3d = prof::timed(Span::MoeInputPrep, || xs_f32.unsqueeze(1)?.contiguous())?;
         let gate_up_out = prof::timed(Span::MoeGateUp, || {
             gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)
         })?;
@@ -623,7 +623,9 @@ impl SparseMoeBlock {
             down_exps.indexed_moe_forward(&hidden, topk_ids)
         })?;
 
-        Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
+        prof::timed(Span::MoeCombine, || {
+            Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
+        })
     }
 
     /// CPU-native equivalent of [`Self::fused_forward`], using
