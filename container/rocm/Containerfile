@@ -142,9 +142,14 @@ CMD ["sh", "-c", "gdn_bench && topk_bench"]
 # ---------------------------------------------------------------------------
 FROM rocm-runtime AS runtime
 
+# entrypoint.sh/chmod/mkdir rarely change; copying the crane-serve binary
+# last means a source-only rebuild (which invalidates every layer from
+# there on) doesn't also redo these.
+COPY container/rocm/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /models
+
 COPY --from=builder /out/crane-serve /usr/local/bin/crane-serve
-RUN mkdir -p /models
 
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/crane-serve"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["--help"]
