@@ -2,7 +2,7 @@
 #
 # crane-serve with the ROCm 10 backend, targeting AMD Strix Halo (gfx1151).
 #
-#   docker build -f docker/rocm/Dockerfile -t localhost/crane-serve:rocm10 .
+#   docker build -f container/rocm/Dockerfile -t localhost/crane-serve:rocm10 .
 #   (or: COMPOSE_PROFILES=rocm docker compose build)
 #
 # Stages:
