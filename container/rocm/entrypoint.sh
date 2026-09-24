@@ -7,7 +7,7 @@
 # string of additional flags (e.g. "--dtype f32"); intentionally unquoted
 # below to word-split, since compose has no other way to append arbitrary
 # arguments. Arguments after the image name (compose's `command:`, or extra
-# args to `docker run`/`podman run`) are appended last via "$@", so they can
+# args to `podman run`/`docker run`) are appended last via "$@", so they can
 # add flags or override one of the above by repeating it.
 set -eu
 
