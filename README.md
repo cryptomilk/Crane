@@ -370,9 +370,13 @@ docker compose run --rm crane-bench-rocm topk_bench 248320 40 200      # N K ite
 CRANE_TOPK_HOST=1 docker compose run --rm crane-bench-rocm topk_bench  # A/B: both arms host sort
 ```
 
-`CRANE_PROF`, `CRANE_TOPK_HOST` and `CRANE_GDN_PORTABLE` are passed through to
-`crane-serve-rocm` when set in the shell or `.env`. `gdn_bench` calls the fused kernel
-directly, so `CRANE_GDN_PORTABLE` and `CRANE_PROF` do not change its numbers.
+`MODEL_TYPE`, `FORMAT`, `EXTRA_ARGS`, `RUST_LOG`, `CRANE_PROF`, `CRANE_PROF_EVERY`,
+`CRANE_TOPK_HOST`, `CRANE_GDN_PORTABLE`, `CRANE_GRAMMAR_TRACE`, `CRANE_VRAM_TRACE`,
+`HIP_LAUNCH_BLOCKING` and `AMD_SERIALIZE_KERNEL` are passed through to
+`crane-serve-rocm` when set in the shell or `.env` (see compose.yaml's
+`environment:` block); `crane-bench-rocm` only forwards `CRANE_TOPK_HOST`.
+`gdn_bench` calls the fused kernel directly, so `CRANE_GDN_PORTABLE` and
+`CRANE_PROF` do not change its numbers.
 
 Notes:
 

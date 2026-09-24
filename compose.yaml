@@ -62,10 +62,27 @@ services:
       # rocBLAS profile logging (dumps a GEMM-shape summary to stderr on
       # exit). Diagnostic only; drop it for quieter logs.
       ROCBLAS_LAYER: "4"
-      # Passed through from the shell / .env when set:
+      # MODEL_TYPE/FORMAT default to crane-serve's own "auto" detection in
+      # entrypoint.sh; only need setting here if that picks the wrong
+      # architecture. EXTRA_ARGS is a space-separated string of additional
+      # crane-serve flags (e.g. "--dtype f32") -- compose has no clean way
+      # to append arbitrary arguments otherwise.
+      MODEL_TYPE:
+      FORMAT:
+      EXTRA_ARGS:
+      # Passed through from the shell / .env when set. crane-serve defaults
+      # to "info" (crane-serve/src/lib.rs) when RUST_LOG is unset.
+      RUST_LOG:
       CRANE_PROF:          # forward-pass submission vs GPU time, to stderr
+      CRANE_PROF_EVERY:    # only log every Nth CRANE_PROF sample
       CRANE_TOPK_HOST:     # 1 = host sort instead of the GPU top-k kernel
       CRANE_GDN_PORTABLE:  # 1 = op-by-op GDN recurrence instead of the fused kernel
+      CRANE_GRAMMAR_TRACE: # 1 = log tool-call grammar mask decisions
+      CRANE_VRAM_TRACE:    # 1 = log VRAM budget/reservation decisions
+      # Generic HIP debugging knobs (not crane-specific): serialize kernel
+      # launches to get an accurate stack on a GPU crash.
+      HIP_LAUNCH_BLOCKING:
+      AMD_SERIALIZE_KERNEL:
     volumes:
       - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
       # hipcc-compiled kernel cache; the first start compiles for minutes.
