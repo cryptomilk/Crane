@@ -11,8 +11,8 @@
 # not supporting any other GPU architecture (no gfx1201/RDNA4 Tensile
 # kernels, for example). See container/rocm/Containerfile's header comment.
 #
-#   docker build -f container/rocm/Containerfile.strix-halo -t localhost/crane-serve:rocm10-strixhalo .
-#   (or: COMPOSE_PROFILES=rocm-strixhalo docker compose build)
+#   podman build -f container/rocm/Containerfile.strix-halo -t localhost/crane-serve:rocm10-strixhalo .
+#   (or: COMPOSE_PROFILES=rocm-strixhalo podman compose build)
 #
 # Stages:
 #   builder        - toolchain + `crane-serve` build

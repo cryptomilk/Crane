@@ -7,8 +7,8 @@
 # (gfx1151) and RDNA4 (gfx1201) in the same package, so one image covers
 # both instead of needing a GPU-family-specific build.
 #
-#   docker build -f container/rocm/Containerfile -t localhost/crane-serve:rocm10 .
-#   (or: COMPOSE_PROFILES=rocm docker compose build)
+#   podman build -f container/rocm/Containerfile -t localhost/crane-serve:rocm10 .
+#   (or: COMPOSE_PROFILES=rocm podman compose build)
 #
 # Stages:
 #   builder        - toolchain + `crane-serve` build

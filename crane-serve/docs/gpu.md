@@ -92,11 +92,12 @@ Fedora's native ROCm 7.1 packages (builder: `fedora:44`) and ships it on
 through gfx950, covering AMD's officially-supported architecture list (e.g.
 Strix Halo/gfx1151, RDNA4/gfx1201) rather than one GPU family. The root
 `compose.yaml` runs it as service `crane-serve-rocm` under the `rocm`
-profile, with the GPU devices mapped:
+profile, with the GPU devices mapped. Examples below use `podman`; swap in
+`docker` if that's what you have installed:
 
 ```bash
 COMPOSE_PROFILES=rocm MODEL_DIR=/path/to/models MODEL=Qwen3-4B \
-    docker compose up --build
+    podman compose up --build
 ```
 
 - The ROCm backend compiles its HIP kernels with `hipcc` on first use, so the
@@ -112,7 +113,7 @@ COMPOSE_PROFILES=rocm MODEL_DIR=/path/to/models MODEL=Qwen3-4B \
   the nested amdgcn kernel build that `rocm-rs` runs itself.
 - Kernel micro-benchmarks: the Containerfile's optional `bench` target ships
   `gdn_bench [BH S K V iters]` and `topk_bench [N K iters]`; run them with
-  `docker compose run --rm crane-bench-rocm [gdn_bench|topk_bench ARGS]`
+  `podman compose run --rm crane-bench-rocm [gdn_bench|topk_bench ARGS]`
   (profile `rocm-bench`). With no arguments it runs both at their defaults.
 
 ## Environment variables
