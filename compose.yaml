@@ -1,18 +1,20 @@
 # crane-serve containers, one service per GPU backend, selected by profile.
+# Examples below use `podman`; swap in `docker` if that's what you have
+# installed, both read this file the same way.
 #
-#   COMPOSE_PROFILES=rocm MODEL_DIR=~/models MODEL=Qwen3-4B docker compose up -d
+#   COMPOSE_PROFILES=rocm MODEL_DIR=~/models MODEL=Qwen3-4B podman compose up -d
 #
 # Or put the variables in a `.env` file next to this one and just run
-# `docker compose up -d`. With no profile selected, nothing starts.
+# `podman compose up -d`. With no profile selected, nothing starts.
 #
 # MODEL is a model directory (or single .gguf file) relative to MODEL_DIR.
 # CRANE_PORT overrides the published host port (default 8080).
 #
 # ROCm micro-benchmarks (profile `rocm-bench`, not started by `up` under `rocm`):
 #
-#   docker compose run --rm crane-bench-rocm                      # both, defaults
-#   docker compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100
-#   docker compose run --rm crane-bench-rocm topk_bench 248320 40 200
+#   podman compose run --rm crane-bench-rocm                      # both, defaults
+#   podman compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100
+#   podman compose run --rm crane-bench-rocm topk_bench 248320 40 200
 #
 # `rocm-strixhalo`/`rocm-strixhalo-bench` build against the community
 # `kyuz0/amd-strix-halo-toolboxes` image instead
@@ -21,7 +23,7 @@
 # that toolbox ships newer or better-tuned gfx1151 kernels than Fedora's
 # own ROCm packages at any given time. Same usage, different profile:
 #
-#   COMPOSE_PROFILES=rocm-strixhalo MODEL_DIR=~/models MODEL=Qwen3-4B docker compose up -d
+#   COMPOSE_PROFILES=rocm-strixhalo MODEL_DIR=~/models MODEL=Qwen3-4B podman compose up -d
 #
 # `<<:` merges keys, not lists or nested maps: a service that sets its own
 # `volumes` or `environment` must repeat the anchor's entries.
