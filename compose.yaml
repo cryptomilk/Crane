@@ -29,12 +29,12 @@ x-crane-serve: &crane-serve
     - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
   restart: unless-stopped
 
-# AMD ROCm GPU access, Strix Halo (gfx1151). See container/rocm/Dockerfile.
+# AMD ROCm GPU access, Strix Halo (gfx1151). See container/rocm/Containerfile.
 # Do NOT set HSA_OVERRIDE_GFX_VERSION: gfx1151 is supported natively.
 x-rocm: &rocm
   build:
     context: .
-    dockerfile: container/rocm/Dockerfile
+    dockerfile: container/rocm/Containerfile
   devices:
     - /dev/dri:/dev/dri
     - /dev/kfd:/dev/kfd
@@ -54,7 +54,7 @@ services:
     profiles: [rocm]
     build:
       context: .
-      dockerfile: container/rocm/Dockerfile
+      dockerfile: container/rocm/Containerfile
       target: runtime
     image: localhost/crane-serve:rocm10
     environment:
@@ -80,7 +80,7 @@ services:
     profiles: [rocm-bench]
     build:
       context: .
-      dockerfile: container/rocm/Dockerfile
+      dockerfile: container/rocm/Containerfile
       target: bench
     image: localhost/crane-bench:rocm10
     environment:

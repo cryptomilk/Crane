@@ -86,7 +86,7 @@ parallelism is not yet supported.
 
 ## AMD ROCm in Docker (Strix Halo / gfx1151)
 
-`container/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's
+`container/rocm/Containerfile` builds `crane-serve --features rocm` against AMD's
 ROCm 10 packages and ships it on `fedora-minimal:44`. The root `compose.yaml`
 runs it as service `crane-serve-rocm` under the `rocm` profile, with the GPU
 devices mapped:
@@ -106,7 +106,7 @@ COMPOSE_PROFILES=rocm MODEL_DIR=/path/to/models MODEL=Qwen3-4B \
 - Build without `-Z build-std=core`: it collides with the prebuilt `std`
   (E0152). The builder sets `RUSTC_BOOTSTRAP=1` and installs `rust-src` for
   the nested amdgcn kernel build that `rocm-rs` runs itself.
-- Kernel micro-benchmarks: the Dockerfile's optional `bench` target ships
+- Kernel micro-benchmarks: the Containerfile's optional `bench` target ships
   `gdn_bench [BH S K V iters]` and `topk_bench [N K iters]`; run them with
   `docker compose run --rm crane-bench-rocm [gdn_bench|topk_bench ARGS]`
   (profile `rocm-bench`). With no arguments it runs both at their defaults.
