@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1
 #
-# crane-serve with the ROCm 10 backend, targeting AMD Strix Halo (gfx1151).
+# crane-serve with the ROCm 7.1 backend, built against Fedora's native ROCm
+# packages rather than a single-GPU-family toolbox image. Fedora's `rocblas`
+# package alone ships Tensile/hipBLASLt kernels for gfx900 through gfx950.
+# `rpm -ql rocblas | grep hsaco` on a Fedora 44 host shows both Strix Halo
+# (gfx1151) and RDNA4 (gfx1201) in the same package, so one image covers
+# both instead of needing a GPU-family-specific build.
 #
 #   docker build -f container/rocm/Containerfile -t localhost/crane-serve:rocm10 .
 #   (or: COMPOSE_PROFILES=rocm docker compose build)
@@ -8,40 +13,51 @@
 # Stages:
 #   builder        - toolchain + `crane-serve` build
 #   bench-builder  - optional: ROCm micro-benchmarks (`gdn_bench`, `topk_bench`)
-#   rocm-runtime   - fedora-minimal + trimmed ROCm tree, shared by the two below
+#   rocm-runtime   - fedora-minimal + Fedora's native ROCm runtime packages
 #   bench          - optional: rocm-runtime + the benchmarks
 #                    (`--target bench`, or compose service `crane-bench-rocm`)
 #   runtime        - rocm-runtime + crane-serve (last stage, the default)
 #
 # The build context is the repository root; the root .dockerignore applies.
 #
-# The binaries JIT-compile their HIP kernels with `hipcc` on first use
-# (candle's ROCm backend and Crane's own kernels in crane-core/kernels/cuda),
-# so the runtime stages carry the ROCm LLVM toolchain and HIP headers, not just
-# the shared libraries. Compiled code objects are cached in
+# Fedora's ROCm packages are FHS-native (headers under /usr/include, shared
+# libs under /usr/lib64, `hipcc` at /usr/bin/hipcc), unlike the traditional
+# AMD tarball layout under /opt/rocm. This is confirmed via `hipconfig
+# --rocmpath` reporting `/usr`. No LD_LIBRARY_PATH override or manual
+# ldconfig step is needed as a result; ROCM_PATH/HIP_PATH are still set
+# explicitly below since rocm-rs's build script falls back to the
+# traditional /opt/rocm default when they're unset.
+#
+# candle's ROCm backend loads rocBLAS/MIOpen's prebuilt per-arch kernels
+# (the .hsaco files above) directly, but Crane's own kernels
+# (crane-core/kernels/cuda/*.cu) are compiled from source via `hipcc` on
+# first use, at *runtime*, not just at build time. As a result, the runtime
+# stage installs HIP's headers (`rocm-hip-devel`) alongside the compiler
+# (`hipcc`/`rocm-clang`, both pulled in by the `rocm` meta-package), not
+# just the shared libraries. Compiled code objects are cached in
 # CANDLE_ROCM_CACHE_DIR; mount a volume there to skip recompiling on every
 # container start.
+#
+# That runtime compile step unbundles hipcc's output with
+# clang-offload-bundler, resolved via `$ROCM_PATH/llvm/bin` or `$PATH` (see
+# candle-rocm-kernels/src/compile/hipcc.rs's `offload_bundler()`). rocm-clang
+# installs it to /usr/lib64/rocm/llvm/bin, which is neither `$ROCM_PATH/llvm/
+# bin` (ROCM_PATH=/usr here, matching `hipconfig --rocmpath`) nor on `$PATH`
+# by default, so it's added to PATH explicitly below.
 
-ARG BUILDER_IMAGE=docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0
+ARG BUILDER_IMAGE=registry.fedoraproject.org/fedora:44
 ARG RUNTIME_IMAGE=registry.fedoraproject.org/fedora-minimal:44
 
 # ---------------------------------------------------------------------------
 FROM ${BUILDER_IMAGE} AS builder
 
-# install_weak_deps=False keeps DNF from pulling the multi-arch GPU payloads.
+# install_weak_deps=False keeps DNF from pulling in rocm-devel's optional
+# GUI/vision/ML subpackages (migraphx, mivisionx, rocal, ...).
 RUN <<-EOF
 	set -eux
 	dnf --setopt=install_weak_deps=False install -y \
 		rust rust-src cargo clang cmake make gcc-c++ git \
-		amdrocm-runtime-devel10.0 \
-		amdrocm-blas-devel10.0 \
-		amdrocm-solver-devel10.0 \
-		amdrocm-fft-devel10.0 \
-		amdrocm-rand-devel10.0 \
-		amdrocm-sparse-devel10.0 \
-		amdrocm-dnn-devel10.0 \
-		amdrocm-hipfile-devel10.0 \
-		amdrocm-llvm-devel10.0
+		rocm-devel hipcc
 	dnf clean all
 EOF
 
@@ -49,12 +65,11 @@ EOF
 # `cargo build` of an amdgcn-amd-amdhsa kernel crate that sets build-std
 # itself. Do NOT pass `-Z build-std=core` to the top-level build: it rebuilds
 # `core` for the host and collides with the prebuilt `std` (E0152).
-ENV ROCM_PATH=/opt/rocm \
-    HIP_PATH=/opt/rocm \
-    LD_LIBRARY_PATH=/opt/rocm/lib \
-    BINDGEN_EXTRA_CLANG_ARGS="-I/opt/rocm/include" \
+ENV ROCM_PATH=/usr \
+    HIP_PATH=/usr \
     RUSTC_BOOTSTRAP=1 \
-    CARGO_TARGET_DIR=/build/target
+    CARGO_TARGET_DIR=/build/target \
+    PATH="/usr/lib64/rocm/llvm/bin:${PATH}"
 
 WORKDIR /src
 COPY . .
@@ -66,20 +81,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 	cargo build --release -p crane-serve --bin crane-serve \
 		--no-default-features --features rocm
 	install -Dm755 /build/target/release/crane-serve /out/crane-serve
-EOF
-
-# Runtime copy of the ROCm tree: shared libraries, gfx1151 kernel databases,
-# HIP headers and the LLVM toolchain hipcc drives. Static archives, CMake
-# files, MLIR, LLVM dev headers and other-arch device bitcode are dropped.
-RUN <<-EOF
-	set -eux
-	cp -a /opt/rocm/core-10.0 /rocm-rt
-	cd /rocm-rt
-	find . -name '*.a' -delete
-	rm -rf lib/cmake lib/python3* lib/librocshmem_device_*.bc \
-		lib/llvm/include lib/llvm/lib/cmake \
-		lib/llvm/lib/libMLIR* lib/llvm/lib/libmlir* \
-		share/doc
 EOF
 
 # ---------------------------------------------------------------------------
@@ -100,32 +101,28 @@ EOF
 # ---------------------------------------------------------------------------
 FROM ${RUNTIME_IMAGE} AS rocm-runtime
 
-# hipcc compiles HIP device code through clang, which still parses the host
-# C/C++ standard headers and locates them via the GCC install dir
-# (/usr/lib/gcc/<triple>/<ver>/crtbegin.o, owned by `gcc`).
+# `rocm` pulls in hipcc, rocm-clang, rocblas, rocsolver, rocfft, rocrand,
+# rocsparse, hipblas, miopen, rocm-hip and rocm-runtime. That's the same set
+# the old amdrocm-*-devel10.0 toolbox packages provided by hand, but tracking
+# Fedora's officially-supported architecture list instead of one GPU family.
+# rocm-hip-devel: HIP headers for Crane's own kernels' runtime hipcc compile
+# (see the file header comment above).
+# gcc/libstdc++-devel/glibc-devel: hipcc compiles HIP device code through
+# clang, which still parses the host C/C++ standard headers and locates them
+# via the GCC install dir (/usr/lib/gcc/<triple>/<ver>/crtbegin.o, owned by
+# `gcc`).
 RUN <<-EOF
 	set -eux
 	microdnf --setopt=install_weak_deps=0 install -y \
-		gcc libstdc++-devel glibc-devel ca-certificates
+		rocm rocm-hip-devel gcc libstdc++-devel glibc-devel ca-certificates
 	microdnf clean all
 EOF
 
-COPY --from=builder /rocm-rt /opt/rocm/core-10.0
-RUN <<-EOF
-	set -eux
-	cd /opt/rocm
-	for d in amdgcn bin include lib libexec llvm share; do
-		ln -s "core-10.0/$d" "$d"
-	done
-	echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf
-	ldconfig
-EOF
-
-ENV ROCM_PATH=/opt/rocm \
-    HIP_PATH=/opt/rocm \
-    PATH=/opt/rocm/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+ENV ROCM_PATH=/usr \
+    HIP_PATH=/usr \
     CANDLE_ROCM_CACHE_DIR=/var/cache/candle-rocm \
-    HSA_ENABLE_SDMA=0
+    HSA_ENABLE_SDMA=0 \
+    PATH="/usr/lib64/rocm/llvm/bin:${PATH}"
 
 RUN mkdir -p /var/cache/candle-rocm
 VOLUME ["/var/cache/candle-rocm"]

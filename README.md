@@ -326,12 +326,15 @@ Current limitations:
   prompt lengths from one process makes exhaustion likelier, because the caching allocator
   retains a bucket set per shape it has seen.
 
-#### AMD ROCm in Docker (Strix Halo / gfx1151)
+#### AMD ROCm in Container
 
-`container/rocm/Containerfile` builds `crane-serve --features rocm` against AMD's ROCm 10
-packages (builder: `kyuz0/amd-strix-halo-toolboxes:rocm-10.0`) and ships it on
-`fedora-minimal:44`. The root `compose.yaml` has one service per GPU backend, each
-behind a [profile](https://docs.docker.com/compose/how-tos/profiles/);
+`container/rocm/Containerfile` builds `crane-serve --features rocm` against Fedora's
+native ROCm 7.1 packages (builder: `fedora:44`) and ships it on
+`fedora-minimal:44`. Fedora's `rocblas` package ships kernels for gfx900 through
+gfx950, covering AMD's officially-supported architecture list (e.g. Strix
+Halo/gfx1151, RDNA4/gfx1201) rather than one GPU family. The root `compose.yaml`
+has one service per GPU backend, each behind a
+[profile](https://docs.docker.com/compose/how-tos/profiles/);
 `crane-serve-rocm` (profile `rocm`) maps `/dev/kfd` and `/dev/dri`:
 
 ```bash
@@ -358,7 +361,7 @@ With no profile selected, nothing starts. To build only the image:
 `docker build -f container/rocm/Containerfile -t localhost/crane-serve:rocm10 .` (the
 context is the repo root).
 
-**ROCm micro-benchmarks in Docker.** The Containerfile's optional `bench` target builds
+**ROCm micro-benchmarks in Container.** The Containerfile's optional `bench` target builds
 `gdn_bench` and `topk_bench` (see *Other toggles* below); compose runs them as
 `crane-bench-rocm` under their own `rocm-bench` profile, so `docker compose up` with
 `rocm` never starts them:
@@ -381,7 +384,8 @@ CRANE_TOPK_HOST=1 docker compose run --rm crane-bench-rocm topk_bench  # A/B: bo
 Notes:
 
 - `group_add` uses numeric host GIDs (render=105, video=39 here); check yours with
-  `getent group render video`. Do not set `HSA_OVERRIDE_GFX_VERSION` on gfx1151.
+  `getent group render video`. Do not set `HSA_OVERRIDE_GFX_VERSION`; your GPU's
+  real architecture is supported natively.
 - The runtime image (~2.9 GB) carries `hipcc` and the ROCm LLVM toolchain, because
   kernels are compiled on first use. They are cached in `/var/cache/candle-rocm`
   (a named volume in the compose file), so only the first start pays that cost.

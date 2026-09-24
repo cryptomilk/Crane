@@ -29,8 +29,12 @@ x-crane-serve: &crane-serve
     - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
   restart: unless-stopped
 
-# AMD ROCm GPU access, Strix Halo (gfx1151). See container/rocm/Containerfile.
-# Do NOT set HSA_OVERRIDE_GFX_VERSION: gfx1151 is supported natively.
+# AMD ROCm GPU access. See container/rocm/Containerfile. It's built on
+# Fedora's native ROCm packages, which ship kernels for the
+# officially-supported architecture list (confirmed to include both Strix
+# Halo/gfx1151 and RDNA4/gfx1201), not one GPU family. Do NOT set
+# HSA_OVERRIDE_GFX_VERSION; your GPU's real architecture is supported
+# natively.
 x-rocm: &rocm
   build:
     context: .
@@ -65,8 +69,8 @@ services:
       # MODEL_TYPE/FORMAT default to crane-serve's own "auto" detection in
       # entrypoint.sh; only need setting here if that picks the wrong
       # architecture. EXTRA_ARGS is a space-separated string of additional
-      # crane-serve flags (e.g. "--dtype f32") -- compose has no clean way
-      # to append arbitrary arguments otherwise.
+      # crane-serve flags (e.g. "--dtype f32"). Compose has no clean way to
+      # append arbitrary arguments otherwise.
       MODEL_TYPE:
       FORMAT:
       EXTRA_ARGS:
