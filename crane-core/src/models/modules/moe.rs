@@ -611,13 +611,17 @@ impl SparseMoeBlock {
     ) -> Result<Tensor> {
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
         let xs_3d = xs_f32.unsqueeze(1)?.contiguous()?;
-        let gate_up_out = gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
+        let gate_up_out = prof::timed(Span::MoeGateUp, || {
+            gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)
+        })?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
         let hidden = prof::timed(Span::MoeActivation, || {
             crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
         })?;
-        let down_out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
+        let down_out = prof::timed(Span::MoeDownProj, || {
+            down_exps.indexed_moe_forward(&hidden, topk_ids)
+        })?;
 
         Self::combine_expert_outputs(&down_out, topk_weights, original_dtype, original_dims)
     }
