@@ -86,7 +86,7 @@ parallelism is not yet supported.
 
 ## AMD ROCm in Docker (Strix Halo / gfx1151)
 
-`docker/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's
+`container/rocm/Dockerfile` builds `crane-serve --features rocm` against AMD's
 ROCm 10 packages and ships it on `fedora-minimal:44`. The root `compose.yaml`
 runs it as service `crane-serve-rocm` under the `rocm` profile, with the GPU
 devices mapped:
