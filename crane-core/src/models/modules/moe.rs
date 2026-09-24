@@ -611,28 +611,16 @@ impl SparseMoeBlock {
     ) -> Result<Tensor> {
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
         let xs_3d = prof::timed(Span::MoeInputPrep, || xs_f32.unsqueeze(1)?.contiguous())?;
-        // TEMPORARY (remove after Phase 5.5 Step 2 measurement): force a device
-        // sync inside each timed closure so MoeGateUp/MoeDownProj capture real
-        // kernel execution time instead of async launch time.
-        let gate_up_out = prof::timed(Span::MoeGateUp, || -> Result<Tensor> {
-            let out = gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)?;
-            if prof::enabled() {
-                out.device().synchronize()?;
-            }
-            Ok(out)
+        let gate_up_out = prof::timed(Span::MoeGateUp, || {
+            gate_up_exps.indexed_moe_forward(&xs_3d, topk_ids)
         })?;
         let gate = gate_up_out.narrow(D::Minus1, 0, intermediate_size)?;
         let up = gate_up_out.narrow(D::Minus1, intermediate_size, intermediate_size)?;
         let hidden = prof::timed(Span::MoeActivation, || {
             crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
         })?;
-        // TEMPORARY (remove after Phase 5.5 Step 2 measurement): see above.
-        let down_out = prof::timed(Span::MoeDownProj, || -> Result<Tensor> {
-            let out = down_exps.indexed_moe_forward(&hidden, topk_ids)?;
-            if prof::enabled() {
-                out.device().synchronize()?;
-            }
-            Ok(out)
+        let down_out = prof::timed(Span::MoeDownProj, || {
+            down_exps.indexed_moe_forward(&hidden, topk_ids)
         })?;
 
         prof::timed(Span::MoeCombine, || {
