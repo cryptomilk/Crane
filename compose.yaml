@@ -14,6 +14,15 @@
 #   docker compose run --rm crane-bench-rocm gdn_bench 16 512 128 128 100
 #   docker compose run --rm crane-bench-rocm topk_bench 248320 40 200
 #
+# `rocm-strixhalo`/`rocm-strixhalo-bench` build against the community
+# `kyuz0/amd-strix-halo-toolboxes` image instead
+# (container/rocm/Containerfile.strix-halo). It's a Strix-Halo-only
+# alternative to the general `rocm`/`rocm-bench` build above, kept in case
+# that toolbox ships newer or better-tuned gfx1151 kernels than Fedora's
+# own ROCm packages at any given time. Same usage, different profile:
+#
+#   COMPOSE_PROFILES=rocm-strixhalo MODEL_DIR=~/models MODEL=Qwen3-4B docker compose up -d
+#
 # `<<:` merges keys, not lists or nested maps: a service that sets its own
 # `volumes` or `environment` must repeat the anchor's entries.
 
@@ -113,5 +122,53 @@ services:
     volumes:
       - candle-rocm-cache:/var/cache/candle-rocm
 
+  # Strix-Halo-toolbox variant of crane-serve-rocm above. See the
+  # `rocm-strixhalo`/container/rocm/Containerfile.strix-halo note near the
+  # top of this file. Same environment knobs; not repeated here since only
+  # the image differs.
+  crane-serve-rocm-strixhalo:
+    <<: [*crane-serve, *rocm]
+    profiles: [rocm-strixhalo]
+    build:
+      context: .
+      dockerfile: container/rocm/Containerfile.strix-halo
+      target: runtime
+    image: localhost/crane-serve:rocm10-strixhalo
+    environment:
+      HSA_ENABLE_SDMA: "0"
+      ROCBLAS_LAYER: "4"
+      MODEL_TYPE:
+      FORMAT:
+      EXTRA_ARGS:
+      RUST_LOG:
+      CRANE_PROF:
+      CRANE_PROF_EVERY:
+      CRANE_TOPK_HOST:
+      CRANE_GDN_PORTABLE:
+      CRANE_GRAMMAR_TRACE:
+      CRANE_VRAM_TRACE:
+      HIP_LAUNCH_BLOCKING:
+      AMD_SERIALIZE_KERNEL:
+    volumes:
+      - ${MODEL_DIR:?set MODEL_DIR to the host model directory}:/models:ro
+      # Separate from candle-rocm-cache: a different toolchain/ROCm build
+      # compiled these code objects, so they aren't interchangeable.
+      - candle-rocm-cache-strixhalo:/var/cache/candle-rocm
+
+  crane-bench-rocm-strixhalo:
+    <<: *rocm
+    profiles: [rocm-strixhalo-bench]
+    build:
+      context: .
+      dockerfile: container/rocm/Containerfile.strix-halo
+      target: bench
+    image: localhost/crane-bench:rocm10-strixhalo
+    environment:
+      HSA_ENABLE_SDMA: "0"
+      CRANE_TOPK_HOST:
+    volumes:
+      - candle-rocm-cache-strixhalo:/var/cache/candle-rocm
+
 volumes:
   candle-rocm-cache:
+  candle-rocm-cache-strixhalo:

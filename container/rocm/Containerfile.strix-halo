@@ -1,0 +1,164 @@
+# syntax=docker/dockerfile:1
+#
+# crane-serve with the ROCm 10 backend, built against the community
+# `kyuz0/amd-strix-halo-toolboxes` image instead of Fedora's native ROCm
+# packages. See container/rocm/Containerfile, the default/recommended build.
+#
+# This variant exists for comparison against or as a fallback from the
+# general build. The toolbox image is maintained specifically for Strix
+# Halo (gfx1151) and may ship newer or better-tuned kernels for that one
+# chip than Fedora's own ROCm packages do at any given time, at the cost of
+# not supporting any other GPU architecture (no gfx1201/RDNA4 Tensile
+# kernels, for example). See container/rocm/Containerfile's header comment.
+#
+#   docker build -f container/rocm/Containerfile.strix-halo -t localhost/crane-serve:rocm10-strixhalo .
+#   (or: COMPOSE_PROFILES=rocm-strixhalo docker compose build)
+#
+# Stages:
+#   builder        - toolchain + `crane-serve` build
+#   bench-builder  - optional: ROCm micro-benchmarks (`gdn_bench`, `topk_bench`)
+#   rocm-runtime   - fedora-minimal + trimmed ROCm tree, shared by the two below
+#   bench          - optional: rocm-runtime + the benchmarks
+#                    (`--target bench`, or compose service `crane-bench-rocm-strixhalo`)
+#   runtime        - rocm-runtime + crane-serve (last stage, the default)
+#
+# The build context is the repository root; the root .dockerignore applies.
+#
+# The binaries JIT-compile their HIP kernels with `hipcc` on first use
+# (candle's ROCm backend and Crane's own kernels in crane-core/kernels/cuda),
+# so the runtime stages carry the ROCm LLVM toolchain and HIP headers, not just
+# the shared libraries. Compiled code objects are cached in
+# CANDLE_ROCM_CACHE_DIR; mount a volume there to skip recompiling on every
+# container start.
+
+ARG BUILDER_IMAGE=docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0
+ARG RUNTIME_IMAGE=registry.fedoraproject.org/fedora-minimal:44
+
+# ---------------------------------------------------------------------------
+FROM ${BUILDER_IMAGE} AS builder
+
+# install_weak_deps=False keeps DNF from pulling the multi-arch GPU payloads.
+RUN <<-EOF
+	set -eux
+	dnf --setopt=install_weak_deps=False install -y \
+		rust rust-src cargo clang cmake make gcc-c++ git \
+		amdrocm-runtime-devel10.0 \
+		amdrocm-blas-devel10.0 \
+		amdrocm-solver-devel10.0 \
+		amdrocm-fft-devel10.0 \
+		amdrocm-rand-devel10.0 \
+		amdrocm-sparse-devel10.0 \
+		amdrocm-dnn-devel10.0 \
+		amdrocm-hipfile-devel10.0 \
+		amdrocm-llvm-devel10.0
+	dnf clean all
+EOF
+
+# RUSTC_BOOTSTRAP=1 + rust-src: rocm-rs's `macros` feature runs a nested
+# `cargo build` of an amdgcn-amd-amdhsa kernel crate that sets build-std
+# itself. Do NOT pass `-Z build-std=core` to the top-level build: it rebuilds
+# `core` for the host and collides with the prebuilt `std` (E0152).
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    LD_LIBRARY_PATH=/opt/rocm/lib \
+    BINDGEN_EXTRA_CLANG_ARGS="-I/opt/rocm/include" \
+    RUSTC_BOOTSTRAP=1 \
+    CARGO_TARGET_DIR=/build/target
+
+WORKDIR /src
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target <<-EOF
+	set -eux
+	cargo build --release -p crane-serve --bin crane-serve \
+		--no-default-features --features rocm
+	install -Dm755 /build/target/release/crane-serve /out/crane-serve
+EOF
+
+# Runtime copy of the ROCm tree: shared libraries, gfx1151 kernel databases,
+# HIP headers and the LLVM toolchain hipcc drives. Static archives, CMake
+# files, MLIR, LLVM dev headers and other-arch device bitcode are dropped.
+RUN <<-EOF
+	set -eux
+	cp -a /opt/rocm/core-10.0 /rocm-rt
+	cd /rocm-rt
+	find . -name '*.a' -delete
+	rm -rf lib/cmake lib/python3* lib/librocshmem_device_*.bc \
+		lib/llvm/include lib/llvm/lib/cmake \
+		lib/llvm/lib/libMLIR* lib/llvm/lib/libmlir* \
+		share/doc
+EOF
+
+# ---------------------------------------------------------------------------
+# Optional: ROCm micro-benchmarks. Only built for the `bench` target; the
+# shared cargo cache mount means only crane-core's bins compile here.
+FROM builder AS bench-builder
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target <<-EOF
+	set -eux
+	cargo build --release -p crane-core --bin gdn_bench --bin topk_bench \
+		--no-default-features --features rocm
+	install -Dm755 -t /out/bench \
+		/build/target/release/gdn_bench /build/target/release/topk_bench
+EOF
+
+# ---------------------------------------------------------------------------
+FROM ${RUNTIME_IMAGE} AS rocm-runtime
+
+# hipcc compiles HIP device code through clang, which still parses the host
+# C/C++ standard headers and locates them via the GCC install dir
+# (/usr/lib/gcc/<triple>/<ver>/crtbegin.o, owned by `gcc`).
+RUN <<-EOF
+	set -eux
+	microdnf --setopt=install_weak_deps=0 install -y \
+		gcc libstdc++-devel glibc-devel ca-certificates
+	microdnf clean all
+EOF
+
+COPY --from=builder /rocm-rt /opt/rocm/core-10.0
+RUN <<-EOF
+	set -eux
+	cd /opt/rocm
+	for d in amdgcn bin include lib libexec llvm share; do
+		ln -s "core-10.0/$d" "$d"
+	done
+	echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf
+	ldconfig
+EOF
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CANDLE_ROCM_CACHE_DIR=/var/cache/candle-rocm \
+    HSA_ENABLE_SDMA=0
+
+RUN mkdir -p /var/cache/candle-rocm
+VOLUME ["/var/cache/candle-rocm"]
+
+# ---------------------------------------------------------------------------
+# Optional: `gdn_bench [BH S K V iters]` (fused GDN recurrence kernel) and
+# `topk_bench [N K iters]` (GPU top-k kernel vs host sort). The default
+# command runs both with their built-in defaults.
+FROM rocm-runtime AS bench
+
+COPY --from=bench-builder /out/bench/ /usr/local/bin/
+CMD ["sh", "-c", "gdn_bench && topk_bench"]
+
+# ---------------------------------------------------------------------------
+FROM rocm-runtime AS runtime
+
+# entrypoint.sh/chmod/mkdir rarely change; copying the crane-serve binary
+# last means a source-only rebuild (which invalidates every layer from
+# there on) doesn't also redo these.
+COPY container/rocm/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && mkdir -p /models
+
+COPY --from=builder /out/crane-serve /usr/local/bin/crane-serve
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["--help"]
