@@ -71,6 +71,12 @@ services:
       context: .
       dockerfile: container/rocm/Containerfile
       target: runtime
+      args:
+        # Build-time only (see the Containerfile) -- host-CPU-specific codegen
+        # flags, e.g. RUSTFLAGS="-C target-feature=+avx2,+fma". Setting this
+        # under `environment:` instead would do nothing: that only reaches the
+        # already-built binary at container start, not the `cargo build` step.
+        RUSTFLAGS:
     image: localhost/crane-serve:rocm10
     environment:
       HSA_ENABLE_SDMA: "0"
@@ -114,6 +120,8 @@ services:
       context: .
       dockerfile: container/rocm/Containerfile
       target: bench
+      args:
+        RUSTFLAGS: # see crane-serve-rocm's build.args.RUSTFLAGS above
     image: localhost/crane-bench:rocm10
     environment:
       HSA_ENABLE_SDMA: "0"
