@@ -656,7 +656,15 @@ impl SparseMoeBlock {
     /// (timing the `swiglu()` call below) runs between the two
     /// `MoeExpert` spans here rather than nested inside one, so unlike the
     /// per-expert loop, its time is additional on top of `MoeExpert`'s, not
-    /// a subset of it.
+    /// a subset of it. Each of `MoeToDevice`'s three calls is additionally
+    /// wrapped in its own `MoeCpuXsDev`/`MoeCpuWeightsDev`/`MoeCpuOutDev`
+    /// span, since on `--features rocm` each crossing independently pays a
+    /// full stream-drain-then-copy (see candle-rocm's
+    /// `SendSyncDeviceMemory::copy_from_host`/`copy_to_host`) regardless of
+    /// the few-KB payload -- this breakdown is what tells apart a
+    /// per-call-overhead-bound `to_dev` (all three roughly equal despite
+    /// `topk_weights` being far smaller than `xs_f32`/the combined output)
+    /// from a bytes-bound one.
     ///
     /// # Errors
     ///
@@ -677,9 +685,14 @@ impl SparseMoeBlock {
         let input_device = xs_f32.device();
         let num_experts = gate_up_exps.shape().dims()[0];
         let intermediate_size = gate_up_exps.shape().dims()[1] / 2;
-        let xs_cpu = prof::timed(Span::MoeToDevice, || xs_f32.to_device(&Device::Cpu))?;
-        let topk_weights_cpu =
-            prof::timed(Span::MoeToDevice, || topk_weights.to_device(&Device::Cpu))?;
+        let xs_cpu = prof::timed(Span::MoeToDevice, || {
+            prof::timed(Span::MoeCpuXsDev, || xs_f32.to_device(&Device::Cpu))
+        })?;
+        let topk_weights_cpu = prof::timed(Span::MoeToDevice, || {
+            prof::timed(Span::MoeCpuWeightsDev, || {
+                topk_weights.to_device(&Device::Cpu)
+            })
+        })?;
 
         let Ok(mut routing) = self.routing.lock() else {
             candle_core::bail!("SparseMoeBlock::routing mutex poisoned");
@@ -707,7 +720,9 @@ impl SparseMoeBlock {
                 original_dims,
             )
         })?;
-        prof::timed(Span::MoeToDevice, || combined.to_device(input_device))
+        prof::timed(Span::MoeToDevice, || {
+            prof::timed(Span::MoeCpuOutDev, || combined.to_device(input_device))
+        })
     }
 
     /// GPU-offloaded equivalent of [`Self::cpu_batched_forward`], for a
