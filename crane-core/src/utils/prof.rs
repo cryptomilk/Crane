@@ -56,18 +56,23 @@ macro_rules! prof_log {
 /// [`Span::MoeGateUp`]/[`Span::MoeDownProj`]/[`Span::MoeInputPrep`]/
 /// [`Span::MoeCombine`] time the `swiglu()` activation, the two
 /// `indexed_moe_forward` GEMMs, and the reshape/combine steps around them
-/// inside `fused_forward` specifically. `MoeActivation` applies across every
-/// `MoE` dispatch path ([`Span::MoeFused`], the per-expert
-/// [`Span::MoeExpert`] loop, and `cpu_batched_forward`); the other four
-/// apply only inside the fused path, and together with `MoeActivation`
-/// should sum to `MoeFused` there. Each of the first four tiers is reported
-/// on its own line and should sum to its parent. In the fused path and the
-/// per-expert loop, [`Span::MoeActivation`] is a subset of time already
-/// counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in `cpu_batched_forward`
-/// it runs between two separate [`Span::MoeExpert`] spans instead of inside
-/// either, so there it is additional time not counted by
-/// [`Span::MoeExpert`]. Either way it is reported for diagnostic purposes
-/// only and not summed into anything.
+/// inside `fused_forward` specifically, and [`Span::MoeCpuXsDev`]/
+/// [`Span::MoeCpuWeightsDev`]/[`Span::MoeCpuOutDev`] time
+/// `cpu_batched_forward`'s three `MoeToDevice` calls individually.
+/// `MoeActivation` applies across every `MoE` dispatch path
+/// ([`Span::MoeFused`], the per-expert [`Span::MoeExpert`] loop, and
+/// `cpu_batched_forward`); the fused-path breakdown applies only inside the
+/// fused path, and together with `MoeActivation` should sum to `MoeFused`
+/// there; the `cpu_batched_forward` breakdown's three spans should each
+/// equal one of `MoeToDevice`'s three calls in that function, and together
+/// sum to `MoeToDevice`'s total there. Each of the first four tiers is
+/// reported on its own line and should sum to its parent. In the fused path
+/// and the per-expert loop, [`Span::MoeActivation`] is a subset of time
+/// already counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in
+/// `cpu_batched_forward` it runs between two separate [`Span::MoeExpert`]
+/// spans instead of inside either, so there it is additional time not
+/// counted by [`Span::MoeExpert`]. Every span in these lower tiers is
+/// reported for diagnostic purposes only and not summed into anything.
 #[derive(Clone, Copy)]
 pub enum Span {
     // Tier 1 — the whole pass.
@@ -129,14 +134,31 @@ pub enum Span {
     /// actually waited on wherever the first following call reads real
     /// output values -- this span checks whether that point is here.
     MoeCombine,
+    // Tier 3c: nested inside `cpu_batched_forward`'s three `MoeToDevice`
+    // calls specifically (a subset of that span's time), added to attribute
+    // `to_dev`'s cost across its three independent host<->device crossings
+    // rather than only seeing their combined total.
+    /// Time spent moving `cpu_batched_forward`'s activation input
+    /// (`xs_f32`, GPU->CPU) specifically. A subset of one of
+    /// [`Span::MoeToDevice`]'s three calls in that function.
+    MoeCpuXsDev,
+    /// Time spent moving `cpu_batched_forward`'s routing weights
+    /// (`topk_weights`, GPU->CPU) specifically. A subset of one of
+    /// [`Span::MoeToDevice`]'s three calls in that function.
+    MoeCpuWeightsDev,
+    /// Time spent moving `cpu_batched_forward`'s combined output back
+    /// (CPU->GPU) specifically. A subset of one of [`Span::MoeToDevice`]'s
+    /// three calls in that function.
+    MoeCpuOutDev,
 }
 
-const NUM_SPANS: usize = 25;
+const NUM_SPANS: usize = 28;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
 const TIER2_MOE: std::ops::Range<usize> = 15..20;
 const TIER3_MOE: std::ops::Range<usize> = 20..25;
+const TIER3C_MOE: std::ops::Range<usize> = 25..28;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed",
@@ -164,6 +186,9 @@ const NAMES: [&str; NUM_SPANS] = [
     "down_proj",
     "input_prep",
     "combine",
+    "cpu_xs",
+    "cpu_weights",
+    "cpu_out",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -344,6 +369,7 @@ fn report(kind: usize, t: &Totals) {
         sum(TIER2_MOE)
     );
     log::trace!("[crane-prof]   moe_detail: {}", line(TIER3_MOE));
+    log::trace!("[crane-prof]   moe_cpu_detail: {}", line(TIER3C_MOE));
 }
 
 #[cfg(test)]
@@ -372,7 +398,8 @@ mod tests {
         assert_eq!(TIER2.end, TIER3.start);
         assert_eq!(TIER3.end, TIER2_MOE.start);
         assert_eq!(TIER2_MOE.end, TIER3_MOE.start);
-        assert_eq!(TIER3_MOE.end, NUM_SPANS);
+        assert_eq!(TIER3_MOE.end, TIER3C_MOE.start);
+        assert_eq!(TIER3C_MOE.end, NUM_SPANS);
         assert_eq!(NAMES.len(), NUM_SPANS);
     }
 }
