@@ -74,6 +74,37 @@ ENV ROCM_PATH=/usr \
 WORKDIR /src
 COPY . .
 
+# Optional CPU codegen flags for this build machine (e.g.
+# `--build-arg RUSTFLAGS="-C target-feature=+avx2,+fma"`), since the right
+# flags are host-CPU-specific -- not baked in as a fixed default. Written
+# into a `[target.x86_64-unknown-linux-gnu]` section in
+# `/root/.cargo/config.toml`, not exported as a global `RUSTFLAGS` env var:
+# cargo only applies a `[target.<triple>]` section's rustflags when
+# compiling for that exact triple, so this can't leak into the nested
+# amdgcn-amd-amdhsa kernel-crate build above (rocm-rs's `macros` feature),
+# unlike a `RUSTFLAGS` env var, which every `cargo`/`rustc` invocation in
+# this stage would inherit regardless of target. Unlocks candle's AVX2 CPU
+# quantized-matmul path (`candle-core/src/quantized/avx.rs`), gated behind
+# `#[cfg(target_feature = "avx2")]`, which otherwise falls back to an
+# unvectorized scalar path regardless of the host CPU's real capabilities.
+ARG RUSTFLAGS=""
+RUN <<-'RUSTFLAGS_EOF'
+	set -eu
+	if [ -n "${RUSTFLAGS:-}" ]; then
+		mkdir -p /root/.cargo
+		{
+			printf '[target.x86_64-unknown-linux-gnu]\n'
+			printf 'rustflags = ['
+			first=1
+			for flag in $RUSTFLAGS; do
+				[ "$first" = 1 ] && first=0 || printf ', '
+				printf '"%s"' "$flag"
+			done
+			printf ']\n'
+		} >> /root/.cargo/config.toml
+	fi
+	RUSTFLAGS_EOF
+
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/build/target <<-EOF
