@@ -9,7 +9,11 @@ use candle_core::quantized::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4_0, BlockQ4_1, BlockQ4K, BlockQ5_0, BlockQ5_1, BlockQ5K, BlockQ6K,
     BlockQ8_0, BlockQ8_1, BlockQ8K,
 };
+#[cfg(feature = "rocm")]
+use candle_core::quantized::rocm as quantized_rocm;
 use candle_core::quantized::{GgmlDType, GgmlType, QMatMul, QTensor, ggml_file::qtensor_from_ggml};
+#[cfg(feature = "rocm")]
+use candle_core::rocm_backend::RocmDevice;
 use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Result, Tensor};
 #[cfg(test)]
@@ -744,6 +748,10 @@ impl SparseMoeBlock {
     /// back to `xs_f32`'s original device before returning, matching
     /// `cpu_batched_forward`'s device contract.
     ///
+    /// On a `ROCm` `device` this delegates to
+    /// [`Self::gpu_offload_forward_rocm_async`], which uploads both packed
+    /// tensors with `hipMemcpyAsync` instead of the synchronous path below.
+    ///
     /// # Errors
     ///
     /// Returns an error if either upload, any device transfer, or
@@ -764,6 +772,27 @@ impl SparseMoeBlock {
             "gpu_offload_forward expects CPU-resident packed experts"
         );
         let input_device = xs_f32.device().clone();
+
+        // ROCm gets the async pinned-upload path below; CUDA does not,
+        // because candle's CUDA backend has no equivalent public API for
+        // pinning host memory and issuing an async upload against it (only
+        // the ROCm backend exposes `with_pinned_host_memory`).
+        #[cfg(feature = "rocm")]
+        if let Device::Rocm(rocm_dev) = device {
+            return Self::gpu_offload_forward_rocm_async(
+                xs_f32,
+                topk_ids,
+                topk_weights,
+                gate_up_exps,
+                down_exps,
+                device,
+                rocm_dev,
+                &input_device,
+                original_dtype,
+                original_dims,
+            );
+        }
+
         let (gate_up_gpu, down_gpu) = prof::timed(Span::MoeToDevice, || -> Result<_> {
             let gate_up_gpu = upload_qtensor(gate_up_exps, device)?;
             let down_gpu = upload_qtensor(down_exps, device)?;
@@ -787,6 +816,105 @@ impl SparseMoeBlock {
         })?;
 
         prof::timed(Span::MoeToDevice, || out.to_device(&input_device))
+    }
+
+    /// `ROCm`-only fast path for [`Self::gpu_offload_forward`]: pins both
+    /// packed expert tensors' host bytes via
+    /// [`RocmDevice::with_pinned_host_memory`] and uploads them with
+    /// `hipMemcpyAsync` instead of blocking on a synchronous `hipMemcpy` for
+    /// each. `PinnedHostRegion::new` is `pub(crate)` in candle, so
+    /// `with_pinned_host_memory`'s closure is the only way to obtain a pin
+    /// from outside that crate; every call this layer makes for the
+    /// duration of the pin — the async uploads, the small `xs`/`topk`
+    /// transfers, `fused_forward`, and the result transfer back — therefore
+    /// runs nested inside its closure, so the CPU thread enqueues all of
+    /// that work before it ever has to wait. `PinnedHostRegion::drop` drains
+    /// the device stream before unregistering, so returning from the
+    /// closure is this function's one blocking point; it blocks once,
+    /// after this layer's work is enqueued, instead of the synchronous
+    /// path's two blocks up front (one per upload) before any compute is
+    /// dispatched at all.
+    ///
+    /// Pinning is per-call: each call here pays a fresh
+    /// `hipHostRegister`/`hipHostUnregister` pair for both tensors, since
+    /// `with_pinned_host_memory`'s closure scoping makes a pin held across
+    /// calls impossible from outside candle. [`Span::MoeOffloadUpload`]
+    /// measures the async-upload enqueue; the register/drain/unregister cost
+    /// isn't separately attributable and shows up only as the gap between a
+    /// pass's total time and the sum of its measured spans. Measured on real
+    /// ROCm hardware, that gap is only significant on a buffer's first call
+    /// (`hipHostRegister` faulting in the pages) and negligible afterward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either pinned-memory scope, either upload, any
+    /// device transfer, or `fused_forward` fails.
+    #[cfg(feature = "rocm")]
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_offload_forward_rocm_async(
+        xs_f32: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        gate_up_exps: &QTensor,
+        down_exps: &QTensor,
+        device: &Device,
+        rocm_dev: &RocmDevice,
+        input_device: &Device,
+        original_dtype: DType,
+        original_dims: &[usize],
+    ) -> Result<Tensor> {
+        // `gate_up_raw`/`down_raw` must live in this function's own scope,
+        // outliving both `with_pinned_host_memory` calls below: each pin
+        // borrows from one of these for the pin's whole lifetime.
+        let gate_up_raw = gate_up_exps.data()?;
+        let down_raw = down_exps.data()?;
+
+        rocm_dev.with_pinned_host_memory(&gate_up_raw, |gate_up_pin| {
+            rocm_dev.with_pinned_host_memory(&down_raw, |down_pin| {
+                let (gate_up_storage, down_storage) =
+                    prof::timed(Span::MoeOffloadUpload, || -> Result<_> {
+                        let gate_up_storage = quantized_rocm::load_quantized_async(
+                            rocm_dev,
+                            gate_up_pin,
+                            gate_up_exps.dtype(),
+                        )?;
+                        let down_storage = quantized_rocm::load_quantized_async(
+                            rocm_dev,
+                            down_pin,
+                            down_exps.dtype(),
+                        )?;
+                        Ok((gate_up_storage, down_storage))
+                    })?;
+
+                let gate_up_gpu =
+                    QTensor::new(gate_up_storage, gate_up_exps.shape().dims().to_vec())?;
+                let down_gpu = QTensor::new(down_storage, down_exps.shape().dims().to_vec())?;
+
+                let xs_gpu = prof::timed(Span::MoeToDevice, || xs_f32.to_device(device))?;
+                let topk_ids_gpu = prof::timed(Span::MoeToDevice, || topk_ids.to_device(device))?;
+                let topk_weights_gpu =
+                    prof::timed(Span::MoeToDevice, || topk_weights.to_device(device))?;
+
+                let out = prof::timed(Span::MoeFused, || {
+                    Self::fused_forward(
+                        &xs_gpu,
+                        &topk_ids_gpu,
+                        &topk_weights_gpu,
+                        &gate_up_gpu,
+                        &down_gpu,
+                        original_dtype,
+                        original_dims,
+                    )
+                })?;
+
+                // `down_pin` drops when this closure returns, draining the
+                // device stream before unregistering — the single sync
+                // point for both async uploads.
+                prof::timed(Span::MoeToDevice, || out.to_device(input_device))
+            })
+            // `gate_up_pin` drops here; the stream was already drained by
+            // `down_pin`'s drop above, so this drain is a no-op.
+        })
     }
 
     /// Dispatches to the packed-tensor batched `MoE` path when this block
@@ -3310,12 +3438,16 @@ mod tests {
     // Verifies `SparseMoeBlock::gpu_offload_forward` (uploading a
     // CPU-resident packed expert pair to a GPU device and dispatching
     // through `fused_forward`) produces the same output as
-    // `cpu_batched_forward`, given identical weight data and routing.
+    // `cpu_batched_forward`, given identical weight data and routing. On a
+    // ROCm device this exercises `gpu_offload_forward_rocm_async` too, since
+    // `gpu_offload_forward` dispatches to it internally for `Device::Rocm`.
     // Requires a real CUDA/ROCm device (the underlying `indexed_moe_forward`
     // has no CPU implementation), so this is only compiled with one of those
     // features enabled and `#[ignore]`d by default; run with:
     //   cargo test -p crane-core --features cuda \
     //     gpu_offload_forward_matches_cpu_batched -- --ignored --nocapture
+    // Covers correctness only; the async path's timing was separately
+    // verified with `CRANE_PROF` on real ROCm hardware (see commit history).
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     #[test]
     #[ignore]

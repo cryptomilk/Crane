@@ -52,7 +52,7 @@ macro_rules! prof_log {
 
 /// One measured region of the forward pass.
 ///
-/// The variants form five non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
+/// The variants form seven non-overlapping tiers: [`Span::Embed`]..=[`Span::Head`]
 /// partition the whole pass, [`Span::GdnProj`]..=[`Span::GdnFinish`] partition
 /// [`Span::Gdn`], [`Span::GdnPrep`]..=[`Span::GdnPost`] partition
 /// [`Span::GdnRecur`], [`Span::MoeRouter`]..=[`Span::MoeMisc`] partition
@@ -60,23 +60,34 @@ macro_rules! prof_log {
 /// [`Span::MoeGateUp`]/[`Span::MoeDownProj`]/[`Span::MoeInputPrep`]/
 /// [`Span::MoeCombine`] time the `swiglu()` activation, the two
 /// `indexed_moe_forward` GEMMs, and the reshape/combine steps around them
-/// inside `fused_forward` specifically, and [`Span::MoeCpuXsDev`]/
+/// inside `fused_forward` specifically, [`Span::MoeCpuXsDev`]/
 /// [`Span::MoeCpuWeightsDev`]/[`Span::MoeCpuOutDev`] time
-/// `cpu_batched_forward`'s three `MoeToDevice` calls individually.
-/// `MoeActivation` applies across every `MoE` dispatch path
-/// ([`Span::MoeFused`], the per-expert [`Span::MoeExpert`] loop, and
-/// `cpu_batched_forward`); the fused-path breakdown applies only inside the
-/// fused path, and together with `MoeActivation` should sum to `MoeFused`
-/// there; the `cpu_batched_forward` breakdown's three spans should each
-/// equal one of `MoeToDevice`'s three calls in that function, and together
-/// sum to `MoeToDevice`'s total there. Each of the first four tiers is
-/// reported on its own line and should sum to its parent. In the fused path
-/// and the per-expert loop, [`Span::MoeActivation`] is a subset of time
-/// already counted by [`Span::MoeFused`]/[`Span::MoeExpert`]; in
-/// `cpu_batched_forward` it runs between two separate [`Span::MoeExpert`]
-/// spans instead of inside either, so there it is additional time not
-/// counted by [`Span::MoeExpert`]. Every span in these lower tiers is
-/// reported for diagnostic purposes only and not summed into anything.
+/// `cpu_batched_forward`'s three `MoeToDevice` calls individually, and
+/// [`Span::MoeOffloadUpload`] times the async-upload enqueue step nested
+/// inside `gpu_offload_forward_rocm_async`'s pinned-memory closure, itself
+/// inside that function's `MoeToDevice` calls. `MoeActivation` applies
+/// across every `MoE` dispatch path ([`Span::MoeFused`], the per-expert
+/// [`Span::MoeExpert`] loop, and `cpu_batched_forward`); the fused-path
+/// breakdown applies only inside the fused path, and together with
+/// `MoeActivation` should sum to `MoeFused` there; the
+/// `cpu_batched_forward` breakdown's three spans should each equal one of
+/// `MoeToDevice`'s three calls in that function, and together sum to
+/// `MoeToDevice`'s total there; `MoeOffloadUpload` is a subset of one of
+/// `gpu_offload_forward_rocm_async`'s `MoeToDevice` calls, not a full
+/// partition of it — the pin/unpin cost around it (`hipHostRegister`, the
+/// stream drain, `hipHostUnregister`) is not separately measurable through
+/// candle's closure-scoped pinning API, so it only shows up as the gap
+/// between a pass's total time and the sum of its measured spans. Measured
+/// on real ROCm hardware, that gap is only significant on a buffer's first
+/// call and negligible afterward. Each of
+/// the first four tiers is reported on its own line and should sum to its
+/// parent. In the fused path and the per-expert loop,
+/// [`Span::MoeActivation`] is a subset of time already counted by
+/// [`Span::MoeFused`]/[`Span::MoeExpert`]; in `cpu_batched_forward` it runs
+/// between two separate [`Span::MoeExpert`] spans instead of inside either,
+/// so there it is additional time not counted by [`Span::MoeExpert`]. Every
+/// span in these lower tiers is reported for diagnostic purposes only and
+/// not summed into anything.
 #[derive(Clone, Copy)]
 pub enum Span {
     // Tier 1 — the whole pass.
@@ -154,15 +165,28 @@ pub enum Span {
     /// (CPU->GPU) specifically. A subset of one of [`Span::MoeToDevice`]'s
     /// three calls in that function.
     MoeCpuOutDev,
+    // Tier 3d: nested inside `gpu_offload_forward_rocm_async`'s
+    // `MoeToDevice` call specifically (a subset of that span's time), added
+    // to attribute the ROCm async-upload path's enqueue cost separately
+    // from the upload itself. The pin/drain/unpin cost around it is not
+    // separately measurable — candle's `with_pinned_host_memory` is
+    // closure-scoped, so there's no point to time it from outside the call.
+    /// Time spent enqueuing both packed expert tensors' `hipMemcpyAsync`
+    /// uploads, in `gpu_offload_forward_rocm_async`. A subset of
+    /// [`Span::MoeToDevice`]'s time in that function. Reads near-zero, the
+    /// same way [`Span::MoeGateUp`]/[`Span::MoeDownProj`] do, since
+    /// enqueuing an async copy returns before the transfer completes.
+    MoeOffloadUpload,
 }
 
-const NUM_SPANS: usize = 28;
+const NUM_SPANS: usize = 29;
 const TIER1: std::ops::Range<usize> = 0..7;
 const TIER2: std::ops::Range<usize> = 7..12;
 const TIER3: std::ops::Range<usize> = 12..15;
 const TIER2_MOE: std::ops::Range<usize> = 15..20;
 const TIER3_MOE: std::ops::Range<usize> = 20..25;
 const TIER3C_MOE: std::ops::Range<usize> = 25..28;
+const TIER3D_MOE: std::ops::Range<usize> = 28..29;
 
 const NAMES: [&str; NUM_SPANS] = [
     "embed",
@@ -193,6 +217,7 @@ const NAMES: [&str; NUM_SPANS] = [
     "cpu_xs",
     "cpu_weights",
     "cpu_out",
+    "offload_upload",
 ];
 
 static SPAN_NS: [AtomicU64; NUM_SPANS] = [const { AtomicU64::new(0) }; NUM_SPANS];
@@ -406,6 +431,7 @@ fn report(kind: usize, t: &Totals) {
     );
     prof_log!("[crane-prof]   moe_detail: {}", line(TIER3_MOE));
     prof_log!("[crane-prof]   moe_cpu_detail: {}", line(TIER3C_MOE));
+    prof_log!("[crane-prof]   moe_offload_detail: {}", line(TIER3D_MOE));
 }
 
 #[cfg(test)]
@@ -425,8 +451,8 @@ mod tests {
         assert_eq!(SPAN_NS[Span::Embed as usize].load(Ordering::Relaxed), 0);
     }
 
-    /// The five tiers must partition the span list exactly — a span left out
-    /// of every tier would be recorded and never reported.
+    /// The seven tiers must partition the span list exactly — a span left
+    /// out of every tier would be recorded and never reported.
     #[test]
     fn tiers_cover_every_span() {
         assert_eq!(TIER1.start, 0);
@@ -435,7 +461,8 @@ mod tests {
         assert_eq!(TIER3.end, TIER2_MOE.start);
         assert_eq!(TIER2_MOE.end, TIER3_MOE.start);
         assert_eq!(TIER3_MOE.end, TIER3C_MOE.start);
-        assert_eq!(TIER3C_MOE.end, NUM_SPANS);
+        assert_eq!(TIER3C_MOE.end, TIER3D_MOE.start);
+        assert_eq!(TIER3D_MOE.end, NUM_SPANS);
         assert_eq!(NAMES.len(), NUM_SPANS);
     }
 }
