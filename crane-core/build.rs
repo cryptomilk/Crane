@@ -66,7 +66,11 @@ fn main() {
 
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
         // All out-of-tree SYCL kernels build into one shared object.
-        let sources = ["kernels/sycl/gdn.cpp", "kernels/sycl/fused_ops.cpp"];
+        let sources = [
+            "kernels/sycl/gdn.cpp",
+            "kernels/sycl/fused_ops.cpp",
+            "kernels/sycl/quant_iq4.cpp",
+        ];
         let lib = out_dir.join("libcrane_gdn_sycl.so");
 
         let icpx = std::env::var("CANDLE_SYCL_ICPX").unwrap_or_else(|_| {

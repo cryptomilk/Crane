@@ -257,7 +257,7 @@ pub fn requantize(
 
 /// Largest input-row count served by the decode matvec kernel; bigger
 /// batches dequantize weight chunks and use a regular matmul.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "sycl")), allow(dead_code))]
 const MATVEC_MAX_ROWS: usize = 8;
 /// Upper bound on the transient dense weight chunk built during prefill.
 const PREFILL_CHUNK_BYTES: usize = 256 << 20;
@@ -363,6 +363,17 @@ impl IQuantLinear {
                 dtype,
             );
         }
+        #[cfg(feature = "sycl")]
+        if self.packed.device().is_sycl() && matches!(dtype, DType::F32 | DType::F16) {
+            return crate::ops::quant_iq::sycl::dequantize(
+                &self.packed,
+                self.ty,
+                0,
+                self.rows,
+                self.cols,
+                dtype,
+            );
+        }
         let bytes = self.packed.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
         let mut values = vec![0f32; self.rows * self.cols];
         self.ty.dequantize(&bytes, &mut values);
@@ -424,6 +435,34 @@ impl IQuantLinear {
                 let n_rows = chunk.min(self.rows - start);
                 let w =
                     cuda::dequantize(&self.packed, self.ty, start, n_rows, self.cols, out_dtype)?;
+                outs.push(x.matmul(&w.t()?)?);
+            }
+            let y = if outs.len() == 1 {
+                outs.pop().unwrap()
+            } else {
+                Tensor::cat(&outs, 1)?
+            };
+            return y.reshape(out_dims);
+        }
+
+        #[cfg(feature = "sycl")]
+        if xs.device().is_sycl() && matches!(out_dtype, DType::F32 | DType::F16) {
+            use crate::ops::quant_iq::sycl;
+            if n <= MATVEC_MAX_ROWS {
+                let x = xs.reshape((n, self.cols))?;
+                let y = sycl::matvec(&x, &self.packed, self.ty, self.rows, self.cols, out_dtype)?;
+                return y.reshape(out_dims);
+            }
+            let x = xs
+                .to_dtype(out_dtype)?
+                .reshape((n, self.cols))?
+                .contiguous()?;
+            let chunk = (chunk_bytes / (self.cols * out_dtype.size_in_bytes())).max(1);
+            let mut outs = Vec::with_capacity(self.rows.div_ceil(chunk));
+            for start in (0..self.rows).step_by(chunk) {
+                let n_rows = chunk.min(self.rows - start);
+                let w =
+                    sycl::dequantize(&self.packed, self.ty, start, n_rows, self.cols, out_dtype)?;
                 outs.push(x.matmul(&w.t()?)?);
             }
             let y = if outs.len() == 1 {
@@ -609,6 +648,58 @@ mod tests {
                 check(
                     gpu.forward_chunked(&xg, DType::F32, 4 * cols * 4)?,
                     f32_tol,
+                    "chunked",
+                )?;
+            }
+            let dense = gpu.dequantize(DType::F32)?.to_device(&Device::Cpu)?;
+            let diff = (dense - cpu.dequantize(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(diff, 0.0, "{} dequantize", ty.name());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "sycl")]
+    #[test]
+    fn sycl_linear_matches_cpu_reference() -> Result<()> {
+        if !candle_core::utils::sycl_is_available() {
+            return Ok(());
+        }
+        let sycl = Device::new_sycl(0)?;
+        // IQ4_NL at 288 columns exercises a partial last 256-value group.
+        for (ty, rows, cols) in [
+            (IQuantType::Iq4Xs, 37, 512),
+            (IQuantType::Iq4Nl, 37, 288),
+            (IQuantType::Iq4Nl, 19, 512),
+        ] {
+            let packed = random_blocks(ty, rows * cols / ty.block_size(), rows as u32 * 31);
+            let cpu = IQuantLinear::new(ty, packed.clone(), rows, cols, &Device::Cpu)?;
+            let gpu = IQuantLinear::new(ty, packed, rows, cols, &sycl)?;
+            for n in [1usize, 3, 4, 7, 9, 33] {
+                let x = Tensor::randn(0f32, 1.0, (n, cols), &Device::Cpu)?;
+                let want = cpu.forward(&x)?;
+                let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+                let check = |got: Tensor, tol: f32, what: &str| -> Result<()> {
+                    let got = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let diff = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    assert!(
+                        diff / scale < tol,
+                        "{} {what} n={n}: rel diff {}",
+                        ty.name(),
+                        diff / scale
+                    );
+                    Ok(())
+                };
+                let xg = x.to_device(&sycl)?;
+                let tol = 1e-4;
+                check(gpu.forward(&xg)?, tol, "f32")?;
+                check(gpu.forward(&xg.to_dtype(DType::F16)?)?, 2e-2, "f16")?;
+                // A tiny chunk forces the multi-chunk prefill path.
+                check(
+                    gpu.forward_chunked(&xg, DType::F32, 4 * cols * 4)?,
+                    tol,
                     "chunked",
                 )?;
             }

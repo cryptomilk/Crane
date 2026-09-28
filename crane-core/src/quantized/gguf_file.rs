@@ -14,6 +14,10 @@ use std::sync::Arc;
 
 use super::extended_gguf::{ExtendedGgufInfo, IQuantTensorInfo};
 use super::ternary::{GdnPermutation, HadamardMode, TernaryLinear, TernaryWeight};
+// `Device::is_sycl` is inherent on the SYCL candle fork; this extension only
+// supplies it (as a constant `false`) for builds without that fork.
+#[cfg(not(feature = "sycl"))]
+use crate::utils::DeviceExt;
 
 /// Opens and memory-maps a GGUF file for zero-syscall tensor reads.
 ///
@@ -414,7 +418,8 @@ impl<R: Read + Seek> Gguf<R> {
 
 /// Whether i-quant linear layers on `device` run through the native kernels.
 fn native_iquant(device: &Device) -> bool {
-    cfg!(feature = "cuda") && device.is_cuda() && super::iquant::native_enabled()
+    ((cfg!(feature = "cuda") && device.is_cuda()) || (cfg!(feature = "sycl") && device.is_sycl()))
+        && super::iquant::native_enabled()
 }
 
 fn log_iquant(iquant: &HashMap<String, IQuantTensorInfo>, device: &Device) {
