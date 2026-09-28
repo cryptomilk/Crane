@@ -6,4 +6,5 @@
 
 pub mod extended_gguf;
 pub mod gguf_file;
+pub mod iquant;
 pub mod ternary;

@@ -369,7 +369,7 @@ impl DuplexSession {
                     candle_core::Error::Msg(format!("failed to mmap audio GGUF {path}: {e}"))
                 })?;
                 let mut cursor = std::io::Cursor::new(mmap.as_ref());
-                let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
+                let ct = crate::quantized::extended_gguf::read_content_lenient(mmap.as_ref())?;
                 let mut gg =
                     crate::quantized::gguf_file::Gguf::new(ct, &mut cursor, device.clone(), dtype);
                 let encoder = AudioEncoder::from_gguf(&mut gg, &config.audio_config)?;
@@ -396,7 +396,7 @@ impl DuplexSession {
                     candle_core::Error::Msg(format!("failed to mmap tts GGUF {path}: {e}"))
                 })?;
                 let mut cursor = std::io::Cursor::new(mmap.as_ref());
-                let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
+                let ct = crate::quantized::extended_gguf::read_content_lenient(mmap.as_ref())?;
                 let mut gg =
                     crate::quantized::gguf_file::Gguf::new(ct, &mut cursor, device.clone(), dtype);
                 MiniCpmTts::from_gguf(&mut gg, &config.tts_config, device, dtype)?

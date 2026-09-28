@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
-use super::extended_gguf::ExtendedGgufInfo;
+use super::extended_gguf::{ExtendedGgufInfo, IQuantTensorInfo};
 use super::ternary::{GdnPermutation, HadamardMode, TernaryLinear, TernaryWeight};
 
 /// Opens and memory-maps a GGUF file for zero-syscall tensor reads.
@@ -48,6 +48,11 @@ pub struct Gguf<R: Read + Seek> {
     /// output to the input's dtype.
     dtype: DType,
     ternary: Option<TernaryContext>,
+    /// llama.cpp i-quant tensors, re-quantized on load (see [`super::iquant`]).
+    iquant: HashMap<String, IQuantTensorInfo>,
+    /// Tensors hidden from Candle's parser that nothing here can decode
+    /// (ternary tensors without their Prism metadata).
+    undecodable: HashSet<String>,
 }
 
 struct TernaryContext {
@@ -60,32 +65,91 @@ struct TernaryContext {
 }
 
 impl<R: Read + Seek> Gguf<R> {
-    pub fn new(ct: gguf_file::Content, reader: R, device: Device, dtype: DType) -> Self {
+    /// Wrap a parsed GGUF file. The reader must cover the whole file: it is
+    /// re-probed for tensors Crane decodes itself, so `ct` may come from
+    /// [`read_content_lenient`](super::extended_gguf::read_content_lenient).
+    pub fn new(ct: gguf_file::Content, mut reader: R, device: Device, dtype: DType) -> Self {
+        let mut info = super::extended_gguf::probe_reader(&mut reader).unwrap_or_else(|e| {
+            eprintln!("[gguf] warning: could not probe for i-quant/ternary tensors: {e}");
+            ExtendedGgufInfo::default()
+        });
+        let iquant = std::mem::take(&mut info.iquant);
+        let mut undecodable = HashSet::new();
+        let ternary = if info.is_ternary() {
+            let names: Vec<String> = info.tensors.keys().cloned().collect();
+            TernaryContext::from_metadata(&ct, info)
+                .inspect_err(|e| {
+                    eprintln!("[gguf] warning: ternary tensors present but unusable: {e}");
+                    undecodable.extend(names);
+                })
+                .ok()
+        } else {
+            None
+        };
+        log_iquant(&iquant);
         Self {
             ct,
             reader,
             device,
             dtype,
-            ternary: None,
+            ternary,
+            iquant,
+            undecodable,
         }
     }
 
-    /// Construct a GGUF reader with Prism PTQ1_0/PQ2_0 tensor information.
+    /// Construct a GGUF reader for tensors Candle cannot parse itself:
+    /// Prism PTQ1_0/PQ2_0 ternary weights and/or llama.cpp i-quants.
+    /// Unlike [`Self::new`], missing Prism metadata is an error.
     pub fn new_extended(
         ct: gguf_file::Content,
         reader: R,
         device: Device,
         dtype: DType,
-        tensors: ExtendedGgufInfo,
+        mut tensors: ExtendedGgufInfo,
     ) -> Result<Self> {
-        let ternary = TernaryContext::from_metadata(&ct, tensors)?;
+        let iquant = std::mem::take(&mut tensors.iquant);
+        super::iquant::requant_target()?;
+        log_iquant(&iquant);
+        let ternary = if tensors.is_ternary() {
+            Some(TernaryContext::from_metadata(&ct, tensors)?)
+        } else {
+            None
+        };
         Ok(Self {
             ct,
             reader,
             device,
             dtype,
-            ternary: Some(ternary),
+            ternary,
+            iquant,
+            undecodable: HashSet::new(),
         })
+    }
+
+    /// Load a tensor by name as a `QTensor`, decoding i-quants that Candle
+    /// cannot represent (see [`super::iquant`]).
+    fn load_qtensor(&mut self, name: &str, device: &Device) -> Result<QTensor> {
+        let Some(info) = self.iquant.get(name) else {
+            if self.undecodable.contains(name) {
+                candle_core::bail!(
+                    "GGUF tensor {name} is ternary but the file lacks Prism metadata"
+                )
+            }
+            return self.ct.tensor(&mut self.reader, name, device);
+        };
+        let elems: usize = info.shape.iter().product();
+        let bytes = elems / info.ty.block_size() * info.ty.block_bytes();
+        let absolute = self
+            .ct
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .ok_or_else(|| candle_core::Error::Msg(format!("tensor {name} offset overflow")))?;
+        self.reader.seek(std::io::SeekFrom::Start(absolute))?;
+        let mut packed = vec![0u8; bytes];
+        self.reader.read_exact(&mut packed)?;
+        let target = super::iquant::requant_target()?;
+        super::iquant::requantize(info.ty, &packed, &info.shape, target, device)
     }
 
     /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
@@ -121,7 +185,7 @@ impl<R: Read + Seek> Gguf<R> {
         name: &str,
         device: &Device,
     ) -> Result<crate::ops::linear::LinearLayer> {
-        let ws = self.ct.tensor(&mut self.reader, name, device)?;
+        let ws = self.load_qtensor(name, device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(crate::ops::linear::LinearLayer::quantized(qmm))
     }
@@ -210,7 +274,7 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn rms_norm(&mut self, name: &str, eps: f64) -> Result<RmsNorm> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_qtensor(name, &self.device.clone())?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(RmsNorm::new(weight, eps))
     }
@@ -244,7 +308,7 @@ impl<R: Read + Seek> Gguf<R> {
                 ),
             );
         }
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_qtensor(name, &self.device.clone())?;
         crate::models::modules::embedding::EmbeddingLayer::from_qtensor(ws, hidden_size, self.dtype)
     }
 
@@ -256,7 +320,7 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing or malformed.
     pub fn embedding(&mut self, name: &str, hidden_size: usize) -> Result<candle_nn::Embedding> {
-        let ws = self.ct.tensor(&mut self.reader, name, &self.device)?;
+        let ws = self.load_qtensor(name, &self.device.clone())?;
         let weight = ws.dequantize(&self.device)?.to_dtype(self.dtype)?;
         Ok(candle_nn::Embedding::new(weight, hidden_size))
     }
@@ -267,7 +331,7 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing.
     pub fn tensor(&mut self, name: &str) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, &self.device)
+        self.load_qtensor(name, &self.device.clone())
     }
 
     /// Load a raw `QTensor` by name onto `device`.
@@ -281,7 +345,7 @@ impl<R: Read + Seek> Gguf<R> {
     ///
     /// Returns an error if the named tensor is missing.
     pub fn tensor_on(&mut self, name: &str, device: &Device) -> Result<QTensor> {
-        self.ct.tensor(&mut self.reader, name, device)
+        self.load_qtensor(name, device)
     }
 
     /// Load a tensor, dequantize, and cast to the target compute dtype.
@@ -311,7 +375,7 @@ impl<R: Read + Seek> Gguf<R> {
         name: &str,
         device: &Device,
     ) -> Result<candle_core::Tensor> {
-        let ws = self.ct.tensor(&mut self.reader, name, device)?;
+        let ws = self.load_qtensor(name, device)?;
         ws.dequantize(device)?.to_dtype(self.dtype)
     }
 
@@ -324,6 +388,23 @@ impl<R: Read + Seek> Gguf<R> {
     pub fn metadata(&self) -> &std::collections::HashMap<String, gguf_file::Value> {
         &self.ct.metadata
     }
+}
+
+fn log_iquant(iquant: &HashMap<String, IQuantTensorInfo>) {
+    if iquant.is_empty() {
+        return;
+    }
+    let mut types: Vec<_> = iquant.values().map(|t| t.ty.name()).collect();
+    types.sort_unstable();
+    types.dedup();
+    let target =
+        super::iquant::requant_target().map_or_else(|e| e.to_string(), |t| format!("{t:?}"));
+    eprintln!(
+        "[gguf] {} tensors in {} have no native kernel; re-quantizing to {target} at load \
+         (CRANE_IQ_REQUANT to change)",
+        iquant.len(),
+        types.join("/"),
+    );
 }
 
 impl TernaryContext {
@@ -488,5 +569,110 @@ mod mmap_gguf_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.gguf");
         assert!(mmap_gguf_file(&path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod iquant_gguf_tests {
+    use super::Gguf;
+    use crate::quantized::extended_gguf::read_content_lenient;
+    use crate::quantized::iquant::IQuantType;
+    use candle_core::quantized::GgmlDType;
+    use candle_core::{DType, Device, Module, Tensor};
+
+    /// Hand-write a GGUF (Candle's writer cannot emit i-quant types).
+    /// Each tensor is `(name, shape outermost-first, ggml type id, bytes)`.
+    fn write_gguf(tensors: &[(&str, &[usize], u32, Vec<u8>)]) -> Vec<u8> {
+        let mut out = b"GGUF".to_vec();
+        out.extend(3u32.to_le_bytes());
+        out.extend((tensors.len() as u64).to_le_bytes());
+        out.extend(0u64.to_le_bytes());
+        let mut offset = 0u64;
+        for (name, shape, ty, data) in tensors {
+            out.extend((name.len() as u64).to_le_bytes());
+            out.extend(name.as_bytes());
+            out.extend((shape.len() as u32).to_le_bytes());
+            for &d in shape.iter().rev() {
+                out.extend((d as u64).to_le_bytes());
+            }
+            out.extend(ty.to_le_bytes());
+            out.extend(offset.to_le_bytes());
+            offset += (data.len() as u64).div_ceil(32) * 32;
+        }
+        for (_, _, _, data) in tensors {
+            out.resize(out.len().div_ceil(32) * 32, 0);
+            out.extend(data);
+        }
+        out
+    }
+
+    /// `n` pseudo-random `IQ4_XS` blocks with a sane `f16` scale.
+    fn iq4_xs_blocks(n: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        let mut out = Vec::with_capacity(n * IQuantType::Iq4Xs.block_bytes());
+        for _ in 0..n {
+            out.extend(half::f16::from_f32(0.01).to_le_bytes());
+            for _ in 2..IQuantType::Iq4Xs.block_bytes() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                out.push(state as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gguf_new_decodes_iquant_tensors_from_lenient_header() -> candle_core::Result<()> {
+        let (rows, cols) = (4, 512);
+        let packed = iq4_xs_blocks(rows * cols / 256);
+        let norm: Vec<u8> = (0..cols).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let bytes = write_gguf(&[
+            ("weight", &[rows, cols], 23, packed.clone()),
+            ("norm", &[cols], 0, norm),
+        ]);
+        let ct = read_content_lenient(&bytes)?;
+        let mut gg = Gguf::new(
+            ct,
+            std::io::Cursor::new(&bytes[..]),
+            Device::Cpu,
+            DType::F32,
+        );
+
+        let mut reference = vec![0f32; rows * cols];
+        IQuantType::Iq4Xs.dequantize(&packed, &mut reference);
+        let weight = gg.tensor("weight")?;
+        assert_eq!(weight.dtype(), GgmlDType::Q5K);
+        assert_eq!(weight.shape().dims(), &[rows, cols]);
+        let got = weight
+            .dequantize(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_ref = reference.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let max_err = reference
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            max_err <= max_ref / 20.0,
+            "max_err {max_err} vs max_ref {max_ref}"
+        );
+
+        let xs = Tensor::ones((1, cols), DType::F32, &Device::Cpu)?;
+        assert_eq!(gg.linear("weight")?.forward(&xs)?.dims(), &[1, rows]);
+
+        let norm = gg.dequant_tensor("norm")?.to_vec1::<f32>()?;
+        assert_eq!(norm[cols - 1], (cols - 1) as f32);
+        Ok(())
+    }
+
+    #[test]
+    fn lenient_header_names_unsupported_ggml_types() {
+        let bytes = write_gguf(&[("blk.0.ffn_down.weight", &[1, 256], 16, vec![0; 66])]);
+        let err = read_content_lenient(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("blk.0.ffn_down.weight") && err.contains("IQ2_XXS"),
+            "{err}"
+        );
     }
 }

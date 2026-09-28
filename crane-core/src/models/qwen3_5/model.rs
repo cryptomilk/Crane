@@ -250,7 +250,10 @@ impl Qwen3_5TextModel {
 
         let head_dim = md_u32(&gg, "attention.key_length")?;
         let hidden_size = md_u32(&gg, "embedding_length")?;
-        let num_hidden_layers = md_u32(&gg, "block_count")?;
+        // Newer converters append the MTP draft layer(s) as extra `blk.N`
+        // blocks and count them in `block_count`; they are not decoder layers.
+        let num_hidden_layers =
+            md_u32(&gg, "block_count")? - md_u32_or(&gg, "nextn_predict_layers", 0);
         let rms_norm_eps = gg
             .metadata()
             .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
@@ -872,11 +875,13 @@ impl Model {
         }
         merge_canonical_eos_ids(&mut eos_token_ids, &tokenizer.get_vocab(true));
 
-        let inner = if extended.is_ternary() {
-            eprintln!(
-                "[qwen3_5] detected Prism ternary GGUF: {} PTQ1_0/PQ2_0 tensors",
-                extended.tensors.len()
-            );
+        let inner = if !extended.is_empty() {
+            if extended.is_ternary() {
+                eprintln!(
+                    "[qwen3_5] detected Prism ternary GGUF: {} PTQ1_0/PQ2_0 tensors",
+                    extended.tensors.len()
+                );
+            }
             Qwen3_5TextModel::from_gguf_extended(ct, &mut cursor, device, extended)?
         } else {
             Qwen3_5TextModel::from_gguf(ct, &mut cursor, device)?

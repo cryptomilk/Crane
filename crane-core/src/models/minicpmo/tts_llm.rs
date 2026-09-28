@@ -747,7 +747,8 @@ mod gguf_cross_check {
         let mmap = crate::quantized::gguf_file::mmap_gguf_file(&gguf_path)
             .unwrap_or_else(|e| panic!("mmap {gguf_path}: {e}"));
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor).expect("parse gguf");
+        let ct = crate::quantized::extended_gguf::read_content_lenient(mmap.as_ref())
+            .expect("parse gguf");
         let mut gg = crate::quantized::gguf_file::Gguf::new(ct, &mut cursor, device.clone(), dtype);
         let mut gguf_tts = MiniCpmTts::from_gguf(&mut gg, &config.tts_config, &device, dtype)
             .expect("load tts from gguf");

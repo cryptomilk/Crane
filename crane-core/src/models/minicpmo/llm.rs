@@ -96,7 +96,7 @@ impl MiniCpmOLlm {
         let mmap = crate::quantized::gguf_file::mmap_gguf_file(gguf_path)
             .map_err(|e| anyhow::anyhow!("failed to mmap GGUF file {gguf_path}: {e}"))?;
         let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        let ct = candle_core::quantized::gguf_file::Content::read(&mut cursor)
+        let ct = crate::quantized::extended_gguf::read_content_lenient(mmap.as_ref())
             .map_err(|e| anyhow::anyhow!("failed to parse GGUF file {gguf_path}: {e}"))?;
         let inner = Qwen3Model::from_gguf(ct, &mut cursor, device)?;
         let dtype = inner.model_dtype();

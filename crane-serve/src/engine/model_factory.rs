@@ -7,7 +7,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use crane_core::device::DeviceAssignment;
-use crane_core::{DType, Device, gguf_file};
+use crane_core::{DType, Device};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -425,8 +425,8 @@ pub fn uses_xml_tool_format(model_path: &str) -> bool {
         && path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-        && let Ok(mut file) = std::fs::File::open(path)
-        && let Ok(ct) = gguf_file::Content::read(&mut file)
+        && let Ok(mmap) = crane_core::quantized::gguf_file::mmap_gguf_file(path)
+        && let Ok(ct) = crane_core::quantized::extended_gguf::read_content_lenient(mmap.as_ref())
         && let Some(arch) = ct.metadata.get("general.architecture")
         && let Ok(arch) = arch.to_string()
     {

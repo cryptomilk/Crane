@@ -20,27 +20,24 @@ impl VarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(p: P, device: &Device) -> Result<Self> {
         let mmap =
             crate::quantized::gguf_file::mmap_gguf_file(p).map_err(candle_core::Error::wrap)?;
-        let mut cursor = std::io::Cursor::new(mmap.as_ref());
-        let content = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
-        let mut data = std::collections::HashMap::new();
-        for tensor_name in content.tensor_infos.keys() {
-            let tensor = content.tensor(&mut cursor, tensor_name, device)?;
-            data.insert(tensor_name.to_string(), Arc::new(tensor));
-        }
-        Ok(Self {
-            data: Arc::new(data),
-            path: Vec::new(),
-            device: device.clone(),
-        })
+        Self::from_gguf_buffer(mmap.as_ref(), device)
     }
 
     pub fn from_gguf_buffer(buffer: &[u8], device: &Device) -> Result<Self> {
-        let mut cursor = std::io::Cursor::new(buffer);
-        let content = candle_core::quantized::gguf_file::Content::read(&mut cursor)?;
+        // Go through `Gguf` so i-quant tensors are decoded (see
+        // `crate::quantized::iquant`) instead of misread.
+        let content = crate::quantized::extended_gguf::read_content_lenient(buffer)?;
+        let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
+        let mut gg = crate::quantized::gguf_file::Gguf::new(
+            content,
+            std::io::Cursor::new(buffer),
+            device.clone(),
+            candle_core::DType::F32,
+        );
         let mut data = std::collections::HashMap::new();
-        for tensor_name in content.tensor_infos.keys() {
-            let tensor = content.tensor(&mut cursor, tensor_name, device)?;
-            data.insert(tensor_name.to_string(), Arc::new(tensor));
+        for tensor_name in names {
+            let tensor = gg.tensor(&tensor_name)?;
+            data.insert(tensor_name, Arc::new(tensor));
         }
         Ok(Self {
             data: Arc::new(data),
