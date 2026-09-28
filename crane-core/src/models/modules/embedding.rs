@@ -347,6 +347,7 @@ mod tests {
             LinearLayer::Standard(l) => assert_eq!(l.weight().dtype(), DType::F32),
             LinearLayer::Quantized(_) => panic!("dense table must not become quantized"),
             LinearLayer::Ternary(_) => panic!("dense table must not become ternary"),
+            LinearLayer::IQuant(_) => panic!("dense table must not become i-quant"),
         }
         Ok(())
     }
@@ -364,6 +365,7 @@ mod tests {
             LinearLayer::Standard(l) => assert_eq!(l.weight().dtype(), DType::BF16),
             LinearLayer::Quantized(_) => panic!("dense table must not become quantized"),
             LinearLayer::Ternary(_) => panic!("dense table must not become ternary"),
+            LinearLayer::IQuant(_) => panic!("dense table must not become i-quant"),
         }
         Ok(())
     }

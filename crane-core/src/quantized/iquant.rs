@@ -8,16 +8,17 @@
 //! [`extended_gguf`](super::extended_gguf) probe hides these tensors from
 //! Candle; this module decodes them.
 //!
-//! There are no native kernels yet: each tensor is dequantized on the CPU and
-//! re-quantized at load time to a Candle-native type (see
-//! [`requant_target`]), so every backend runs it through its existing
-//! `QMatMul` kernels. Reference: `ggml/src/ggml-quants.c` and
+//! On CUDA, linear layers keep the packed encoding and run through native
+//! kernels ([`IQuantLinear`]). Everything else (other devices, embeddings,
+//! packed MoE experts) is dequantized on the CPU and re-quantized at load
+//! time to a Candle-native type (see [`requant_target`]), so every backend
+//! can still run it through its existing `QMatMul` kernels. Reference: `ggml/src/ggml-quants.c` and
 //! `ggml/src/ggml-common.h` in llama.cpp.
 
 use std::borrow::Cow;
 
 use candle_core::quantized::{GgmlDType, QStorage, QTensor};
-use candle_core::{Device, Result, Tensor, bail};
+use candle_core::{DType, Device, Result, Tensor, bail};
 use half::f16;
 
 /// Super-block size shared by the k-quants and `IQ4_XS`.
@@ -150,23 +151,34 @@ fn dequantize_iq4_xs(blocks: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Candle-native type to re-quantize i-quant tensors into.
+/// Whether linear layers keep i-quant weights packed and run them through
+/// the native kernels (CUDA only). True unless `CRANE_IQ_REQUANT` names an
+/// explicit target, which forces re-quantization everywhere (handy for A/B
+/// comparisons).
+pub fn native_enabled() -> bool {
+    std::env::var("CRANE_IQ_REQUANT").map_or(true, |v| v.eq_ignore_ascii_case("native"))
+}
+
+/// Candle-native type to re-quantize i-quant tensors into when they are not
+/// run natively: on non-CUDA devices, for embeddings and packed MoE experts,
+/// or everywhere when `CRANE_IQ_REQUANT` is set.
 ///
-/// `CRANE_IQ_REQUANT` picks it (`q4k`, `q5k`, `q6k`, `q8_0`); the default
-/// `q5k` keeps nearly all of the source precision at ~30% more memory than
-/// `IQ4_XS`. `q4k` is about the same size as the source but quantizes twice.
+/// `CRANE_IQ_REQUANT` picks it (`q4k`, `q5k`, `q6k`, `q8_0`); unset or
+/// `native` means the default `q5k`, which keeps nearly all of the source
+/// precision at ~30% more memory than `IQ4_XS`. `q4k` is about the same size
+/// as the source but quantizes twice.
 pub fn requant_target() -> Result<GgmlDType> {
     let Ok(value) = std::env::var("CRANE_IQ_REQUANT") else {
         return Ok(GgmlDType::Q5K);
     };
     Ok(match value.to_ascii_lowercase().as_str() {
+        "native" | "q5k" | "q5_k" => GgmlDType::Q5K,
         "q4k" | "q4_k" => GgmlDType::Q4K,
-        "q5k" | "q5_k" => GgmlDType::Q5K,
         "q6k" | "q6_k" => GgmlDType::Q6K,
         "q8_0" | "q8" => GgmlDType::Q8_0,
-        other => {
-            bail!("CRANE_IQ_REQUANT: unsupported target {other:?} (use q4k, q5k, q6k or q8_0)")
-        },
+        other => bail!(
+            "CRANE_IQ_REQUANT: unsupported target {other:?} (use native, q4k, q5k, q6k or q8_0)"
+        ),
     })
 }
 
@@ -241,6 +253,191 @@ pub fn requantize(
     let bytes = chunks.concat();
     let storage = QStorage::from_data(Cow::Owned(bytes), device, target)?;
     QTensor::new(storage, shape.to_vec())
+}
+
+/// Largest input-row count served by the decode matvec kernel; bigger
+/// batches dequantize weight chunks and use a regular matmul.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const MATVEC_MAX_ROWS: usize = 8;
+/// Upper bound on the transient dense weight chunk built during prefill.
+const PREFILL_CHUNK_BYTES: usize = 256 << 20;
+
+/// A linear layer whose weight stays in its packed i-quant encoding on the
+/// device (see `kernels/cuda/quant_iq4.cu`).
+///
+/// Only built for CUDA by [`Gguf`](super::gguf_file::Gguf); other devices
+/// get a re-quantized `QMatMul` instead. The CPU path here dequantizes the
+/// whole weight per call and exists for tests and device fallbacks.
+#[derive(Clone, Debug)]
+pub struct IQuantLinear {
+    ty: IQuantType,
+    /// Raw GGUF bytes, `[rows * row_bytes]` u8.
+    packed: Tensor,
+    rows: usize,
+    cols: usize,
+}
+
+impl IQuantLinear {
+    /// Wrap the raw GGUF bytes of a `[rows, cols]` weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `packed` does not match the shape or the upload fails.
+    pub fn new(
+        ty: IQuantType,
+        packed: Vec<u8>,
+        rows: usize,
+        cols: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        if cols == 0 || !cols.is_multiple_of(ty.block_size()) {
+            bail!(
+                "{} linear width {cols} is not a multiple of {}",
+                ty.name(),
+                ty.block_size()
+            )
+        }
+        let expected = rows * (cols / ty.block_size()) * ty.block_bytes();
+        if packed.len() != expected {
+            bail!(
+                "{} linear [{rows}, {cols}] should be {expected} bytes, got {}",
+                ty.name(),
+                packed.len()
+            )
+        }
+        let len = packed.len();
+        Ok(Self {
+            ty,
+            packed: Tensor::from_vec(packed, (len,), device)?,
+            rows,
+            cols,
+        })
+    }
+
+    pub fn ty(&self) -> IQuantType {
+        self.ty
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn device(&self) -> &Device {
+        self.packed.device()
+    }
+
+    pub fn size_in_bytes(&self) -> usize {
+        self.packed.elem_count()
+    }
+
+    /// Copy the packed weight to `device`, keeping it encoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transfer fails.
+    pub fn to_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            packed: self.packed.to_device(device)?,
+            ..self.clone()
+        })
+    }
+
+    /// The whole weight as a dense `[rows, cols]` tensor on its device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding fails.
+    pub fn dequantize(&self, dtype: DType) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if self.packed.device().is_cuda() {
+            return crate::ops::quant_iq::cuda::dequantize(
+                &self.packed,
+                self.ty,
+                0,
+                self.rows,
+                self.cols,
+                dtype,
+            );
+        }
+        let bytes = self.packed.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+        let mut values = vec![0f32; self.rows * self.cols];
+        self.ty.dequantize(&bytes, &mut values);
+        Tensor::from_vec(values, (self.rows, self.cols), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(self.packed.device())
+    }
+
+    /// Project `xs` (`[..., cols]`), returning `[..., rows]` in `xs`'s dtype.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shapes disagree or a kernel fails.
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_as(xs, xs.dtype())
+    }
+
+    /// Like [`Self::forward`] but always returns F32.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shapes disagree or a kernel fails.
+    pub fn forward_f32(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_as(xs, DType::F32)
+    }
+
+    fn forward_as(&self, xs: &Tensor, out_dtype: DType) -> Result<Tensor> {
+        self.forward_chunked(xs, out_dtype, PREFILL_CHUNK_BYTES)
+    }
+
+    fn forward_chunked(&self, xs: &Tensor, out_dtype: DType, chunk_bytes: usize) -> Result<Tensor> {
+        let mut out_dims = xs.dims().to_vec();
+        match out_dims.last_mut() {
+            Some(last) if *last == self.cols => *last = self.rows,
+            _ => bail!(
+                "{} linear expects input width {}, got shape {:?}",
+                self.ty.name(),
+                self.cols,
+                xs.dims()
+            ),
+        }
+        let n = xs.elem_count() / self.cols;
+
+        #[cfg(feature = "cuda")]
+        if xs.device().is_cuda() {
+            use crate::ops::quant_iq::cuda;
+            if n <= MATVEC_MAX_ROWS {
+                let x = xs.reshape((n, self.cols))?;
+                let y = cuda::matvec(&x, &self.packed, self.ty, self.rows, self.cols, out_dtype)?;
+                return y.reshape(out_dims);
+            }
+            let x = xs
+                .to_dtype(out_dtype)?
+                .reshape((n, self.cols))?
+                .contiguous()?;
+            let chunk = (chunk_bytes / (self.cols * out_dtype.size_in_bytes())).max(1);
+            let mut outs = Vec::with_capacity(self.rows.div_ceil(chunk));
+            for start in (0..self.rows).step_by(chunk) {
+                let n_rows = chunk.min(self.rows - start);
+                let w =
+                    cuda::dequantize(&self.packed, self.ty, start, n_rows, self.cols, out_dtype)?;
+                outs.push(x.matmul(&w.t()?)?);
+            }
+            let y = if outs.len() == 1 {
+                outs.pop().unwrap()
+            } else {
+                Tensor::cat(&outs, 1)?
+            };
+            return y.reshape(out_dims);
+        }
+
+        let x = xs.to_dtype(DType::F32)?.reshape((n, self.cols))?;
+        let w = self.dequantize(DType::F32)?;
+        x.matmul(&w.t()?)?.to_dtype(out_dtype)?.reshape(out_dims)
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +530,162 @@ mod tests {
             max_err <= max_ref / 100.0,
             "max_err {max_err} vs max_ref {max_ref}"
         );
+        Ok(())
+    }
+
+    /// `n` pseudo-random blocks of `ty` with a sane `f16` scale.
+    fn random_blocks(ty: IQuantType, n: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(n * ty.block_bytes());
+        for i in 0..n {
+            out.extend(f16::from_f32(0.002 + 0.0001 * (i % 7) as f32).to_le_bytes());
+            for _ in 2..ty.block_bytes() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                out.push(state as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cpu_linear_matches_dequantized_matmul() -> Result<()> {
+        let (rows, cols) = (5, 256);
+        let packed = random_blocks(IQuantType::Iq4Xs, rows * cols / 256, 7);
+        let mut w = vec![0f32; rows * cols];
+        IQuantType::Iq4Xs.dequantize(&packed, &mut w);
+        let layer = IQuantLinear::new(IQuantType::Iq4Xs, packed, rows, cols, &Device::Cpu)?;
+        let x = Tensor::arange(0f32, (2 * cols) as f32, &Device::Cpu)?.reshape((2, cols))? / 100.0;
+        let x = x?;
+        let want = x.matmul(&Tensor::from_vec(w, (rows, cols), &Device::Cpu)?.t()?)?;
+        let got = layer.forward(&x)?;
+        let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-3, "diff {diff}");
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_linear_matches_cpu_reference() -> Result<()> {
+        if !candle_core::utils::cuda_is_available() {
+            return Ok(());
+        }
+        let cuda = Device::new_cuda(0)?;
+        // IQ4_NL at 288 columns exercises a partial last 256-value group.
+        for (ty, rows, cols) in [
+            (IQuantType::Iq4Xs, 37, 512),
+            (IQuantType::Iq4Nl, 37, 288),
+            (IQuantType::Iq4Nl, 19, 512),
+        ] {
+            let packed = random_blocks(ty, rows * cols / ty.block_size(), rows as u32 * 31);
+            let cpu = IQuantLinear::new(ty, packed.clone(), rows, cols, &Device::Cpu)?;
+            let gpu = IQuantLinear::new(ty, packed, rows, cols, &cuda)?;
+            for n in [1usize, 3, 4, 7, 9, 33] {
+                let x = Tensor::randn(0f32, 1.0, (n, cols), &Device::Cpu)?;
+                let want = cpu.forward(&x)?;
+                let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+                let check = |got: Tensor, tol: f32, what: &str| -> Result<()> {
+                    let got = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                    let diff = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    assert!(
+                        diff / scale < tol,
+                        "{} {what} n={n}: rel diff {}",
+                        ty.name(),
+                        diff / scale
+                    );
+                    Ok(())
+                };
+                let xg = x.to_device(&cuda)?;
+                // IQ4_XS decode quantizes activations to int8 (as llama.cpp does).
+                let f32_tol = if ty == IQuantType::Iq4Xs && n <= MATVEC_MAX_ROWS {
+                    1e-2
+                } else {
+                    1e-4
+                };
+                check(gpu.forward(&xg)?, f32_tol, "f32")?;
+                check(gpu.forward(&xg.to_dtype(DType::BF16)?)?, 2e-2, "bf16")?;
+                // A tiny chunk forces the multi-chunk prefill path.
+                check(
+                    gpu.forward_chunked(&xg, DType::F32, 4 * cols * 4)?,
+                    f32_tol,
+                    "chunked",
+                )?;
+            }
+            let dense = gpu.dequantize(DType::F32)?.to_device(&Device::Cpu)?;
+            let diff = (dense - cpu.dequantize(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(diff, 0.0, "{} dequantize", ty.name());
+        }
+        Ok(())
+    }
+
+    /// Decode-shaped timing of the native matvec against Candle's `QMatMul`
+    /// on the same weight re-quantized to Q5_K / Q4_K. Run with
+    /// `cargo test --release --features cuda -p crane-core --lib bench_iq4_matvec -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_iq4_matvec() -> Result<()> {
+        use candle_core::Module;
+        use candle_core::quantized::QMatMul;
+        let cuda = Device::new_cuda(0)?;
+        // Every IQ4_XS linear shape in a Qwen 3.8-27B IQ4_XS GGUF.
+        for (rows, cols) in [
+            (17408usize, 5120usize),
+            (5120, 17408),
+            (12288, 5120),
+            (6144, 5120),
+            (5120, 6144),
+            (1024, 5120),
+            (48, 5120),
+        ] {
+            let packed = random_blocks(IQuantType::Iq4Xs, rows * cols / 256, 99);
+            let native = IQuantLinear::new(IQuantType::Iq4Xs, packed.clone(), rows, cols, &cuda)?;
+            let x = Tensor::randn(0f32, 1.0, (1, cols), &cuda)?.to_dtype(DType::BF16)?;
+            let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
+                for _ in 0..5 {
+                    f()?;
+                }
+                cuda.synchronize()?;
+                let iters = 200;
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    f()?;
+                }
+                cuda.synchronize()?;
+                Ok(t.elapsed().as_secs_f64() / f64::from(iters))
+            };
+            let t_native = time(&|| native.forward(&x))?;
+            let t_deq = time(&|| native.dequantize(DType::BF16))?;
+            println!(
+                "[{rows}x{cols}] IQ4_XS dequant->bf16 {:7.1} us  {:6.1} GB/s written",
+                t_deq * 1e6,
+                (rows * cols * 2) as f64 / t_deq / 1e9
+            );
+            let xp = Tensor::randn(0f32, 1.0, (512, cols), &cuda)?.to_dtype(DType::BF16)?;
+            let t_pre = time(&|| native.forward(&xp))?;
+            println!("[{rows}x{cols}] IQ4_XS prefill 512 {:7.1} us", t_pre * 1e6);
+            let bytes = packed.len() as f64;
+            println!(
+                "[{rows}x{cols}] IQ4_XS native {:7.1} us  {:6.1} GB/s",
+                t_native * 1e6,
+                bytes / t_native / 1e9
+            );
+            for target in [GgmlDType::Q4K, GgmlDType::Q5K] {
+                let q = requantize(IQuantType::Iq4Xs, &packed, &[rows, cols], target, &cuda)?;
+                let q_bytes = q.storage_size_in_bytes() as f64;
+                let qmm = QMatMul::from_arc(std::sync::Arc::new(q))?;
+                let t = time(&|| qmm.forward(&x.to_dtype(DType::F32)?)?.to_dtype(DType::BF16))?;
+                println!(
+                    "[{rows}x{cols}] {target:?} candle   {:7.1} us  {:6.1} GB/s",
+                    t * 1e6,
+                    q_bytes / t / 1e9
+                );
+            }
+        }
         Ok(())
     }
 }

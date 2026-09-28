@@ -17,6 +17,7 @@
 pub mod fused_ops;
 pub mod gdn;
 pub mod linear;
+pub mod quant_iq;
 pub mod quant_ternary;
 #[cfg(all(feature = "rocm", not(feature = "cuda")))]
 pub mod rocm;

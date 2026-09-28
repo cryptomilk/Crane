@@ -1971,6 +1971,80 @@ fn fuse_packed_qtensors(a: &QTensor, b: &QTensor, device: &Device) -> Result<QTe
     )
 }
 
+/// Copies a [`LinearLayer`] to `device`, preserving quantization.
+///
+/// Unlike [`LinearLayer::to_device`] (which dequantizes `Quantized`
+/// variants to promote an expert permanently), this rebuilds a
+/// `QMatMul::QTensor` from its raw quantized bytes on `device` using the
+/// same `qtensor_from_ggml` reconstruction technique as
+/// [`slice_packed_qtensor`], so a routed expert's temporary copy still runs
+/// through the target device's quantized matmul kernels instead of a dense
+/// GEMM. Used by [`SparseMoeBlock::forward`] to copy only the routed
+/// experts' weights to the input device for each call, rather than moving
+/// the hidden state to `expert_device`.
+///
+/// Unlike [`LinearLayer::to_device`], this does not cast to a target dtype:
+/// the `Quantized` path's `forward` handles F32 conversion internally, and
+/// the `Standard` path assumes weights are already in the model's compute
+/// dtype (true for all current callers, since experts are loaded in the
+/// compute dtype at model-load time).
+///
+/// Note: `QTensor::data()` on CUDA storage copies bytes to the host, so for
+/// GPU-to-GPU offload this results in a D2H2D round-trip through host
+/// memory. Acceptable for the primary use case (CPU-offloaded experts
+/// copied to GPU).
+///
+/// # Errors
+///
+/// Returns an error if the device transfer or `QTensor` reconstruction
+/// fails.
+fn copy_linear_to_device(layer: &LinearLayer, device: &Device) -> Result<LinearLayer> {
+    match layer {
+        LinearLayer::Standard(l) => {
+            let weight = l.weight().to_device(device)?;
+            let bias = l.bias().map(|b| b.to_device(device)).transpose()?;
+            Ok(LinearLayer::Standard(Linear::new(weight, bias)))
+        },
+        LinearLayer::Quantized(q) => {
+            let matmul = match &q.matmul {
+                QMatMul::QTensor(qt) => {
+                    let raw = qt.data()?;
+                    let new_qt =
+                        qtensor_from_ggml(qt.dtype(), &raw, qt.shape().dims().to_vec(), device)?;
+                    QMatMul::from_arc(Arc::new(new_qt))?
+                },
+                QMatMul::Tensor(t) => QMatMul::Tensor(t.to_device(device)?),
+                QMatMul::TensorF16(t) => QMatMul::TensorF16(t.to_device(device)?),
+            };
+            match q.bias.as_ref().map(|b| b.to_device(device)).transpose()? {
+                Some(bias) => Ok(LinearLayer::quantized_with_bias(matmul, bias)),
+                None => Ok(LinearLayer::quantized(matmul)),
+            }
+        },
+        LinearLayer::Ternary(_) => {
+            candle_core::bail!(
+                "copying a Ternary-quantized expert to another device is not supported"
+            )
+        },
+        LinearLayer::IQuant(l) => Ok(LinearLayer::IQuant(l.to_device(device)?)),
+    }
+}
+
+/// Copies both of an [`MoeExpert`]'s projections to `device` via
+/// [`copy_linear_to_device`], for use as a short-lived GPU-resident copy
+/// of a CPU-offloaded expert (see [`SparseMoeBlock::forward`]).
+///
+/// # Errors
+///
+/// Returns an error if either projection's device transfer fails.
+fn copy_expert_to_device(expert: &MoeExpert, device: &Device) -> Result<MoeExpert> {
+    Ok(MoeExpert::from_layers(
+        copy_linear_to_device(&expert.gate_up_proj, device)?,
+        copy_linear_to_device(&expert.down_proj, device)?,
+        expert.intermediate_size,
+    ))
+}
+
 /// Narrows one expert's view out of an already-promoted, single-owner
 /// `[num_experts, out, in]` tensor, without forcing a copy.
 ///

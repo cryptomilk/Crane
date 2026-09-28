@@ -86,7 +86,7 @@ impl<R: Read + Seek> Gguf<R> {
         } else {
             None
         };
-        log_iquant(&iquant);
+        log_iquant(&iquant, &device);
         Self {
             ct,
             reader,
@@ -110,7 +110,7 @@ impl<R: Read + Seek> Gguf<R> {
     ) -> Result<Self> {
         let iquant = std::mem::take(&mut tensors.iquant);
         super::iquant::requant_target()?;
-        log_iquant(&iquant);
+        log_iquant(&iquant, &device);
         let ternary = if tensors.is_ternary() {
             Some(TernaryContext::from_metadata(&ct, tensors)?)
         } else {
@@ -130,13 +130,22 @@ impl<R: Read + Seek> Gguf<R> {
     /// Load a tensor by name as a `QTensor`, decoding i-quants that Candle
     /// cannot represent (see [`super::iquant`]).
     fn load_qtensor(&mut self, name: &str, device: &Device) -> Result<QTensor> {
-        let Some(info) = self.iquant.get(name) else {
+        let Some((info, packed)) = self.iquant_bytes(name)? else {
             if self.undecodable.contains(name) {
                 candle_core::bail!(
                     "GGUF tensor {name} is ternary but the file lacks Prism metadata"
                 )
             }
             return self.ct.tensor(&mut self.reader, name, device);
+        };
+        let target = super::iquant::requant_target()?;
+        super::iquant::requantize(info.ty, &packed, &info.shape, target, device)
+    }
+
+    /// Raw GGUF bytes of an i-quant tensor, or `None` for any other tensor.
+    fn iquant_bytes(&mut self, name: &str) -> Result<Option<(IQuantTensorInfo, Vec<u8>)>> {
+        let Some(info) = self.iquant.get(name).cloned() else {
+            return Ok(None);
         };
         let elems: usize = info.shape.iter().product();
         let bytes = elems / info.ty.block_size() * info.ty.block_bytes();
@@ -148,8 +157,7 @@ impl<R: Read + Seek> Gguf<R> {
         self.reader.seek(std::io::SeekFrom::Start(absolute))?;
         let mut packed = vec![0u8; bytes];
         self.reader.read_exact(&mut packed)?;
-        let target = super::iquant::requant_target()?;
-        super::iquant::requantize(info.ty, &packed, &info.shape, target, device)
+        Ok(Some((info, packed)))
     }
 
     /// Load a quantized tensor and wrap as a `LinearLayer` (`QMatMul`).
@@ -185,6 +193,20 @@ impl<R: Read + Seek> Gguf<R> {
         name: &str,
         device: &Device,
     ) -> Result<crate::ops::linear::LinearLayer> {
+        if native_iquant(device)
+            && let Some(info) = self.iquant.get(name)
+            && info.shape.len() == 2
+        {
+            let (info, packed) = self.iquant_bytes(name)?.expect("i-quant tensor present");
+            let layer = super::iquant::IQuantLinear::new(
+                info.ty,
+                packed,
+                info.shape[0],
+                info.shape[1],
+                device,
+            )?;
+            return Ok(crate::ops::linear::LinearLayer::IQuant(layer));
+        }
         let ws = self.load_qtensor(name, device)?;
         let qmm = candle_core::quantized::QMatMul::from_arc(Arc::new(ws))?;
         Ok(crate::ops::linear::LinearLayer::quantized(qmm))
@@ -390,7 +412,12 @@ impl<R: Read + Seek> Gguf<R> {
     }
 }
 
-fn log_iquant(iquant: &HashMap<String, IQuantTensorInfo>) {
+/// Whether i-quant linear layers on `device` run through the native kernels.
+fn native_iquant(device: &Device) -> bool {
+    cfg!(feature = "cuda") && device.is_cuda() && super::iquant::native_enabled()
+}
+
+fn log_iquant(iquant: &HashMap<String, IQuantTensorInfo>, device: &Device) {
     if iquant.is_empty() {
         return;
     }
@@ -399,12 +426,21 @@ fn log_iquant(iquant: &HashMap<String, IQuantTensorInfo>) {
     types.dedup();
     let target =
         super::iquant::requant_target().map_or_else(|e| e.to_string(), |t| format!("{t:?}"));
-    eprintln!(
-        "[gguf] {} tensors in {} have no native kernel; re-quantizing to {target} at load \
-         (CRANE_IQ_REQUANT to change)",
-        iquant.len(),
-        types.join("/"),
-    );
+    if native_iquant(device) {
+        eprintln!(
+            "[gguf] {} tensors in {}: linear layers run natively; embeddings and packed MoE \
+             experts are re-quantized to {target} (CRANE_IQ_REQUANT=<type> forces re-quantization)",
+            iquant.len(),
+            types.join("/"),
+        );
+    } else {
+        eprintln!(
+            "[gguf] {} tensors in {} have no native kernel on this device; re-quantizing to \
+             {target} at load (CRANE_IQ_REQUANT to change)",
+            iquant.len(),
+            types.join("/"),
+        );
+    }
 }
 
 impl TernaryContext {

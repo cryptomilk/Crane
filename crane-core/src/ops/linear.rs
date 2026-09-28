@@ -80,6 +80,9 @@ pub enum LinearLayer {
     Standard(Linear),
     Quantized(QuantizedLinear),
     Ternary(crate::quantized::ternary::TernaryLinear),
+    /// llama.cpp i-quant weight kept in its packed encoding (CUDA only;
+    /// see [`crate::quantized::iquant::IQuantLinear`]).
+    IQuant(crate::quantized::iquant::IQuantLinear),
 }
 
 impl LinearLayer {
@@ -136,6 +139,8 @@ impl LinearLayer {
                     "promoting a Ternary-quantized layer to another device is not supported"
                 )
             },
+            // The packed encoding moves as-is; forward casts to the input dtype.
+            Self::IQuant(l) => Ok(Self::IQuant(l.to_device(device)?)),
         }
     }
 }
@@ -146,6 +151,7 @@ impl Module for LinearLayer {
             Self::Standard(l) => l.forward(xs),
             Self::Quantized(q) => q.forward(xs),
             Self::Ternary(t) => t.forward(xs),
+            Self::IQuant(l) => l.forward(xs),
         }
     }
 }
@@ -193,6 +199,7 @@ impl LinearLayer {
             // with F32 input the matmul runs natively, no cast needed.
             Self::Quantized(q) => q.forward(&xs_f32),
             Self::Ternary(t) => t.forward_f32(&xs_f32),
+            Self::IQuant(l) => l.forward_f32(&xs_f32),
         }
     }
 
