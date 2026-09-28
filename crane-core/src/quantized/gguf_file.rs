@@ -418,7 +418,9 @@ impl<R: Read + Seek> Gguf<R> {
 
 /// Whether i-quant linear layers on `device` run through the native kernels.
 fn native_iquant(device: &Device) -> bool {
-    ((cfg!(feature = "cuda") && device.is_cuda()) || (cfg!(feature = "sycl") && device.is_sycl()))
+    ((cfg!(feature = "cuda") && device.is_cuda())
+        || (cfg!(feature = "sycl") && device.is_sycl())
+        || (cfg!(feature = "metal") && device.is_metal()))
         && super::iquant::native_enabled()
 }
 

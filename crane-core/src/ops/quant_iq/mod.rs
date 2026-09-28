@@ -4,5 +4,7 @@
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(feature = "metal")]
+pub mod metal;
 #[cfg(feature = "sycl")]
 pub mod sycl;

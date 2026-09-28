@@ -87,9 +87,16 @@ prost = { version = "0.14.3", optional = true }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 candle-core-default = { workspace = true, optional = true, features = ["metal"] }
 candle-nn-default = { workspace = true, optional = true, features = ["metal"] }
+# Direct deps so `ops/quant_iq/metal.rs` can use `candle_metal_kernels::metal::{Library, ComputePipeline, ...}`
+# (candle-core's `metal_backend` doesn't re-export them) and `objc2_metal::MTLSize`
+# (used to construct dispatch dimensions for `dispatch_threads`).
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 candle-core-default = { workspace = true, optional = true, features = ["accelerate"] }
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 candle-core-default = { workspace = true, optional = true }
@@ -112,6 +119,8 @@ metal = [
     "candle-core-default/metal",
     "candle-nn-default/metal",
     "candle-transformers-default/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
 ]
 cuda = [
     "candle-core-default/cuda",
