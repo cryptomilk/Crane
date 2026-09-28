@@ -330,7 +330,7 @@ pub fn wrap_bf16<S: Into<Shape>>(
     wrap(RocmStorageSlice::BF16(buf), dev, shape)
 }
 
-fn wrap<S: Into<Shape>>(slice: RocmStorageSlice, dev: &RocmDevice, shape: S) -> Tensor {
+pub(crate) fn wrap<S: Into<Shape>>(slice: RocmStorageSlice, dev: &RocmDevice, shape: S) -> Tensor {
     Tensor::from_storage(
         Storage::Rocm(RocmStorage {
             slice,

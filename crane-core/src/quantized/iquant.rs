@@ -8,7 +8,7 @@
 //! [`extended_gguf`](super::extended_gguf) probe hides these tensors from
 //! Candle; this module decodes them.
 //!
-//! On CUDA / SYCL / Metal, linear layers keep the packed encoding and run
+//! On CUDA / SYCL / Metal / ROCm, linear layers keep the packed encoding and run
 //! through native kernels ([`IQuantLinear`]). Everything else (other devices,
 //! embeddings, packed MoE experts) is dequantized on the CPU and re-quantized
 //! at load time to a Candle-native type (see [`requant_target`]), so every
@@ -152,9 +152,9 @@ fn dequantize_iq4_xs(blocks: &[u8], out: &mut [f32]) {
 }
 
 /// Whether linear layers keep i-quant weights packed and run them through
-/// the native kernels (CUDA only). True unless `CRANE_IQ_REQUANT` names an
-/// explicit target, which forces re-quantization everywhere (handy for A/B
-/// comparisons).
+/// the native kernels (CUDA / SYCL / Metal / ROCm). True unless
+/// `CRANE_IQ_REQUANT` names an explicit target, which forces re-quantization
+/// everywhere (handy for A/B comparisons).
 pub fn native_enabled() -> bool {
     std::env::var("CRANE_IQ_REQUANT").map_or(true, |v| v.eq_ignore_ascii_case("native"))
 }
@@ -258,7 +258,7 @@ pub fn requantize(
 /// Largest input-row count served by the decode matvec kernel; bigger
 /// batches dequantize weight chunks and use a regular matmul.
 #[cfg_attr(
-    not(any(feature = "cuda", feature = "sycl", feature = "metal")),
+    not(any(feature = "cuda", feature = "sycl", feature = "metal", feature = "rocm")),
     allow(dead_code)
 )]
 const MATVEC_MAX_ROWS: usize = 8;
@@ -269,7 +269,7 @@ const PREFILL_CHUNK_BYTES: usize = 256 << 20;
 /// device (see `kernels/cuda/quant_iq4.cu`,
 /// `kernels/sycl/quant_iq4.cpp`, `kernels/metal/quant_iq4.metal`).
 ///
-/// Only built for CUDA / SYCL / Metal by [`Gguf`](super::gguf_file::Gguf);
+/// Only built for CUDA / SYCL / Metal / ROCm by [`Gguf`](super::gguf_file::Gguf);
 /// other devices get a re-quantized `QMatMul` instead. The CPU path here
 /// dequantizes the whole weight per call and exists for tests and device
 /// fallbacks.
@@ -383,6 +383,17 @@ impl IQuantLinear {
         if self.packed.device().is_metal() && matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
         {
             return crate::ops::quant_iq::metal::dequantize(
+                &self.packed,
+                self.ty,
+                0,
+                self.rows,
+                self.cols,
+                dtype,
+            );
+        }
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        if self.packed.device().is_rocm() && matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return crate::ops::quant_iq::rocm::dequantize(
                 &self.packed,
                 self.ty,
                 0,
@@ -508,6 +519,34 @@ impl IQuantLinear {
                 let n_rows = chunk.min(self.rows - start);
                 let w =
                     metal::dequantize(&self.packed, self.ty, start, n_rows, self.cols, out_dtype)?;
+                outs.push(x.matmul(&w.t()?)?);
+            }
+            let y = if outs.len() == 1 {
+                outs.pop().unwrap()
+            } else {
+                Tensor::cat(&outs, 1)?
+            };
+            return y.reshape(out_dims);
+        }
+
+        #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+        if xs.device().is_rocm() {
+            use crate::ops::quant_iq::rocm;
+            if n <= MATVEC_MAX_ROWS {
+                let x = xs.reshape((n, self.cols))?;
+                let y = rocm::matvec(&x, &self.packed, self.ty, self.rows, self.cols, out_dtype)?;
+                return y.reshape(out_dims);
+            }
+            let x = xs
+                .to_dtype(out_dtype)?
+                .reshape((n, self.cols))?
+                .contiguous()?;
+            let chunk = (chunk_bytes / (self.cols * out_dtype.size_in_bytes())).max(1);
+            let mut outs = Vec::with_capacity(self.rows.div_ceil(chunk));
+            for start in (0..self.rows).step_by(chunk) {
+                let n_rows = chunk.min(self.rows - start);
+                let w =
+                    rocm::dequantize(&self.packed, self.ty, start, n_rows, self.cols, out_dtype)?;
                 outs.push(x.matmul(&w.t()?)?);
             }
             let y = if outs.len() == 1 {
