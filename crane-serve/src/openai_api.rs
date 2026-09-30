@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::StopSequences;
+
 // ═════════════════════════════════════════════════════════════
 //  Shared helpers
 // ═════════════════════════════════════════════════════════════
@@ -418,10 +420,10 @@ impl StringOrArray {
         }
     }
 
-    pub fn into_vec(self) -> Vec<String> {
+    pub fn into_vec(self) -> StopSequences {
         match self {
-            Self::Single(s) => vec![s],
-            Self::Array(arr) => arr,
+            Self::Single(s) => smallvec::smallvec![s],
+            Self::Array(arr) => arr.into_iter().collect(),
         }
     }
 }

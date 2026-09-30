@@ -10,6 +10,9 @@
 
 use std::sync::Arc;
 
+use crate::engine::{EngineResponse, GenerationParams, StopSequences};
+use crate::openai_api::*;
+use crate::{AppState, make_error, now_epoch};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -18,10 +21,6 @@ use axum::{
         sse::{KeepAlive, Sse},
     },
 };
-
-use crate::engine::{EngineResponse, GenerationParams};
-use crate::openai_api::*;
-use crate::{AppState, make_error, now_epoch};
 
 use super::sse;
 use super::vlm;
@@ -108,7 +107,9 @@ pub async fn chat_completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
-                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
+                stop: req
+                    .stop
+                    .map_or_else(StopSequences::new, StringOrArray::into_vec),
                 tool_names: tools.map_or_else(Vec::new, |tools| {
                     tools.iter().map(|t| t.function.name.clone()).collect()
                 }),
@@ -215,7 +216,9 @@ pub async fn completions(
                 frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
                 presence_penalty: req.presence_penalty.unwrap_or(0.0),
                 eos_token_id: state.eos_token_id.clone(),
-                stop: req.stop.map_or_else(Vec::new, StringOrArray::into_vec),
+                stop: req
+                    .stop
+                    .map_or_else(StopSequences::new, StringOrArray::into_vec),
                 // `/v1/completions` is raw text completion with no chat
                 // template or tool concept.
                 tool_names: Vec::new(),

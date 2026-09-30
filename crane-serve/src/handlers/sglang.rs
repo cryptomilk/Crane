@@ -20,7 +20,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::engine::{EngineResponse, GenerationParams};
+use crate::engine::{EngineResponse, GenerationParams, StopSequences};
 use crate::openai_api::ErrorResponse;
 use crate::sglang_api::*;
 use crate::{AppState, make_error};
@@ -95,7 +95,7 @@ pub async fn generate(
                 stop: sp
                     .stop
                     .clone()
-                    .map_or_else(Vec::new, StringOrList::into_vec),
+                    .map_or_else(StopSequences::new, StringOrList::into_vec),
                 // SGLang's `/generate` has no tool-calling concept.
                 tool_names: Vec::new(),
             },
@@ -226,7 +226,7 @@ pub async fn health_generate(
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: state.eos_token_id.clone(),
-                stop: vec![],
+                stop: StopSequences::new(),
                 tool_names: Vec::new(),
             },
         )

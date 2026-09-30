@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::StopSequences;
+
 // ═════════════════════════════════════════════════════════════
 //  /generate — Native generation endpoint
 // ═════════════════════════════════════════════════════════════
@@ -116,10 +118,10 @@ pub enum StringOrList {
 
 #[allow(dead_code)]
 impl StringOrList {
-    pub fn into_vec(self) -> Vec<String> {
+    pub fn into_vec(self) -> StopSequences {
         match self {
-            Self::Single(s) => vec![s],
-            Self::List(v) => v,
+            Self::Single(s) => smallvec::smallvec![s],
+            Self::List(v) => v.into_iter().collect(),
         }
     }
 }
@@ -246,25 +248,25 @@ mod tests {
     #[test]
     fn string_or_list_single_into_vec() {
         let s = StringOrList::Single("stop".into());
-        assert_eq!(s.into_vec(), vec!["stop".to_string()]);
+        assert_eq!(s.into_vec().as_slice(), ["stop".to_string()]);
     }
 
     #[test]
     fn string_or_list_list_into_vec() {
         let s = StringOrList::List(vec!["a".into(), "b".into()]);
-        assert_eq!(s.into_vec(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(s.into_vec().as_slice(), ["a".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn string_or_list_deserialize_single() {
         let v: StringOrList = serde_json::from_str(r#""stop""#).unwrap();
-        assert_eq!(v.into_vec(), vec!["stop".to_string()]);
+        assert_eq!(v.into_vec().as_slice(), ["stop".to_string()]);
     }
 
     #[test]
     fn string_or_list_deserialize_list() {
         let v: StringOrList = serde_json::from_str(r#"["a","b"]"#).unwrap();
-        assert_eq!(v.into_vec(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(v.into_vec().as_slice(), ["a".to_string(), "b".to_string()]);
     }
 
     // ── GenerateRequest deserialization ──
@@ -318,7 +320,7 @@ mod tests {
         }"#;
         let req: GenerateRequest = serde_json::from_str(json).unwrap();
         let stops = req.sampling_params.stop.unwrap().into_vec();
-        assert_eq!(stops, vec!["<|end|>", "\n\n"]);
+        assert_eq!(stops.as_slice(), ["<|end|>", "\n\n"]);
     }
 
     // ── Response serialization ──

@@ -41,7 +41,9 @@ pub mod types;
 // Re-export commonly used items for convenience.
 pub use memory::MemoryConfig;
 pub use stats::{EngineStats, StatsSnapshot};
-pub use types::{EngineHandle, EngineRequest, EngineResponse, EosTokenIds, GenerationParams};
+pub use types::{
+    EngineHandle, EngineRequest, EngineResponse, EosTokenIds, GenerationParams, StopSequences,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;

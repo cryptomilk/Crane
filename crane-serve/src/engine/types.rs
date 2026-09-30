@@ -12,6 +12,11 @@ use super::stats::EngineStats;
 /// (most models have 1-3 EOS ids) without a heap allocation.
 pub type EosTokenIds = SmallVec<[u32; 4]>;
 
+/// String sequences that terminate generation when produced; inline
+/// capacity 4 covers the common case (most requests carry 0-3 stop
+/// strings) without a heap allocation.
+pub type StopSequences = SmallVec<[String; 4]>;
+
 /// A request from an API handler to the engine.
 pub struct EngineRequest {
     pub id: String,
@@ -25,7 +30,7 @@ pub struct EngineRequest {
     pub presence_penalty: f32,
     pub eos_token_id: EosTokenIds,
     /// String sequences that terminate generation when produced.
-    pub stop: Vec<String>,
+    pub stop: StopSequences,
     /// Tool function names offered in the request, used to build a
     /// grammar constraint on the tool-call XML skeleton. Empty when no
     /// tools were offered.
@@ -58,7 +63,7 @@ pub struct GenerationParams {
     /// Token IDs that terminate generation when produced.
     pub eos_token_id: EosTokenIds,
     /// String sequences that terminate generation when produced.
-    pub stop: Vec<String>,
+    pub stop: StopSequences,
     /// Tool function names offered in the request, used to build a
     /// grammar constraint on the tool-call XML skeleton. Empty when no
     /// tools were offered.
@@ -172,7 +177,7 @@ mod tests {
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: smallvec::smallvec![0],
-                stop: vec![],
+                stop: StopSequences::new(),
                 tool_names: vec![],
             },
         );
@@ -199,7 +204,7 @@ mod tests {
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: smallvec::smallvec![0],
-                stop: vec![],
+                stop: StopSequences::new(),
                 tool_names: vec![],
             },
         );
@@ -225,7 +230,7 @@ mod tests {
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
                 eos_token_id: smallvec::smallvec![0],
-                stop: vec![],
+                stop: StopSequences::new(),
                 tool_names: vec![],
             },
         );
@@ -314,7 +319,7 @@ mod tests {
                     frequency_penalty: 0.3,
                     presence_penalty: 0.2,
                     eos_token_id: smallvec::smallvec![2],
-                    stop: vec![],
+                    stop: StopSequences::new(),
                     tool_names: vec![],
                 },
             )

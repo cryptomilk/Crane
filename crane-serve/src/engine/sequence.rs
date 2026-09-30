@@ -4,7 +4,7 @@ use crane_core::{LogitsProcessor, Tensor};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
-use super::types::EosTokenIds;
+use super::types::{EosTokenIds, StopSequences};
 
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
 #[must_use]
@@ -79,7 +79,7 @@ pub struct Sequence {
 
     // ── stop sequences ──
     /// String sequences that terminate generation when produced.
-    pub stop_sequences: Vec<String>,
+    pub stop_sequences: StopSequences,
     /// Decoded text accumulated since the last successful `take_safe_text`
     /// call. Used both to detect stop-sequence matches and, via
     /// `take_safe_text`, to withhold text that could still extend into a
@@ -317,7 +317,7 @@ mod tests {
             max_tokens,
             eos_token_id: smallvec::smallvec![eos_token_id],
             grammar: None,
-            stop_sequences: vec![],
+            stop_sequences: StopSequences::new(),
             unsent_text: String::new(),
             decode_start: None,
             created_at: Instant::now(),
