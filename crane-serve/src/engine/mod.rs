@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crane_core::{LogitsProcessor, Tensor};
+use smallvec::{SmallVec, smallvec};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
@@ -1420,16 +1421,16 @@ impl InferenceEngine {
         // Multi-round decode loop with lazy eviction.
         let mut total_tokens_this_step = 0u64;
         let mut rounds_done = 0usize;
-        let mut alive = vec![true; batch.len()];
-        let mut pending_finish: Vec<String> = Vec::new();
-        let mut pending_cancel: Vec<String> = Vec::new();
+        let mut alive: SmallVec<[bool; 16]> = smallvec![true; batch.len()];
+        let mut pending_finish: SmallVec<[String; 16]> = SmallVec::new();
+        let mut pending_cancel: SmallVec<[String; 16]> = SmallVec::new();
 
-        let mut positions: Vec<usize> = batch
+        let mut positions: SmallVec<[usize; 16]> = batch
             .iter()
             .map(|id| self.sequences.get(id).unwrap().start_pos())
             .collect();
 
-        let mut last_tokens: Vec<u32> = batch
+        let mut last_tokens: SmallVec<[u32; 16]> = batch
             .iter()
             .map(|id| *self.sequences.get(id).unwrap().tokens.last().unwrap())
             .collect();
@@ -1439,7 +1440,7 @@ impl InferenceEngine {
                 break;
             }
 
-            let tokens: Vec<u32> = (0..batch.len())
+            let tokens: SmallVec<[u32; 16]> = (0..batch.len())
                 .map(|i| {
                     if alive[i] {
                         *self
