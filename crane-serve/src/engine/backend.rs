@@ -14,6 +14,9 @@
 use anyhow::Result;
 use crane_core::device::DeviceAssignment;
 use crane_core::{DType, Device, Tensor, bail};
+use smallvec::SmallVec;
+
+use super::types::EosTokenIds;
 
 /// Per-layer KV cache for one sequence: `(K, V)` per layer, or `None` for
 /// layers with no cached state yet.
@@ -81,7 +84,7 @@ pub trait ModelBackend: Send + 'static {
     fn tokenizer(&self) -> &tokenizers::Tokenizer;
 
     /// The model's end-of-sequence token ID(s).
-    fn eos_token_id(&self) -> Vec<u32>;
+    fn eos_token_id(&self) -> EosTokenIds;
 
     /// Warm up the model with a small forward pass.
     fn warmup(&mut self);
@@ -244,9 +247,9 @@ impl ModelBackend for Gemma4Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
+    fn eos_token_id(&self) -> EosTokenIds {
         let tok = &self.model.tokenizer.tokenizer;
-        let mut ids = Vec::new();
+        let mut ids = SmallVec::new();
         if let Some(id) = tok.token_to_id("<end_of_turn>") {
             ids.push(id);
         }
@@ -321,8 +324,8 @@ impl ModelBackend for HunyuanBackend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
-        vec![120_020]
+    fn eos_token_id(&self) -> EosTokenIds {
+        smallvec::smallvec![120_020]
     }
 
     fn warmup(&mut self) {
@@ -452,13 +455,16 @@ impl ModelBackend for Qwen25Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
+    fn eos_token_id(&self) -> EosTokenIds {
         self.model
             .tokenizer
             .tokenizer
             .token_to_id("<|endoftext|>")
             .or_else(|| self.model.tokenizer.tokenizer.token_to_id("<|im_end|>"))
-            .map_or_else(|| vec![151_643], |id| vec![id])
+            .map_or_else(
+                || smallvec::smallvec![151_643],
+                |id| smallvec::smallvec![id],
+            )
     }
 
     fn warmup(&mut self) {
@@ -527,15 +533,15 @@ impl ModelBackend for Minicpm5Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
+    fn eos_token_id(&self) -> EosTokenIds {
         let ids = self.model.eos_token_ids();
         if !ids.is_empty() {
-            return ids.to_vec();
+            return SmallVec::from_slice(ids);
         }
         let tok = &self.model.tokenizer.tokenizer;
         tok.token_to_id("<|im_end|>")
             .or_else(|| tok.token_to_id("<|endoftext|>"))
-            .map_or_else(|| vec![1], |id| vec![id])
+            .map_or_else(|| smallvec::smallvec![1], |id| smallvec::smallvec![id])
     }
 
     fn warmup(&mut self) {
@@ -637,10 +643,10 @@ impl ModelBackend for Qwen3_5Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
+    fn eos_token_id(&self) -> EosTokenIds {
         // Prefer the ids the model read from generation_config.json / GGUF
         // metadata (Qwen 3.5 uses a multi-id EOS set, e.g. [248044, 248046]).
-        let ids = self.model.eos_token_ids().to_vec();
+        let ids = SmallVec::from_slice(self.model.eos_token_ids());
         if !ids.is_empty() {
             return ids;
         }
@@ -742,11 +748,11 @@ impl ModelBackend for Qwen3Backend {
         &self.model.tokenizer.tokenizer
     }
 
-    fn eos_token_id(&self) -> Vec<u32> {
+    fn eos_token_id(&self) -> EosTokenIds {
         // Qwen3 chat models stop at <|im_end|> (151645).
         // Also include <|endoftext|> (151643) as a fallback.
         let tok = &self.model.tokenizer.tokenizer;
-        let mut ids = Vec::new();
+        let mut ids = SmallVec::new();
         if let Some(id) = tok.token_to_id("<|im_end|>") {
             ids.push(id);
         }

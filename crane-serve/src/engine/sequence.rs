@@ -4,6 +4,8 @@ use crane_core::{LogitsProcessor, Tensor};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
+use super::types::EosTokenIds;
+
 /// Compute the total GPU memory (in bytes) held by a set of KV caches.
 #[must_use]
 pub fn kv_cache_bytes(caches: &[Option<(Tensor, Tensor)>]) -> u64 {
@@ -63,7 +65,7 @@ pub struct Sequence {
     pub top_p: Option<f64>,
     pub top_k: Option<usize>,
     pub max_tokens: usize,
-    pub eos_token_id: Vec<u32>,
+    pub eos_token_id: EosTokenIds,
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
@@ -313,7 +315,7 @@ mod tests {
             top_p: Some(0.95),
             top_k: Some(40),
             max_tokens,
-            eos_token_id: vec![eos_token_id],
+            eos_token_id: smallvec::smallvec![eos_token_id],
             grammar: None,
             stop_sequences: vec![],
             unsent_text: String::new(),

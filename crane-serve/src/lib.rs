@@ -31,7 +31,7 @@ use chat_template::ChatTemplateProcessor;
 use crane_core::device::DeviceAssignment;
 use engine::backend::ExpertPromotionPolicy;
 use engine::model_factory::{ModelFormat, ModelType};
-use engine::{EngineHandle, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
+use engine::{EngineHandle, EosTokenIds, InferenceEngine, KV_GPU_OVERHEAD_FACTOR, MemoryConfig};
 use handlers::asr::AsrTranscribeRequest;
 use handlers::tts::TtsGenerateRequest;
 use handlers::vlm::{Gemma4VlmRequest, MinicpmVVlmRequest, Qwen3_5VlmRequest, VlmRequest};
@@ -173,7 +173,7 @@ pub struct AppState {
     pub model_name: String,
     pub tokenizer: tokenizers::Tokenizer,
     pub chat_template: Box<dyn ChatTemplateProcessor>,
-    pub eos_token_id: Vec<u32>,
+    pub eos_token_id: EosTokenIds,
     pub server_start_time: u64,
     pub vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
     pub gemma4_vlm_tx: Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
@@ -1142,7 +1142,7 @@ pub async fn run(mut args: Args) -> Result<()> {
     ): (
         Option<EngineHandle>,
         tokenizers::Tokenizer,
-        Vec<u32>,
+        EosTokenIds,
         Box<dyn ChatTemplateProcessor>,
         Option<tokio::sync::mpsc::UnboundedSender<VlmRequest>>,
         Option<tokio::sync::mpsc::UnboundedSender<Gemma4VlmRequest>>,
@@ -1205,7 +1205,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         (
             None,
             tokenizer,
-            vec![eos_id],
+            smallvec::smallvec![eos_id],
             chat_template,
             None,
             None,
@@ -1266,7 +1266,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         (
             None,
             tokenizer,
-            vec![eos_id],
+            smallvec::smallvec![eos_id],
             chat_template,
             None,
             None,
@@ -1592,7 +1592,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         (
             None,
             tokenizer,
-            vec![eos_id],
+            smallvec::smallvec![eos_id],
             chat_template,
             vlm_tx_opt_inner,
             gemma4_vlm_tx_opt_inner,
@@ -1664,7 +1664,7 @@ pub async fn run(mut args: Args) -> Result<()> {
         (
             None,
             tokenizer,
-            vec![eos_id],
+            smallvec::smallvec![eos_id],
             chat_template,
             None,
             None,
@@ -2177,7 +2177,7 @@ mod auth_middleware_tests {
             model_name: "test-model".to_string(),
             tokenizer: tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default()),
             chat_template: Box::new(StubChatTemplate),
-            eos_token_id: vec![0],
+            eos_token_id: smallvec::smallvec![0],
             server_start_time: now_epoch(),
             vlm_tx: None,
             gemma4_vlm_tx: None,

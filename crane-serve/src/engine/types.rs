@@ -3,9 +3,14 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
 use super::stats::EngineStats;
+
+/// End-of-sequence token IDs; inline capacity 4 covers the common case
+/// (most models have 1-3 EOS ids) without a heap allocation.
+pub type EosTokenIds = SmallVec<[u32; 4]>;
 
 /// A request from an API handler to the engine.
 pub struct EngineRequest {
@@ -18,7 +23,7 @@ pub struct EngineRequest {
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
-    pub eos_token_id: Vec<u32>,
+    pub eos_token_id: EosTokenIds,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
     /// Tool function names offered in the request, used to build a
@@ -51,7 +56,7 @@ pub struct GenerationParams {
     /// at all so far (0.0 = no penalty).
     pub presence_penalty: f32,
     /// Token IDs that terminate generation when produced.
-    pub eos_token_id: Vec<u32>,
+    pub eos_token_id: EosTokenIds,
     /// String sequences that terminate generation when produced.
     pub stop: Vec<String>,
     /// Tool function names offered in the request, used to build a
@@ -166,7 +171,7 @@ mod tests {
                 repetition_penalty: 1.0,
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
-                eos_token_id: vec![0],
+                eos_token_id: smallvec::smallvec![0],
                 stop: vec![],
                 tool_names: vec![],
             },
@@ -193,7 +198,7 @@ mod tests {
                 repetition_penalty: 1.0,
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
-                eos_token_id: vec![0],
+                eos_token_id: smallvec::smallvec![0],
                 stop: vec![],
                 tool_names: vec![],
             },
@@ -219,7 +224,7 @@ mod tests {
                 repetition_penalty: 1.0,
                 frequency_penalty: 0.0,
                 presence_penalty: 0.0,
-                eos_token_id: vec![0],
+                eos_token_id: smallvec::smallvec![0],
                 stop: vec![],
                 tool_names: vec![],
             },
@@ -308,7 +313,7 @@ mod tests {
                     repetition_penalty: 1.1,
                     frequency_penalty: 0.3,
                     presence_penalty: 0.2,
-                    eos_token_id: vec![2],
+                    eos_token_id: smallvec::smallvec![2],
                     stop: vec![],
                     tool_names: vec![],
                 },
@@ -325,6 +330,6 @@ mod tests {
         assert!((req.repetition_penalty - 1.1).abs() < 0.001);
         assert!((req.frequency_penalty - 0.3).abs() < 0.001);
         assert!((req.presence_penalty - 0.2).abs() < 0.001);
-        assert_eq!(req.eos_token_id, vec![2]);
+        assert_eq!(req.eos_token_id.as_slice(), [2]);
     }
 }
