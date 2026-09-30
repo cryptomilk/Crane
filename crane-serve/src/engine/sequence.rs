@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use crane_core::{LogitsProcessor, Tensor};
+use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -158,7 +159,9 @@ impl Sequence {
             if stop.is_empty() {
                 continue;
             }
-            let mut boundaries: Vec<usize> = stop.char_indices().map(|(i, _)| i).collect();
+            // Most stop sequences are under 16 chars, so this stays off the heap.
+            let mut boundaries: SmallVec<[usize; 16]> =
+                stop.char_indices().map(|(i, _)| i).collect();
             boundaries.push(stop.len());
             for k in boundaries {
                 if k == 0 || k > text.len() {
