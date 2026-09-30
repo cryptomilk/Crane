@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use crane_core::{D, DType, Device, Tensor, bail, softmax_last_dim};
+use smallvec::SmallVec;
 use tracing::debug;
 
 use super::grammar::{TokenMask, apply_grammar_mask, suppress_eos_inplace};
@@ -428,6 +429,12 @@ pub fn sample_gumbel_max_idx(logits: &Tensor, temperature: f64) -> crane_core::R
     }
 }
 
+/// Inline capacity for the token-id/delta buffers in
+/// [`apply_penalties_inplace`], matching the default `repeat_last_n` window
+/// size so the common case never spills to the heap; a larger configured
+/// window still works, just with a heap allocation.
+const PENALTY_INLINE_CAPACITY: usize = 64;
+
 /// Apply repetition, frequency, and presence penalties to `logits` in-place
 /// (GPU-friendly scatter/gather).
 ///
@@ -479,7 +486,7 @@ pub fn apply_penalties_inplace(
         *counts.entry(t).or_insert(0) += 1;
     }
 
-    let mut token_ids: Vec<u32> = counts.keys().copied().collect();
+    let mut token_ids: SmallVec<[u32; PENALTY_INLINE_CAPACITY]> = counts.keys().copied().collect();
     token_ids.sort_unstable();
 
     let idx = Tensor::new(token_ids.as_slice(), logits.device())?;
@@ -495,7 +502,7 @@ pub fn apply_penalties_inplace(
     };
 
     let updated = if freq_presence_active {
-        let deltas: Vec<f32> = token_ids
+        let deltas: SmallVec<[f32; PENALTY_INLINE_CAPACITY]> = token_ids
             .iter()
             .map(|id| {
                 // Counts are bounded by `context.len()`, which is always far

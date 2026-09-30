@@ -35,6 +35,7 @@ tempfile = "3"
 image = "0.25"
 base64 = "0.23"
 subtle = "2"
+smallvec = "1"
 
 [features]
 # See `crane-core/Cargo.toml`'s `default-backend` comment: both `crane-core`
