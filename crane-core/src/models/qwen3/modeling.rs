@@ -1222,15 +1222,43 @@ impl Qwen3Model {
             .map(|l| matches!(l.mlp, MlpOrMoe::Moe(_)))
             .collect();
         let total_moe_layers = is_moe_layer.iter().filter(|&&m| m).count();
-        // Every MoE layer in a Qwen3 checkpoint has identical expert-tensor
-        // shapes (3 projections per expert: gate, up, down), so this cost
-        // is uniform across MoE layers; non-MoE layers cost 0 so they never
-        // affect the greedy budget below.
-        let per_layer_cost = moe_config.num_experts as u64
+        // Dynamic-quant checkpoints (e.g. Unsloth's "UD" GGUFs) can mix
+        // quantization levels across MoE layers, so each layer's packed
+        // expert-weight byte size is read individually rather than assumed
+        // uniform. Prefer the packed weights' actual quantized byte size
+        // (what `upload_qtensor` copies, or the raw i-quant buffer size)
+        // over the compute-dtype estimate below. For sub-byte-per-element
+        // quantizations like Q4K the compute-dtype estimate overcounts by
+        // ~3.5x, and even more for i-quant formats like IQ2_S. Fall back to
+        // the compute-dtype formula per layer for dequantized per-expert
+        // tensors (no packed `QTensor`s or i-quant experts).
+        let bf16_per_layer_cost = moe_config.num_experts as u64
             * moe_config.moe_intermediate_size as u64
             * self.config.hidden_size as u64
             * 3
             * self.dtype.size_in_bytes() as u64;
+        // `None` for non-MoE layers; `Some(cost)` for MoE layers, indexed
+        // in lockstep with `self.layers` for the `layer_costs` zip below.
+        let layer_raw_costs: Vec<Option<u64>> = self
+            .layers
+            .iter()
+            .map(|l| match &l.mlp {
+                MlpOrMoe::Moe(block) => Some(
+                    block
+                        .packed_expert_weight_bytes()
+                        .unwrap_or(bf16_per_layer_cost),
+                ),
+                MlpOrMoe::Dense(_) => None,
+            })
+            .collect();
+        let max_layer_cost = layer_raw_costs.iter().filter_map(|c| *c).max().unwrap_or(0);
+        if max_layer_cost != bf16_per_layer_cost {
+            log::debug!(
+                "MoE budget: max quantized per-layer cost {} (vs. compute-dtype estimate {})",
+                format_budget(max_layer_cost),
+                format_budget(bf16_per_layer_cost),
+            );
+        }
         // Layers whose experts already live on `gpu_location` (e.g. a
         // re-promotion pass after `max_seq_len` shrinks and frees headroom)
         // cost 0: they're already promoted, so charging them again would
@@ -1238,16 +1266,17 @@ impl Qwen3Model {
         let layer_costs: Vec<u64> = self
             .layers
             .iter()
-            .map(|l| match &l.mlp {
+            .zip(layer_raw_costs.iter())
+            .map(|(l, cost)| match &l.mlp {
                 MlpOrMoe::Moe(block) if block.expert_device().location() != gpu_location => {
-                    per_layer_cost
+                    cost.unwrap_or(0)
                 },
                 _ => 0,
             })
             .collect();
         log::debug!(
-            "MoE layout: {total_moe_layers} layers, per-layer expert cost estimate={}",
-            format_budget(per_layer_cost),
+            "MoE layout: {total_moe_layers} layers, max per-layer expert cost estimate={}",
+            format_budget(max_layer_cost),
         );
 
         let Some((free, total)) = query_gpu_memory(main_device) else {

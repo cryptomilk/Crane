@@ -323,6 +323,12 @@ impl PackedIQuantExperts {
         Ok(Self { gate, up, down })
     }
 
+    /// Total raw packed byte size across the gate, up and down projections.
+    fn packed_byte_size(&self) -> u64 {
+        (self.gate.packed_byte_size() + self.up.packed_byte_size() + self.down.packed_byte_size())
+            as u64
+    }
+
     /// Routed output `(tokens, top_k, hidden)` for `xs_f32` `(tokens,
     /// hidden)` and the router's `(tokens, top_k)` `U32` ids.
     fn forward(&self, xs_f32: &Tensor, topk_ids: &Tensor) -> Result<Tensor> {
@@ -761,6 +767,28 @@ impl SparseMoeBlock {
     #[must_use]
     pub fn expert_device(&self) -> &Device {
         &self.expert_device
+    }
+
+    /// Returns the total byte size of this block's packed expert weights
+    /// (`gate_up` + down, or the i-quant gate + up + down projections), or
+    /// `None` if the block holds dequantized per-expert tensors instead.
+    ///
+    /// When `Some`, this reflects the actual quantized byte cost (e.g.
+    /// ~0.5625 bytes/element for Q4K) — callers estimating VRAM cost should
+    /// prefer this over a compute-dtype-based estimate, which overestimates
+    /// for quantized checkpoints. Callers should fall back to their own
+    /// compute-dtype estimate when this returns `None`.
+    #[must_use]
+    pub fn packed_expert_weight_bytes(&self) -> Option<u64> {
+        if let (Some(gate_up), Some(down)) = (
+            self.packed_gate_up_exps.as_ref(),
+            self.packed_down_exps.as_ref(),
+        ) {
+            return Some((qtensor_byte_size(gate_up) + qtensor_byte_size(down)) as u64);
+        }
+        self.iquant_experts
+            .as_ref()
+            .map(PackedIQuantExperts::packed_byte_size)
     }
 
     /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a/10): two
@@ -1862,6 +1890,19 @@ fn supports_fused_moe(device: &Device, ggml_dtype: GgmlDType) -> bool {
 fn upload_qtensor(src: &QTensor, device: &Device) -> Result<QTensor> {
     let raw = src.data()?;
     qtensor_from_ggml(src.dtype(), &raw, src.shape().dims().to_vec(), device)
+}
+
+/// Returns the byte size of `qt`'s raw quantized data — what
+/// [`upload_qtensor`] actually copies, as opposed to
+/// `qt.elem_count() * compute_dtype.size_in_bytes()`, which overestimates
+/// for sub-byte-per-element quantizations like Q4K.
+///
+/// Integer division is exact: GGUF packing requires element counts to be
+/// whole multiples of the quantization block size (same invariant
+/// [`slice_packed_qtensor`] checks).
+fn qtensor_byte_size(qt: &QTensor) -> usize {
+    let elems: usize = qt.shape().dims().iter().product();
+    elems / qt.dtype().block_size() * qt.dtype().type_size()
 }
 
 /// Byte-slice one expert's 2D weight out of a packed `[num_experts, out, in]`
@@ -4434,6 +4475,22 @@ mod tests {
                 "got {got_vals:?}, expected {expected:?}"
             );
         }
+    }
+
+    // Verifies `qtensor_byte_size` matches Q4K's known block layout
+    // (`type_size=144` bytes per `block_size=256` elements), rather than the
+    // compute-dtype's `size_in_bytes()` an earlier VRAM budget estimate used.
+    #[test]
+    fn test_qtensor_byte_size_q4k() {
+        let device = &Device::Cpu;
+        let (num_experts, out_dim, in_dim) = (3usize, 32usize, 256usize);
+        let packed = make_packed_experts(num_experts, out_dim, in_dim, GgmlDType::Q4K, device);
+
+        let elems = num_experts * out_dim * in_dim;
+        let expected = elems / GgmlDType::Q4K.block_size() * GgmlDType::Q4K.type_size();
+        assert_eq!(qtensor_byte_size(&packed), expected);
+        // Sanity-check against the known Q4K ratio: 144 bytes / 256 elements.
+        assert_eq!(expected, elems / 256 * 144);
     }
 
     // GgmlDType::Q4K is a K-quant super-block format (`BLCK_SIZE=256`,
