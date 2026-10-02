@@ -769,6 +769,14 @@ impl SparseMoeBlock {
         &self.expert_device
     }
 
+    /// Whether this block's experts are stored as a packed `QTensor` pair —
+    /// the only storage mode [`Self::dispatch_packed`]'s GPU-offload burst
+    /// path handles. `false` for i-quant and dequantized per-expert storage.
+    #[must_use]
+    pub(crate) fn has_packed_qtensor_experts(&self) -> bool {
+        self.packed_gate_up_exps.is_some() && self.packed_down_exps.is_some()
+    }
+
     /// Returns the total byte size of this block's packed expert weights
     /// (`gate_up` + down, or the i-quant gate + up + down projections), or
     /// `None` if the block holds dequantized per-expert tensors instead.
@@ -789,6 +797,40 @@ impl SparseMoeBlock {
         self.iquant_experts
             .as_ref()
             .map(PackedIQuantExperts::packed_byte_size)
+    }
+
+    /// Worst-case transient VRAM this block's `gpu_offload_forward` path
+    /// would need for a `chunk_tokens`-token batch: its packed expert
+    /// weights (what `upload_qtensor` copies) plus `fused_forward`'s
+    /// activation buffers. `None` if experts aren't CPU-resident (the
+    /// offload path is never reached) or this block isn't stored as a
+    /// packed `QTensor` pair (i-quant and dequantized per-expert storage
+    /// never use the GPU offload burst). Callers are responsible for also
+    /// checking whether the main device backend supports the burst at all
+    /// (CUDA/ROCm only) — this method only answers the storage-mode and
+    /// expert-placement question.
+    #[must_use]
+    pub fn offload_reservation_bytes(
+        &self,
+        chunk_tokens: usize,
+        hidden_size: usize,
+    ) -> Option<u64> {
+        if !self.expert_device.is_cpu() {
+            return None;
+        }
+        let (gate_up, down) = (
+            self.packed_gate_up_exps.as_ref()?,
+            self.packed_down_exps.as_ref()?,
+        );
+        let weight_bytes = (qtensor_byte_size(gate_up) + qtensor_byte_size(down)) as u64;
+        let intermediate_size = gate_up.shape().dims()[1] / 2;
+        Some(offload_reservation_bytes_for(
+            weight_bytes,
+            chunk_tokens,
+            self.num_experts_per_tok,
+            intermediate_size,
+            hidden_size,
+        ))
     }
 
     /// Fused GPU `MoE` dispatch via `indexed_moe_forward` (Phase 8a/10): two
@@ -1988,6 +2030,26 @@ fn moe_offload_activation_bytes(
     let combined = tokens as u64 * hidden_size as u64;
     (gate_up + swiglu_contiguous + hidden + down_out + weighted + combined)
         * std::mem::size_of::<f32>() as u64
+}
+
+/// Worst-case transient VRAM one `MoE` CPU-offload call needs: one layer's
+/// packed weight bytes plus one `chunk_tokens`-token prefill chunk's F32
+/// activation buffers, plus the fixed fragmentation margin. Shared by
+/// [`SparseMoeBlock::offload_reservation_bytes`] (post-promotion, sizing the
+/// KV budget for whichever layers end up CPU-resident) and
+/// `Qwen3Model::promote_experts_to_gpu` (pre-promotion, sizing how many
+/// layers to promote in the first place) so the two estimates can't drift
+/// apart.
+pub(crate) fn offload_reservation_bytes_for(
+    per_layer_weight_bytes: u64,
+    chunk_tokens: usize,
+    topk: usize,
+    moe_intermediate_size: usize,
+    hidden_size: usize,
+) -> u64 {
+    per_layer_weight_bytes
+        + moe_offload_activation_bytes(chunk_tokens, topk, moe_intermediate_size, hidden_size)
+        + MOE_OFFLOAD_SAFETY_MARGIN_BYTES
 }
 
 /// Byte-slice one expert's 2D weight out of a packed `[num_experts, out, in]`
@@ -4604,6 +4666,108 @@ mod tests {
 
         // Zero tokens must not panic and must yield zero bytes.
         assert_eq!(moe_offload_activation_bytes(0, 2, 8, 16), 0);
+    }
+
+    // Verifies `offload_reservation_bytes_for` sums the per-layer weight
+    // bytes, `moe_offload_activation_bytes`, and the fixed safety margin —
+    // the single formula shared by `SparseMoeBlock::offload_reservation_bytes`
+    // (post-promotion) and `Qwen3Model::promote_experts_to_gpu`
+    // (pre-promotion).
+    #[test]
+    fn test_offload_reservation_bytes_for() {
+        let (per_layer_weight_bytes, chunk_tokens, topk, intermediate_size, hidden_size) =
+            (324_000_000u64, 2048usize, 8usize, 768usize, 2048usize);
+        let activation_bytes =
+            moe_offload_activation_bytes(chunk_tokens, topk, intermediate_size, hidden_size);
+        assert_eq!(
+            offload_reservation_bytes_for(
+                per_layer_weight_bytes,
+                chunk_tokens,
+                topk,
+                intermediate_size,
+                hidden_size,
+            ),
+            per_layer_weight_bytes + activation_bytes + MOE_OFFLOAD_SAFETY_MARGIN_BYTES
+        );
+    }
+
+    // Verifies `SparseMoeBlock::offload_reservation_bytes` sums packed
+    // expert weight bytes with `moe_offload_activation_bytes`, and returns
+    // `None` when experts have no packed `QTensor`s to offload (even if
+    // `expert_device` is CPU).
+    #[test]
+    fn test_offload_reservation_bytes() {
+        let (hidden, intermediate, num_experts, topk) = (2usize, 2usize, 4usize, 2usize);
+        let identity = vec![1.0f32, 0.0, 0.0, 1.0];
+        let expert_data = vec![(identity.clone(), identity.clone(), identity.clone()); num_experts];
+        let gate_data = vec![0.0f32; num_experts * hidden];
+        let chunk_tokens = 4usize;
+
+        let packed = make_packed_sparse_moe(
+            hidden,
+            intermediate,
+            num_experts,
+            topk,
+            false,
+            gate_data.clone(),
+            &expert_data,
+        );
+        let weight_bytes = packed
+            .packed_expert_weight_bytes()
+            .expect("packed weights present");
+        let activation_bytes =
+            moe_offload_activation_bytes(chunk_tokens, topk, intermediate, hidden);
+        assert_eq!(
+            packed.offload_reservation_bytes(chunk_tokens, hidden),
+            Some(weight_bytes + activation_bytes + MOE_OFFLOAD_SAFETY_MARGIN_BYTES)
+        );
+
+        let per_expert = make_sparse_moe(
+            hidden,
+            intermediate,
+            num_experts,
+            topk,
+            false,
+            gate_data,
+            &expert_data,
+        );
+        assert_eq!(
+            per_expert.offload_reservation_bytes(chunk_tokens, hidden),
+            None
+        );
+    }
+
+    // Verifies `has_packed_qtensor_experts` distinguishes packed `QTensor`
+    // storage (the only mode the GPU offload burst handles) from
+    // dequantized per-expert storage.
+    #[test]
+    fn test_has_packed_qtensor_experts() {
+        let (hidden, intermediate, num_experts, topk) = (2usize, 2usize, 4usize, 2usize);
+        let identity = vec![1.0f32, 0.0, 0.0, 1.0];
+        let expert_data = vec![(identity.clone(), identity.clone(), identity.clone()); num_experts];
+        let gate_data = vec![0.0f32; num_experts * hidden];
+
+        let packed = make_packed_sparse_moe(
+            hidden,
+            intermediate,
+            num_experts,
+            topk,
+            false,
+            gate_data.clone(),
+            &expert_data,
+        );
+        assert!(packed.has_packed_qtensor_experts());
+
+        let per_expert = make_sparse_moe(
+            hidden,
+            intermediate,
+            num_experts,
+            topk,
+            false,
+            gate_data,
+            &expert_data,
+        );
+        assert!(!per_expert.has_packed_qtensor_experts());
     }
 
     // GgmlDType::Q4K is a K-quant super-block format (`BLCK_SIZE=256`,

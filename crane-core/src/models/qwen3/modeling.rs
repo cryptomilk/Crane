@@ -48,7 +48,9 @@ use crate::device::{DeviceAssignment, format_budget, greedy_fit_layers, query_gp
 use crate::models::modules::embedding::EmbeddingLayer;
 use crate::models::modules::flash_attn::dispatch_flash_attn;
 use crate::models::modules::kv_cache;
-use crate::models::modules::moe::{MlpOrMoe, MoeConfig, SparseMoeBlock};
+use crate::models::modules::moe::{
+    MlpOrMoe, MoeConfig, SparseMoeBlock, offload_reservation_bytes_for,
+};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::quantized::gguf_metadata::GgufMetadata;
 use crate::utils::DeviceExt;
@@ -1170,7 +1172,15 @@ impl Qwen3Model {
     /// library initialization (rocBLAS/hipRAND/JIT-compiled kernels), then
     /// live-queries free VRAM and greedily promotes CPU-placed `MoE` expert
     /// layers to `main_device` up to `vram_ceiling_bytes` (minus
-    /// `runtime_reservation_bytes`). No-op for non-`MoE` checkpoints.
+    /// `runtime_reservation_bytes` for the KV cache, and minus a `MoE`
+    /// CPU-offload reservation sized for a `chunk_tokens`-token prefill
+    /// chunk — see [`crate::models::modules::moe::offload_reservation_bytes_for`]).
+    /// Reserving the offload headroom here, not just when later sizing the
+    /// KV budget, is what keeps `baseline + kv_budget + offload_reservation`
+    /// from exceeding `vram_ceiling_bytes`: once a layer is promoted its
+    /// weight cost becomes part of the (fixed) baseline, so the ceiling must
+    /// already account for the reservation before promotion decides how
+    /// many layers to place. No-op for non-`MoE` checkpoints.
     ///
     /// A static pre-load VRAM estimate consistently undershoots real usage:
     /// rocBLAS/hipRAND/CUDA JIT lazily initialize on first use, so the real
@@ -1193,6 +1203,7 @@ impl Qwen3Model {
         main_device: &Device,
         vram_ceiling_bytes: u64,
         runtime_reservation_bytes: u64,
+        chunk_tokens: usize,
     ) -> Result<()> {
         let Some(moe_config) = self.config.moe_config() else {
             return Ok(());
@@ -1289,15 +1300,62 @@ impl Qwen3Model {
         let used = total.saturating_sub(free);
         let ceiling = vram_ceiling_bytes.min(total);
         let remaining = ceiling.saturating_sub(used);
-        let available = remaining.saturating_sub(runtime_reservation_bytes);
+        // Reserved even though no layer is known to be CPU-resident yet:
+        // the offload path is only unreachable if every layer ends up
+        // promoted, which the greedy fit below can't guarantee in advance.
+        // Leaving this unreserved would let promotion spend it on GPU
+        // experts, inflating the (fixed) baseline with no room left for the
+        // transient burst once some layers inevitably stay on CPU. Only
+        // charged when the burst is structurally reachable at all: the main
+        // device must support `indexed_moe_forward` (CUDA/ROCm only — Metal
+        // and SYCL always fall through to the CPU batched path) and at
+        // least one MoE layer must store experts as a packed `QTensor`
+        // pair (i-quant and dequantized per-expert storage never use the
+        // burst either). Sized from the max cost among *those* packed-QTensor
+        // layers specifically, not `max_layer_cost` above: a dequantized
+        // per-expert layer's `bf16_per_layer_cost` fallback is always >= any
+        // quantized layer's real cost, so on a checkpoint mixing storage
+        // representations it would otherwise inflate this reservation with a
+        // layer that can never reach the burst path, under-promoting
+        // GPU-resident experts for no benefit. Mirrors the per-layer filter
+        // `moe_offload_reservation_bytes` (the post-promotion counterpart)
+        // already applies via `SparseMoeBlock::offload_reservation_bytes`.
+        let max_packed_layer_cost = self
+            .layers
+            .iter()
+            .zip(layer_raw_costs.iter())
+            .filter_map(|(l, cost)| match &l.mlp {
+                MlpOrMoe::Moe(block) if block.has_packed_qtensor_experts() => *cost,
+                _ => None,
+            })
+            .max();
+        let moe_offload_reservation =
+            if total_moe_layers > 0 && (main_device.is_cuda() || main_device.is_rocm()) {
+                match max_packed_layer_cost {
+                    Some(cost) => offload_reservation_bytes_for(
+                        cost,
+                        chunk_tokens,
+                        moe_config.num_experts_per_tok,
+                        moe_config.moe_intermediate_size,
+                        self.config.hidden_size,
+                    ),
+                    None => 0,
+                }
+            } else {
+                0
+            };
+        let available = remaining
+            .saturating_sub(runtime_reservation_bytes)
+            .saturating_sub(moe_offload_reservation);
         log::info!(
             "Live VRAM on {gpu_location:?} after probe: free={}, total={}, used={}, \
-             available_for_experts={} (configured limit={})",
+             available_for_experts={} (configured limit={}, moe_offload_reservation={})",
             format_budget(free),
             format_budget(total),
             format_budget(used),
             format_budget(available),
             format_budget(vram_ceiling_bytes),
+            format_budget(moe_offload_reservation),
         );
 
         let promoted: std::collections::HashSet<usize> = greedy_fit_layers(&layer_costs, available)
@@ -1353,6 +1411,31 @@ impl Qwen3Model {
             total_moe_layers - gpu_layers,
         );
         Ok(())
+    }
+
+    /// Worst-case transient VRAM one in-flight `MoE` CPU-offload call needs:
+    /// the largest CPU-resident layer's packed weights plus one
+    /// `chunk_tokens`-token prefill chunk's activation buffers, plus a fixed
+    /// fragmentation margin (both folded into
+    /// [`SparseMoeBlock::offload_reservation_bytes`]). 0 if every `MoE`
+    /// layer is already GPU-resident, this isn't a `MoE` model, or
+    /// `main_device` doesn't support the GPU offload burst (CUDA/ROCm
+    /// only — Metal, SYCL, and CPU always fall through to the CPU batched
+    /// path, which needs no GPU VRAM).
+    #[must_use]
+    pub fn moe_offload_reservation_bytes(&self, chunk_tokens: usize, main_device: &Device) -> u64 {
+        if !(main_device.is_cuda() || main_device.is_rocm()) {
+            return 0;
+        }
+        let hidden_size = self.config.hidden_size;
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.mlp {
+                MlpOrMoe::Moe(block) => block.offload_reservation_bytes(chunk_tokens, hidden_size),
+                MlpOrMoe::Dense(_) => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     // ── Forward ─────────────────────────────────────────────────────────
@@ -2019,7 +2102,7 @@ mod tests {
         let mut model = Qwen3Model::new(&cfg, vb).expect("new");
 
         model
-            .promote_experts_to_gpu(&device, 1 << 30, 0)
+            .promote_experts_to_gpu(&device, 1 << 30, 0, 2048)
             .expect("promote_experts_to_gpu");
     }
 
