@@ -6,13 +6,20 @@
 pub mod cuda;
 #[cfg(feature = "metal")]
 pub mod metal;
+#[cfg(all(feature = "rocm", not(feature = "cuda")))]
+pub mod rocm;
 #[cfg(feature = "sycl")]
 pub mod sycl;
 
 /// Experts decoded per batched GEMM in [`indexed_via_gemm`]; bounds the
 /// transient f16 weights (32 x 640 x 2560 x 2 B = 105 MB for
 /// Qwen3.8-Flash-Next).
-#[cfg(any(feature = "sycl", feature = "metal", feature = "cuda"))]
+#[cfg(any(
+    feature = "sycl",
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm"
+))]
 const GEMM_EXPERT_BATCH: usize = 32;
 
 /// Zero-padded activation rows per batched GEMM in [`indexed_via_gemm`]:
@@ -20,7 +27,12 @@ const GEMM_EXPERT_BATCH: usize = 32;
 /// (a few experts taking most tokens) an unbounded batch pads every expert to
 /// the busiest one's count. 8192 rows of a 2560-wide projection are 42 MB of
 /// f16 activations, and as much again for the output.
-#[cfg(any(feature = "sycl", feature = "metal", feature = "cuda"))]
+#[cfg(any(
+    feature = "sycl",
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm"
+))]
 const GEMM_ROW_BUDGET: usize = 8192;
 
 /// Prefill path of the backends' `matvec_indexed` (`MoE` matmul by expert
@@ -37,7 +49,12 @@ const GEMM_ROW_BUDGET: usize = 8192;
 /// pair order.
 ///
 /// Costs one host sync for `ids` (`U32`, flattened).
-#[cfg(any(feature = "sycl", feature = "metal", feature = "cuda"))]
+#[cfg(any(
+    feature = "sycl",
+    feature = "metal",
+    feature = "cuda",
+    feature = "rocm"
+))]
 pub(crate) fn indexed_via_gemm(
     input: &candle_core::Tensor,
     ids: &candle_core::Tensor,

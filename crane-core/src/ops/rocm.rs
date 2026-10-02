@@ -127,15 +127,49 @@ pub unsafe fn launch(
     shared_mem_bytes: u32,
     args: &mut [*mut c_void],
 ) -> Result<()> {
+    // SAFETY: forwarded from this function's own safety contract.
+    unsafe {
+        launch_2d(
+            dev,
+            module,
+            kernel,
+            source,
+            rocm_rs::hip::Dim3::from(grid),
+            rocm_rs::hip::Dim3::from(block),
+            shared_mem_bytes,
+            args,
+        )
+    }
+}
+
+/// [`launch`] for a 2D launch grid, needed by kernels that index an output
+/// dimension and a batch/pair dimension independently (see
+/// `quant_iq::rocm`'s matvec/dequant launchers).
+///
+/// # Safety
+///
+/// Same contract as [`launch`]: `args` must match the kernel's parameter
+/// list exactly, and `grid` must cover every element the kernel writes.
+///
+/// # Errors
+///
+/// Returns an error if `hipcc` fails, if `kernel` is not in `source`, or if
+/// the launch is rejected (an oversized `shared_mem_bytes` or block,
+/// typically).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_2d(
+    dev: &RocmDevice,
+    module: &str,
+    kernel: &str,
+    source: &str,
+    grid: rocm_rs::hip::Dim3,
+    block: rocm_rs::hip::Dim3,
+    shared_mem_bytes: u32,
+    args: &mut [*mut c_void],
+) -> Result<()> {
     let func = dev.get_or_load_custom_func(kernel, module, source)?;
-    func.launch(
-        rocm_rs::hip::Dim3::from(grid),
-        rocm_rs::hip::Dim3::from(block),
-        shared_mem_bytes,
-        Some(dev.stream()),
-        args,
-    )
-    .map_err(|e| candle_core::Error::Msg(format!("{kernel} launch failed: {e}")))
+    func.launch(grid, block, shared_mem_bytes, Some(dev.stream()), args)
+        .map_err(|e| candle_core::Error::Msg(format!("{kernel} launch failed: {e}")))
 }
 
 /// A dtype whose device buffer can be wrapped straight into a
@@ -330,7 +364,8 @@ pub fn wrap_bf16<S: Into<Shape>>(
     wrap(RocmStorageSlice::BF16(buf), dev, shape)
 }
 
-fn wrap<S: Into<Shape>>(slice: RocmStorageSlice, dev: &RocmDevice, shape: S) -> Tensor {
+/// Hand a freshly-wrapped slice back as a Tensor of `shape`, without a copy.
+pub(crate) fn wrap<S: Into<Shape>>(slice: RocmStorageSlice, dev: &RocmDevice, shape: S) -> Tensor {
     Tensor::from_storage(
         Storage::Rocm(RocmStorage {
             slice,
