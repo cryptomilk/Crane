@@ -17,11 +17,11 @@
 
 __device__ __forceinline__ float to_f(float v) { return v; }
 __device__ __forceinline__ float to_f(half v) { return __half2float(v); }
-__device__ __forceinline__ float to_f(nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float to_f(__nv_bfloat16 v) { return __bfloat162float(v); }
 template <typename T> __device__ __forceinline__ T from_f(float v);
 template <> __device__ __forceinline__ float from_f<float>(float v) { return v; }
 template <> __device__ __forceinline__ half from_f<half>(float v) { return __float2half(v); }
-template <> __device__ __forceinline__ nv_bfloat16 from_f<nv_bfloat16>(float v) {
+template <> __device__ __forceinline__ __nv_bfloat16 from_f<__nv_bfloat16>(float v) {
     return __float2bfloat16(v);
 }
 
@@ -129,4 +129,4 @@ __device__ void hc_combine_impl(const T * streams, const T * block, const T * lo
 
 HC_KERNELS(float, f32)
 HC_KERNELS(half, f16)
-HC_KERNELS(nv_bfloat16, bf16)
+HC_KERNELS(__nv_bfloat16, bf16)
