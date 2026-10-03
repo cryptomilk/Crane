@@ -171,7 +171,7 @@ template <int TY> __device__ __forceinline__ size_t row_bytes(int cols) {
 
 __device__ __forceinline__ void store_out(float * p, float v) { *p = v; }
 __device__ __forceinline__ void store_out(half * p, float v) { *p = __float2half(v); }
-__device__ __forceinline__ void store_out(nv_bfloat16 * p, float v) { *p = __float2bfloat16(v); }
+__device__ __forceinline__ void store_out(__nv_bfloat16 * p, float v) { *p = __float2bfloat16(v); }
 
 // `output[p, r] = dot(W_e[r], input[p / x_div])` for `p < pairs`, where `W_e`
 // is expert `e = ids[p]` of `packed`, or the only matrix without ids
@@ -261,4 +261,4 @@ __device__ __forceinline__ void iq_dequant_impl(
 
 IQ_ALL_TYPES(float, f32)
 IQ_ALL_TYPES(half, f16)
-IQ_ALL_TYPES(nv_bfloat16, bf16)
+IQ_ALL_TYPES(__nv_bfloat16, bf16)
