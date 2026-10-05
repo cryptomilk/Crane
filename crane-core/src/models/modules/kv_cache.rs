@@ -153,6 +153,16 @@ impl KvCache {
             Self::Quant(c) => c.current_kv(),
         }
     }
+
+    /// Build an [`FpKvCache`]-backed cache directly from pre-built tensors
+    /// (e.g. padded/stacked batch-decode buffers). `k`/`v` may hold more than
+    /// `seq_len` positions as pre-allocated headroom for subsequent `append`
+    /// calls. Batch-decode orchestration operates on raw FP tensors above the
+    /// cache backend, so this bypasses quantization.
+    #[must_use]
+    pub fn from_fp(k: Tensor, v: Tensor, seq_len: usize) -> Self {
+        Self::Fp(FpKvCache::from_tensors(k, v, seq_len))
+    }
 }
 
 impl Default for KvCache {
@@ -226,6 +236,18 @@ impl FpKvCache {
                 v.narrow(2, 0, self.seq_len)?,
             ))),
             _ => Ok(None),
+        }
+    }
+
+    /// Build a cache directly from pre-built tensors (e.g. padded/stacked
+    /// batch-decode buffers). `k`/`v` may hold more than `seq_len` positions
+    /// as pre-allocated headroom for subsequent `append` calls.
+    #[must_use]
+    pub fn from_tensors(k: Tensor, v: Tensor, seq_len: usize) -> Self {
+        Self {
+            k: Some(k),
+            v: Some(v),
+            seq_len,
         }
     }
 }
