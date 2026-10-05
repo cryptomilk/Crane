@@ -468,8 +468,7 @@ pub(crate) struct KvCacheUpdate {
 /// Append `k`/`v` to a pre-allocated KV cache buffer.
 ///
 /// This is the stateless wrapper around [`grow_append`] that older callers
-/// (qwen3, `GqaAttention`, kugelaudio) use. New code should use [`KvCache`]
-/// directly.
+/// (`GqaAttention`) use. New code should use [`KvCache`] directly.
 ///
 /// # Errors
 ///
