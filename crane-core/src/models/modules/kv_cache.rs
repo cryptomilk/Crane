@@ -137,6 +137,22 @@ impl KvCache {
             Self::Quant(c) => c.byte_size(),
         }
     }
+
+    /// Full cached `(k, v)` view narrowed to the valid span, in the compute
+    /// dtype (dequantized for the `Quant` backend). `None` if empty.
+    ///
+    /// Used by cross-layer KV sharing and batch-decode orchestration, which
+    /// operate on the raw tensors above the cache backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if narrowing or dequantizing the underlying tensors fails.
+    pub fn current_kv(&self) -> Result<Option<(Tensor, Tensor)>> {
+        match self {
+            Self::Fp(c) => c.current_kv(),
+            Self::Quant(c) => c.current_kv(),
+        }
+    }
 }
 
 impl Default for KvCache {
@@ -196,6 +212,21 @@ pub struct FpKvCache {
 impl FpKvCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Full cached `(k, v)` view narrowed to the valid span, or `None` if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if narrowing the underlying tensors fails.
+    pub fn current_kv(&self) -> Result<Option<(Tensor, Tensor)>> {
+        match (&self.k, &self.v) {
+            (Some(k), Some(v)) if self.seq_len > 0 => Ok(Some((
+                k.narrow(2, 0, self.seq_len)?,
+                v.narrow(2, 0, self.seq_len)?,
+            ))),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -264,6 +295,34 @@ impl QuantKvCache {
             seq_len: 0,
             dtype: None,
         }
+    }
+
+    /// Full cached `(k, v)` view narrowed to the valid span and dequantized
+    /// to the compute dtype, or `None` if empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if narrowing or dequantizing the underlying tensors fails.
+    pub fn current_kv(&self) -> Result<Option<(Tensor, Tensor)>> {
+        let (Some(kc), Some(ks), Some(vc), Some(vs), Some(dtype)) = (
+            &self.k_codes,
+            &self.k_scale,
+            &self.v_codes,
+            &self.v_scale,
+            self.dtype,
+        ) else {
+            return Ok(None);
+        };
+        if self.seq_len == 0 {
+            return Ok(None);
+        }
+        let kc = kc.narrow(2, 0, self.seq_len)?;
+        let ks = ks.narrow(2, 0, self.seq_len)?;
+        let vc = vc.narrow(2, 0, self.seq_len)?;
+        let vs = vs.narrow(2, 0, self.seq_len)?;
+        let k = dequantize_per_token(&kc, &ks, self.bits, dtype)?;
+        let v = dequantize_per_token(&vc, &vs, self.bits, dtype)?;
+        Ok(Some((k, v)))
     }
 }
 
