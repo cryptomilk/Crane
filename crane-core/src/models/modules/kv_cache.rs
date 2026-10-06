@@ -220,6 +220,7 @@ pub struct FpKvCache {
 }
 
 impl FpKvCache {
+    /// Creates an empty cache.
     pub fn new() -> Self {
         Self::default()
     }
@@ -306,6 +307,11 @@ pub struct QuantKvCache {
 }
 
 impl QuantKvCache {
+    /// Creates an empty cache quantizing to `bits` bits per element.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bits` is not 4 or 8.
     pub fn new(bits: u32) -> Self {
         assert!(bits == 4 || bits == 8, "QuantKvCache supports 4 or 8 bits");
         Self {
