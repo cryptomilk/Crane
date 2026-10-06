@@ -450,3 +450,575 @@ impl KvCacheBackend for QuantKvCache {
             + tensor_bytes(self.v_scale.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .expect("sub")
+            .abs()
+            .expect("abs")
+            .max_all()
+            .expect("max_all")
+            .to_scalar::<f32>()
+            .expect("to_scalar")
+    }
+
+    /// `[B,H,S,D]` F32 tensor with distinct, monotonically increasing values.
+    fn varying_kv(batch: usize, heads: usize, seq: usize, dim: usize) -> Tensor {
+        let data: Vec<f32> = (0..batch * heads * seq * dim)
+            .map(|i| (i as f32 + 1.0) * 0.01)
+            .collect();
+        Tensor::from_vec(data, (batch, heads, seq, dim), &Device::Cpu).expect("varying_kv")
+    }
+
+    // ── grow_append ────────────────────────────────────────────────────────
+
+    #[test]
+    fn grow_append_first_call_allocates_with_room() {
+        let mut buf: Option<Tensor> = None;
+        let new = varying_kv(1, 4, 8, 64);
+        let view = grow_append(&mut buf, &new, 0).expect("grow_append");
+        assert_eq!(view.dims(), &[1, 4, 8, 64]);
+        let store = buf.expect("buf allocated");
+        assert_eq!(store.dims(), &[1, 4, 8 + ROOM, 64]);
+        assert!(max_abs_diff(&view, &new) < 1e-6);
+    }
+
+    #[test]
+    fn grow_append_fits_in_existing_buffer() {
+        let mut buf: Option<Tensor> = None;
+        let new1 = varying_kv(1, 4, 8, 64);
+        grow_append(&mut buf, &new1, 0).expect("first append");
+        let new2 = varying_kv(1, 4, 1, 64);
+        let view = grow_append(&mut buf, &new2, 8).expect("second append");
+        assert_eq!(view.dims(), &[1, 4, 9, 64]);
+        let store = buf.expect("buf still allocated");
+        assert_eq!(store.dims(), &[1, 4, 8 + ROOM, 64]);
+        let first8 = view.narrow(2, 0, 8).expect("narrow");
+        assert!(max_abs_diff(&first8, &new1) < 1e-6);
+        let last = view.narrow(2, 8, 1).expect("narrow");
+        assert!(max_abs_diff(&last, &new2) < 1e-6);
+    }
+
+    #[test]
+    fn grow_append_overflow_reallocates() {
+        let mut buf: Option<Tensor> = None;
+        let new1 = varying_kv(1, 4, 8, 64);
+        grow_append(&mut buf, &new1, 0).expect("first append"); // buffer = 264
+        let new2 = varying_kv(1, 4, 260, 64); // 8 + 260 = 268 > 264
+        let view = grow_append(&mut buf, &new2, 8).expect("overflow append");
+        assert_eq!(view.dims(), &[1, 4, 268, 64]);
+        let store = buf.expect("buf reallocated");
+        assert_eq!(store.dims(), &[1, 4, 268 + ROOM, 64]);
+        let first8 = view.narrow(2, 0, 8).expect("narrow");
+        assert!(max_abs_diff(&first8, &new1) < 1e-6);
+        let rest = view.narrow(2, 8, 260).expect("narrow");
+        assert!(max_abs_diff(&rest, &new2) < 1e-6);
+    }
+
+    #[test]
+    fn grow_append_exactly_fills_then_overflows() {
+        let mut buf: Option<Tensor> = None;
+        let new1 = varying_kv(1, 4, 8, 64);
+        grow_append(&mut buf, &new1, 0).expect("first append"); // buffer = 264
+        let mut filled = 8usize;
+        for _ in 0..256 {
+            let step = varying_kv(1, 4, 1, 64);
+            let view = grow_append(&mut buf, &step, filled).expect("fill step");
+            filled += 1;
+            assert_eq!(view.dim(2).expect("dim"), filled);
+        }
+        let store = buf.as_ref().expect("buf").clone();
+        assert_eq!(store.dims(), &[1, 4, 264, 64]); // exactly full, no realloc yet
+
+        let overflow_step = varying_kv(1, 4, 1, 64);
+        let view = grow_append(&mut buf, &overflow_step, filled).expect("overflow step");
+        assert_eq!(view.dims(), &[1, 4, 265, 64]);
+        let store = buf.expect("buf reallocated");
+        assert_eq!(store.dims(), &[1, 4, 265 + ROOM, 64]);
+    }
+
+    // ── pack_nibbles / unpack_nibbles ─────────────────────────────────────
+
+    #[test]
+    fn pack_unpack_nibbles_round_trip() {
+        let n: usize = 2 * 3 * 8;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 15) + 1) as f32).collect();
+        let x = Tensor::from_vec(data, (1, 2, 3, 8), &Device::Cpu).expect("from_vec");
+        let packed = pack_nibbles(&x).expect("pack");
+        assert_eq!(packed.dims(), &[1, 2, 3, 4]);
+        assert_eq!(packed.dtype(), DType::U8);
+        let unpacked = unpack_nibbles(&packed).expect("unpack");
+        assert_eq!(unpacked.dims(), &[1, 2, 3, 8]);
+        assert!(max_abs_diff(&unpacked, &x) < 1e-6);
+    }
+
+    #[test]
+    fn pack_nibbles_known_values() {
+        let x = Tensor::from_vec(vec![3.0f32, 12.0, 1.0, 15.0], (1, 1, 1, 4), &Device::Cpu)
+            .expect("from_vec");
+        let packed = pack_nibbles(&x).expect("pack");
+        assert_eq!(packed.dims(), &[1, 1, 1, 2]);
+        assert_eq!(packed.dtype(), DType::U8);
+        let bytes = packed
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<u8>()
+            .expect("to_vec1");
+        assert_eq!(bytes, vec![3 + 12 * 16, 1 + 15 * 16]);
+    }
+
+    // ── quantize_per_token / dequantize_per_token ──────────────────────────
+
+    #[test]
+    fn quantize_dequantize_round_trip_int8() {
+        let x = varying_kv(1, 4, 3, 64);
+        let (codes, scale) = quantize_per_token(&x, 8).expect("quantize");
+        assert_eq!(codes.dims(), &[1, 4, 3, 64]);
+        assert_eq!(codes.dtype(), DType::U8);
+        assert_eq!(scale.dims(), &[1, 4, 3, 1]);
+        assert_eq!(scale.dtype(), DType::F32);
+        let recon = dequantize_per_token(&codes, &scale, 8, DType::F32).expect("dequantize");
+        let diff = max_abs_diff(&recon, &x);
+        assert!(diff < 0.04, "int8 round-trip error too large: {diff}");
+    }
+
+    #[test]
+    fn quantize_dequantize_round_trip_int4() {
+        let x = varying_kv(1, 4, 3, 64);
+        let (codes, scale) = quantize_per_token(&x, 4).expect("quantize");
+        assert_eq!(codes.dims(), &[1, 4, 3, 32]);
+        assert_eq!(codes.dtype(), DType::U8);
+        assert_eq!(scale.dims(), &[1, 4, 3, 1]);
+        let recon = dequantize_per_token(&codes, &scale, 4, DType::F32).expect("dequantize");
+        let diff = max_abs_diff(&recon, &x);
+        assert!(diff < 0.6, "int4 round-trip error too large: {diff}");
+    }
+
+    #[test]
+    fn quantize_dequantize_dtype_preserved() {
+        let x = varying_kv(1, 2, 3, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (codes, scale) = quantize_per_token(&x, 8).expect("quantize");
+        let recon = dequantize_per_token(&codes, &scale, 8, DType::F16).expect("dequantize");
+        assert_eq!(recon.dtype(), DType::F16);
+        assert_eq!(recon.dims(), &[1, 2, 3, 64]);
+    }
+
+    // ── FpKvCache ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn fp_cache_new_is_empty() {
+        let cache = FpKvCache::new();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.byte_size(), 0);
+        assert!(cache.current_kv().expect("current_kv").is_none());
+    }
+
+    #[test]
+    fn fp_cache_append_single_token() {
+        let mut cache = FpKvCache::new();
+        let k = varying_kv(1, 4, 1, 64);
+        let v = (varying_kv(1, 4, 1, 64) + 100.0).expect("shift");
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert_eq!(k_full.dims(), &[1, 4, 1, 64]);
+        assert_eq!(v_full.dims(), &[1, 4, 1, 64]);
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_empty());
+        assert!(max_abs_diff(&k_full, &k) < 1e-6);
+        assert!(max_abs_diff(&v_full, &v) < 1e-6);
+        assert!(cache.byte_size() > 0);
+    }
+
+    #[test]
+    fn fp_cache_append_prefill_then_decode() {
+        let mut cache = FpKvCache::new();
+        let k1 = varying_kv(1, 4, 10, 64);
+        let v1 = varying_kv(1, 4, 10, 64);
+        let (k_full, _) = cache.append(&k1, &v1).expect("prefill");
+        assert_eq!(k_full.dims(), &[1, 4, 10, 64]);
+        assert_eq!(cache.len(), 10);
+
+        let k2 = varying_kv(1, 4, 1, 64);
+        let v2 = varying_kv(1, 4, 1, 64);
+        let (k_full, _) = cache.append(&k2, &v2).expect("decode");
+        assert_eq!(k_full.dims(), &[1, 4, 11, 64]);
+        assert_eq!(cache.len(), 11);
+
+        let first10 = k_full.narrow(2, 0, 10).expect("narrow");
+        assert!(max_abs_diff(&first10, &k1) < 1e-6);
+        let last = k_full.narrow(2, 10, 1).expect("narrow");
+        assert!(max_abs_diff(&last, &k2) < 1e-6);
+    }
+
+    #[test]
+    fn fp_cache_append_batch_gt_one() {
+        let mut cache = FpKvCache::new();
+        let k = varying_kv(2, 4, 3, 64);
+        let v = varying_kv(2, 4, 3, 64);
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert_eq!(k_full.dims(), &[2, 4, 3, 64]);
+        assert_eq!(cache.len(), 3);
+        assert!(max_abs_diff(&k_full, &k) < 1e-6);
+        assert!(max_abs_diff(&v_full, &v) < 1e-6);
+    }
+
+    #[test]
+    fn fp_cache_current_kv_narrows_to_valid_span() {
+        let mut cache = FpKvCache::new();
+        let k = varying_kv(1, 4, 5, 64);
+        let v = varying_kv(1, 4, 5, 64);
+        cache.append(&k, &v).expect("append");
+        let (ck, cv) = cache.current_kv().expect("current_kv").expect("some");
+        assert_eq!(ck.dims(), &[1, 4, 5, 64]);
+        assert_eq!(cv.dims(), &[1, 4, 5, 64]);
+        assert!(max_abs_diff(&ck, &k) < 1e-6);
+    }
+
+    #[test]
+    fn fp_cache_from_tensors_narrows_and_extends() {
+        let k = varying_kv(1, 4, 20, 64);
+        let v = varying_kv(1, 4, 20, 64);
+        let cache = FpKvCache::from_tensors(k.clone(), v.clone(), 12);
+        assert_eq!(cache.len(), 12);
+        let (ck, _) = cache.current_kv().expect("current_kv").expect("some");
+        assert_eq!(ck.dims(), &[1, 4, 12, 64]);
+        let expected = k.narrow(2, 0, 12).expect("narrow");
+        assert!(max_abs_diff(&ck, &expected) < 1e-6);
+        assert!(cache.byte_size() > 0);
+    }
+
+    #[test]
+    fn fp_cache_reset_and_truncate() {
+        let mut cache = FpKvCache::new();
+        let k = varying_kv(1, 4, 10, 64);
+        let v = varying_kv(1, 4, 10, 64);
+        cache.append(&k, &v).expect("append");
+
+        cache.truncate(5);
+        assert_eq!(cache.len(), 5);
+        cache.truncate(100); // beyond len -> no-op
+        assert_eq!(cache.len(), 5);
+
+        let k2 = varying_kv(1, 4, 2, 64);
+        let v2 = varying_kv(1, 4, 2, 64);
+        let (k_full, _) = cache.append(&k2, &v2).expect("append after truncate");
+        assert_eq!(k_full.dims(), &[1, 4, 7, 64]);
+        assert_eq!(cache.len(), 7);
+        let first5 = k_full.narrow(2, 0, 5).expect("narrow");
+        let expected_first5 = k.narrow(2, 0, 5).expect("narrow");
+        assert!(max_abs_diff(&first5, &expected_first5) < 1e-6);
+
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.byte_size(), 0);
+        assert!(cache.current_kv().expect("current_kv").is_none());
+
+        let k3 = varying_kv(1, 4, 3, 64);
+        let v3 = varying_kv(1, 4, 3, 64);
+        let (k_full, _) = cache.append(&k3, &v3).expect("append after reset");
+        assert_eq!(k_full.dims(), &[1, 4, 3, 64]);
+        assert_eq!(cache.len(), 3);
+    }
+
+    // ── QuantKvCache ────────────────────────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "QuantKvCache supports 4 or 8 bits")]
+    fn quant_cache_panics_on_invalid_bits() {
+        let _ = QuantKvCache::new(16);
+    }
+
+    #[test]
+    fn quant_cache_int8_new_is_empty() {
+        let cache = QuantKvCache::new(8);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.byte_size(), 0);
+        assert!(cache.current_kv().expect("current_kv").is_none());
+    }
+
+    #[test]
+    fn quant_cache_int8_append_and_accuracy() {
+        let mut cache = QuantKvCache::new(8);
+        let k = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert_eq!(k_full.dims(), &[1, 4, 1, 64]);
+        assert_eq!(k_full.dtype(), DType::F16);
+        assert_eq!(cache.len(), 1);
+        let diff = max_abs_diff(
+            &k_full.to_dtype(DType::F32).expect("to_f32"),
+            &k.to_dtype(DType::F32).expect("to_f32"),
+        );
+        assert!(diff < 0.05, "int8 reconstruction error too large: {diff}");
+        assert_eq!(v_full.dims(), &[1, 4, 1, 64]);
+    }
+
+    #[test]
+    fn quant_cache_int4_append_and_accuracy() {
+        let mut cache = QuantKvCache::new(4);
+        let k = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, _) = cache.append(&k, &v).expect("append");
+        assert_eq!(k_full.dims(), &[1, 4, 1, 64]);
+        assert_eq!(k_full.dtype(), DType::F16);
+        let diff = max_abs_diff(
+            &k_full.to_dtype(DType::F32).expect("to_f32"),
+            &k.to_dtype(DType::F32).expect("to_f32"),
+        );
+        assert!(diff < 0.6, "int4 reconstruction error too large: {diff}");
+    }
+
+    #[test]
+    fn quant_cache_int8_prefill_then_decode() {
+        let mut cache = QuantKvCache::new(8);
+        let k1 = varying_kv(1, 4, 10, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v1 = varying_kv(1, 4, 10, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, _) = cache.append(&k1, &v1).expect("prefill");
+        assert_eq!(k_full.dims(), &[1, 4, 10, 64]);
+        assert_eq!(cache.len(), 10);
+
+        let k2 = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v2 = varying_kv(1, 4, 1, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, _) = cache.append(&k2, &v2).expect("decode");
+        assert_eq!(k_full.dims(), &[1, 4, 11, 64]);
+        assert_eq!(k_full.dtype(), DType::F16);
+        assert_eq!(cache.len(), 11);
+    }
+
+    #[test]
+    fn quant_cache_int8_current_kv_matches_append() {
+        let mut cache = QuantKvCache::new(8);
+        let k = varying_kv(1, 4, 5, 64);
+        let v = varying_kv(1, 4, 5, 64);
+        let (k_append, v_append) = cache.append(&k, &v).expect("append");
+        let (k_current, v_current) = cache.current_kv().expect("current_kv").expect("some");
+        assert_eq!(k_current.dims(), k_append.dims());
+        assert!(max_abs_diff(&k_current, &k_append) < 1e-6);
+        assert!(max_abs_diff(&v_current, &v_append) < 1e-6);
+    }
+
+    #[test]
+    fn quant_cache_int8_reset_and_truncate() {
+        let mut cache = QuantKvCache::new(8);
+        let k = varying_kv(1, 4, 10, 64);
+        let v = varying_kv(1, 4, 10, 64);
+        cache.append(&k, &v).expect("append");
+
+        cache.truncate(5);
+        assert_eq!(cache.len(), 5);
+
+        let k2 = varying_kv(1, 4, 2, 64);
+        let v2 = varying_kv(1, 4, 2, 64);
+        let (k_full, _) = cache.append(&k2, &v2).expect("append after truncate");
+        assert_eq!(k_full.dims(), &[1, 4, 7, 64]);
+        assert_eq!(cache.len(), 7);
+
+        cache.reset();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.byte_size(), 0);
+        assert!(cache.current_kv().expect("current_kv").is_none());
+
+        let k3 = varying_kv(1, 4, 3, 64);
+        let v3 = varying_kv(1, 4, 3, 64);
+        let (k_full, _) = cache.append(&k3, &v3).expect("append after reset");
+        assert_eq!(k_full.dims(), &[1, 4, 3, 64]);
+    }
+
+    #[test]
+    fn quant_cache_int8_byte_size_smaller_than_fp() {
+        let mut fp_cache = FpKvCache::new();
+        let mut quant_cache = QuantKvCache::new(8);
+        let k = varying_kv(1, 4, 32, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v = varying_kv(1, 4, 32, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        fp_cache.append(&k, &v).expect("fp append");
+        quant_cache.append(&k, &v).expect("quant append");
+        assert!(quant_cache.byte_size() < fp_cache.byte_size());
+    }
+
+    // ── KvCache enum dispatcher ────────────────────────────────────────────
+
+    #[test]
+    fn kv_cache_fp_dispatch_is_lossless() {
+        let mut cache = KvCache::new(KvCacheKind::Fp);
+        let k = varying_kv(1, 4, 3, 64);
+        let v = varying_kv(1, 4, 3, 64);
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert_eq!(cache.len(), 3);
+        assert!(max_abs_diff(&k_full, &k) < 1e-6);
+        assert!(max_abs_diff(&v_full, &v) < 1e-6);
+    }
+
+    #[test]
+    fn kv_cache_int8_dispatch_is_lossy_within_tolerance() {
+        let mut cache = KvCache::new(KvCacheKind::Int8);
+        let k = varying_kv(1, 4, 3, 64);
+        let v = varying_kv(1, 4, 3, 64);
+        let (k_full, _) = cache.append(&k, &v).expect("append");
+        assert_eq!(cache.len(), 3);
+        assert!(max_abs_diff(&k_full, &k) < 0.05);
+    }
+
+    #[test]
+    fn kv_cache_int4_dispatch_is_lossy_within_tolerance() {
+        let mut cache = KvCache::new(KvCacheKind::Int4);
+        let k = varying_kv(1, 4, 3, 64);
+        let v = varying_kv(1, 4, 3, 64);
+        let (k_full, _) = cache.append(&k, &v).expect("append");
+        assert_eq!(cache.len(), 3);
+        assert!(max_abs_diff(&k_full, &k) < 0.6);
+    }
+
+    #[test]
+    fn kv_cache_default_is_fp() {
+        let mut cache = KvCache::default();
+        let k = varying_kv(1, 4, 2, 64);
+        let v = varying_kv(1, 4, 2, 64);
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert!(max_abs_diff(&k_full, &k) < 1e-6);
+        assert!(max_abs_diff(&v_full, &v) < 1e-6);
+    }
+
+    #[test]
+    fn kv_cache_from_fp_narrows_and_extends() {
+        let k = varying_kv(1, 4, 20, 64);
+        let v = varying_kv(1, 4, 20, 64);
+        let mut cache = KvCache::from_fp(k.clone(), v.clone(), 8);
+        assert_eq!(cache.len(), 8);
+        let (ck, _) = cache.current_kv().expect("current_kv").expect("some");
+        assert_eq!(ck.dims(), &[1, 4, 8, 64]);
+
+        let k2 = varying_kv(1, 4, 1, 64);
+        let v2 = varying_kv(1, 4, 1, 64);
+        let (k_full, _) = cache.append(&k2, &v2).expect("append");
+        assert_eq!(k_full.dims(), &[1, 4, 9, 64]);
+        assert_eq!(cache.len(), 9);
+    }
+
+    // ── KvCacheKind::from_env ───────────────────────────────────────────────
+
+    #[test]
+    fn kv_cache_kind_from_env() {
+        // SAFETY: no other test in this crate reads or writes CRANE_KV_QUANT,
+        // and all cases below run sequentially within this single test.
+        unsafe {
+            std::env::set_var("CRANE_KV_QUANT", "int8");
+            assert_eq!(KvCacheKind::from_env(), KvCacheKind::Int8);
+
+            std::env::set_var("CRANE_KV_QUANT", "int4");
+            assert_eq!(KvCacheKind::from_env(), KvCacheKind::Int4);
+
+            std::env::set_var("CRANE_KV_QUANT", "garbage");
+            assert_eq!(KvCacheKind::from_env(), KvCacheKind::Fp);
+
+            std::env::remove_var("CRANE_KV_QUANT");
+            assert_eq!(KvCacheKind::from_env(), KvCacheKind::Fp);
+        }
+    }
+
+    // ── Quant vs Fp accuracy ────────────────────────────────────────────────
+
+    #[test]
+    fn quant_int8_close_to_fp() {
+        let mut fp_cache = FpKvCache::new();
+        let mut quant_cache = QuantKvCache::new(8);
+        let k = varying_kv(1, 4, 3, 64);
+        let v = varying_kv(1, 4, 3, 64);
+        let (k_fp, v_fp) = fp_cache.append(&k, &v).expect("fp append");
+        let (k_quant, v_quant) = quant_cache.append(&k, &v).expect("quant append");
+        assert!(max_abs_diff(&k_quant, &k_fp) < 0.04);
+        assert!(max_abs_diff(&v_quant, &v_fp) < 0.04);
+    }
+
+    #[test]
+    fn quant_int4_close_to_fp() {
+        let mut fp_cache = FpKvCache::new();
+        let mut quant_cache = QuantKvCache::new(4);
+        let k = varying_kv(1, 4, 3, 64);
+        let v = varying_kv(1, 4, 3, 64);
+        let (k_fp, v_fp) = fp_cache.append(&k, &v).expect("fp append");
+        let (k_quant, v_quant) = quant_cache.append(&k, &v).expect("quant append");
+        assert!(max_abs_diff(&k_quant, &k_fp) < 0.6);
+        assert!(max_abs_diff(&v_quant, &v_fp) < 0.6);
+    }
+
+    // ── Dtype edge cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn fp_cache_preserves_f16_dtype() {
+        let mut cache = FpKvCache::new();
+        let k = varying_kv(1, 4, 2, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v = varying_kv(1, 4, 2, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, v_full) = cache.append(&k, &v).expect("append");
+        assert_eq!(k_full.dtype(), DType::F16);
+        assert_eq!(v_full.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn quant_cache_records_and_returns_input_dtype() {
+        let mut cache = QuantKvCache::new(8);
+        let k_f16 = varying_kv(1, 4, 2, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let v_f16 = varying_kv(1, 4, 2, 64)
+            .to_dtype(DType::F16)
+            .expect("to_dtype");
+        let (k_full, _) = cache.append(&k_f16, &v_f16).expect("append f16");
+        assert_eq!(k_full.dtype(), DType::F16);
+
+        cache.reset();
+        let k_f32 = varying_kv(1, 4, 2, 64);
+        let v_f32 = varying_kv(1, 4, 2, 64);
+        let (k_full, _) = cache.append(&k_f32, &v_f32).expect("append f32");
+        assert_eq!(k_full.dtype(), DType::F32);
+    }
+
+    // ── Decode loop simulation ──────────────────────────────────────────────
+
+    #[test]
+    fn quant_int8_twenty_decode_steps() {
+        let mut cache = QuantKvCache::new(8);
+        for _ in 0..20 {
+            let k = varying_kv(1, 4, 1, 64);
+            let v = varying_kv(1, 4, 1, 64);
+            cache.append(&k, &v).expect("decode step");
+        }
+        assert_eq!(cache.len(), 20);
+        let (k, v) = cache.current_kv().expect("current_kv").expect("some");
+        assert_eq!(k.dims(), &[1, 4, 20, 64]);
+        assert_eq!(v.dims(), &[1, 4, 20, 64]);
+    }
+}
