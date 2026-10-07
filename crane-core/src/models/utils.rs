@@ -69,6 +69,7 @@ pub fn build_additive_causal_mask(
 /// which enforces that pattern at the type level — a caller can't pass a
 /// padding or sliding-window mask to a causal-only call site by accident,
 /// the exact mistake a plain `&Tensor` mask parameter invites.
+#[derive(Clone)]
 pub struct CausalMask(Tensor);
 
 impl CausalMask {
