@@ -19,6 +19,7 @@ use candle_nn::{Activation, Embedding, Linear, VarBuilder, embedding, linear_no_
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
+#[cfg(test)]
 use crate::models::utils::build_additive_causal_mask;
 use crate::models::with_tracing::RmsNorm;
 
@@ -208,21 +209,13 @@ impl VoxtralLlm {
 
         let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
 
-        let mask = if seq_len > 1 {
-            Some(build_additive_causal_mask(
-                seq_len,
-                seq_len,
-                0,
-                input_embeds.dtype(),
-                input_embeds.device(),
-            )?)
-        } else {
-            None
-        };
-
         let mut h = input_embeds.clone();
         for layer in &mut self.layers {
-            h = layer.forward(&h, Some((&cos, &sin)), mask.as_ref())?;
+            // Plain causal, no padding mask: this is exactly what
+            // `GqaAttention`'s `causal: true` dispatch already builds
+            // internally, so pass `None` and let it reach the fused kernel
+            // instead of hand-building the same mask here.
+            h = layer.forward(&h, Some((&cos, &sin)), None)?;
         }
 
         self.norm.forward(&h)
