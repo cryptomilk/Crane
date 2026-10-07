@@ -21,7 +21,6 @@ use crate::generation::SpeechOptions;
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
-use crate::models::utils::build_additive_causal_mask;
 use candle_transformers::generation::LogitsProcessor;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -432,27 +431,13 @@ impl CodePredictor {
         let seq_len = inputs_embeds.dim(1)?;
         let (cos, sin) = self.rotary_emb.forward(0, seq_len)?;
 
-        // Build causal mask for the 2-token prefill
-        let causal_mask = if seq_len > 1 {
-            let mut mask_data = vec![0f32; seq_len * seq_len];
-            for i in 0..seq_len {
-                for j in (i + 1)..seq_len {
-                    mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-                }
-            }
-            let mask = Tensor::new(mask_data.as_slice(), device)?
-                .reshape((1, 1, seq_len, seq_len))?
-                .to_dtype(inputs_embeds.dtype())?;
-            Some(mask)
-        } else {
-            None
-        };
-
-        // Forward through layers
+        // Forward through layers. Plain causal, no padding mask: this is
+        // exactly what `GqaAttention`'s `causal: true` dispatch already
+        // builds internally, so pass `None` and let it reach the fused
+        // kernel instead of hand-building the same mask here.
         let mut hidden_states = inputs_embeds;
         for layer in &mut self.layers {
-            hidden_states =
-                layer.forward(&hidden_states, Some((&cos, &sin)), causal_mask.as_ref())?;
+            hidden_states = layer.forward(&hidden_states, Some((&cos, &sin)), None)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
@@ -1469,15 +1454,12 @@ impl Qwen3TTSModel {
                 self.dtype,
             )?;
 
-        // Build causal attention mask for prefill
         let prefill_len = prefill_embeds.dim(1)?;
-        let causal_mask =
-            build_additive_causal_mask(prefill_len, prefill_len, 0, self.dtype, &self.device)?;
-
-        // Prefill with causal mask, positions start at 0
-        let hidden_states = self
-            .talker
-            .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
+        // Prefill, positions start at 0. Plain causal, no padding mask:
+        // this is exactly what `GqaAttention`'s `causal: true` dispatch
+        // already builds internally, so pass `None` and let it reach the
+        // fused kernel instead of hand-building the same mask here.
+        let hidden_states = self.talker.forward_embeds(&prefill_embeds, None, 0)?;
 
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
         let mut all_codes = Vec::new();
@@ -1645,11 +1627,11 @@ impl Qwen3TTSModel {
             )?;
 
         let prefill_len = prefill_embeds.dim(1)?;
-        let causal_mask =
-            build_additive_causal_mask(prefill_len, prefill_len, 0, self.dtype, &self.device)?;
-        let hidden_states = self
-            .talker
-            .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
+        // Plain causal, no padding mask: this is exactly what
+        // `GqaAttention`'s `causal: true` dispatch already builds
+        // internally, so pass `None` and let it reach the fused kernel
+        // instead of hand-building the same mask here.
+        let hidden_states = self.talker.forward_embeds(&prefill_embeds, None, 0)?;
 
         let eos_token_id = self.config.talker_config.codec_eos_token_id as u32;
         let logits_processor = LogitsProcessor::from_sampling(
@@ -1878,11 +1860,11 @@ impl Qwen3TTSModel {
         // KV cache population and attention computation.
         let combined_embeds = Tensor::cat(&[&prefill_embeds, &icl_embed], 1)?;
         let combined_len = combined_embeds.dim(1)?;
-        let causal_mask =
-            build_additive_causal_mask(combined_len, combined_len, 0, self.dtype, &self.device)?;
-        let hidden_states = self
-            .talker
-            .forward_embeds(&combined_embeds, Some(&causal_mask), 0)?;
+        // Plain causal, no padding mask: this is exactly what
+        // `GqaAttention`'s `causal: true` dispatch already builds
+        // internally, so pass `None` and let it reach the fused kernel
+        // instead of hand-building the same mask here.
+        let hidden_states = self.talker.forward_embeds(&combined_embeds, None, 0)?;
         let offset = combined_len;
         let mut past_hidden = hidden_states.narrow(1, hidden_states.dim(1)? - 1, 1)?;
 
