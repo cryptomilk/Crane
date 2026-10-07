@@ -19,6 +19,7 @@ use candle_nn::{Activation, Embedding, Linear, VarBuilder, embedding, linear_no_
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
+use crate::models::utils::build_additive_causal_mask;
 use crate::models::with_tracing::RmsNorm;
 
 use super::model::VoxtralConfig;
@@ -75,23 +76,6 @@ pub fn rename_voxtral_transformer_keys(
             (new_k, v)
         })
         .collect()
-}
-
-// ── Causal mask ───────────────────────────────────────────────────────────────
-
-/// Build a square additive causal attention mask.
-///
-/// Returns shape `[1, 1, seq_len, seq_len]` in `dtype`. Allowed positions
-/// (diagonal and lower triangle) are `0.0`; future positions (upper triangle)
-/// are `f32::NEG_INFINITY` cast to `dtype`.
-fn build_causal_mask(seq_len: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-    let mut data = vec![0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in (i + 1)..seq_len {
-            data[i * seq_len + j] = f32::NEG_INFINITY;
-        }
-    }
-    Tensor::from_vec(data, (1, 1, seq_len, seq_len), device)?.to_dtype(dtype)
 }
 
 // ── VoxtralLlm ────────────────────────────────────────────────────────────────
@@ -225,8 +209,10 @@ impl VoxtralLlm {
         let (cos, sin) = self.rotary_emb.forward(start_pos, seq_len)?;
 
         let mask = if seq_len > 1 {
-            Some(build_causal_mask(
+            Some(build_additive_causal_mask(
                 seq_len,
+                seq_len,
+                0,
                 input_embeds.dtype(),
                 input_embeds.device(),
             )?)
@@ -844,14 +830,14 @@ mod tests {
 
     #[test]
     fn test_causal_mask_shape() {
-        let mask = build_causal_mask(4, DType::F32, &Device::Cpu).expect("mask");
+        let mask = build_additive_causal_mask(4, 4, 0, DType::F32, &Device::Cpu).expect("mask");
         assert_eq!(mask.dims(), &[1, 1, 4, 4]);
     }
 
     #[test]
     fn test_causal_mask_values() {
         // Squeeze to [3, 3] and verify upper triangle is -inf, rest is 0.
-        let mask = build_causal_mask(3, DType::F32, &Device::Cpu)
+        let mask = build_additive_causal_mask(3, 3, 0, DType::F32, &Device::Cpu)
             .expect("mask")
             .squeeze(0)
             .expect("sq0")

@@ -21,6 +21,7 @@ use crate::generation::SpeechOptions;
 use crate::models::modules::attention::{AttentionConfig, RopeMode};
 use crate::models::modules::rotary::RotaryEmbedding;
 use crate::models::modules::transformer::TransformerBlock;
+use crate::models::utils::build_additive_causal_mask;
 use candle_transformers::generation::LogitsProcessor;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -1438,44 +1439,6 @@ impl Qwen3TTSModel {
         self.talker.clear_kv_cache();
     }
 
-    /// Build a lower-triangular causal attention mask.
-    /// Shape: `[1, 1, seq_len, seq_len]`, with 0.0 for allowed and -inf for blocked.
-    fn build_causal_mask(seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
-        let mut mask_data = vec![0f32; seq_len * seq_len];
-        for i in 0..seq_len {
-            for j in (i + 1)..seq_len {
-                mask_data[i * seq_len + j] = f32::NEG_INFINITY;
-            }
-        }
-        let mask = Tensor::new(mask_data.as_slice(), device)?
-            .reshape((1, 1, seq_len, seq_len))?
-            .to_dtype(dtype)?;
-        Ok(mask)
-    }
-
-    /// Build a causal mask for new tokens attending to previous KV cache + themselves.
-    /// Shape: `[1, 1, seq_len, offset + seq_len]`.
-    /// New token i can attend to all positions 0..(offset + i), but not future positions.
-    #[allow(dead_code)]
-    fn build_causal_mask_with_offset(
-        seq_len: usize,
-        offset: usize,
-        device: &Device,
-        dtype: DType,
-    ) -> Result<Tensor> {
-        let full_len = offset + seq_len;
-        let mut mask_data = vec![0f32; seq_len * full_len];
-        for i in 0..seq_len {
-            for j in (offset + i + 1)..full_len {
-                mask_data[i * full_len + j] = f32::NEG_INFINITY;
-            }
-        }
-        let mask = Tensor::new(mask_data.as_slice(), device)?
-            .reshape((1, 1, seq_len, full_len))?
-            .to_dtype(dtype)?;
-        Ok(mask)
-    }
-
     /// Generate speech codec tokens from text.
     ///
     /// Returns a Vec of (`num_code_groups`) tokens per time step.
@@ -1508,7 +1471,8 @@ impl Qwen3TTSModel {
 
         // Build causal attention mask for prefill
         let prefill_len = prefill_embeds.dim(1)?;
-        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
+        let causal_mask =
+            build_additive_causal_mask(prefill_len, prefill_len, 0, self.dtype, &self.device)?;
 
         // Prefill with causal mask, positions start at 0
         let hidden_states = self
@@ -1681,7 +1645,8 @@ impl Qwen3TTSModel {
             )?;
 
         let prefill_len = prefill_embeds.dim(1)?;
-        let causal_mask = Self::build_causal_mask(prefill_len, &self.device, self.dtype)?;
+        let causal_mask =
+            build_additive_causal_mask(prefill_len, prefill_len, 0, self.dtype, &self.device)?;
         let hidden_states = self
             .talker
             .forward_embeds(&prefill_embeds, Some(&causal_mask), 0)?;
@@ -1913,7 +1878,8 @@ impl Qwen3TTSModel {
         // KV cache population and attention computation.
         let combined_embeds = Tensor::cat(&[&prefill_embeds, &icl_embed], 1)?;
         let combined_len = combined_embeds.dim(1)?;
-        let causal_mask = Self::build_causal_mask(combined_len, &self.device, self.dtype)?;
+        let causal_mask =
+            build_additive_causal_mask(combined_len, combined_len, 0, self.dtype, &self.device)?;
         let hidden_states = self
             .talker
             .forward_embeds(&combined_embeds, Some(&causal_mask), 0)?;
