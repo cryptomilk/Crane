@@ -40,9 +40,6 @@ pub fn attention_scale(head_dim: usize) -> f32 {
 /// `0` when `i + kv_offset - window_left <= j <= i + kv_offset + window_right`
 /// and `f32::NEG_INFINITY` otherwise. Shares `kv_offset`'s meaning, and the
 /// per-call allocation caveat, with [`build_additive_causal_mask`].
-// Only reachable via `windowed`, not wired into any model yet either -
-// see this module's doc comment.
-#[allow(dead_code)]
 fn build_windowed_mask(
     q_len: usize,
     kv_len: usize,
@@ -345,9 +342,6 @@ pub(super) fn full_matmul(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Res
 /// # Errors
 ///
 /// See [`causal_without_mask`].
-// Not wired into any model's prefill path yet - see this module's doc
-// comment.
-#[allow(dead_code)]
 pub(super) fn windowed_matmul(
     q: &Tensor,
     k: &Tensor,

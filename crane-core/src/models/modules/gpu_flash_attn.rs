@@ -86,9 +86,30 @@ fn kv_offset(q: &Tensor, k: &Tensor) -> Result<usize> {
 /// documented "incapable of serving this call" contract, instead of
 /// propagating a `validate_fattn_bshd` `Err` for a case that isn't actually
 /// a failure, just an unsupported model shape.
+///
+/// On AMD, `head_dim > 256` is excluded even though it structurally fits
+/// the `{64, 128, 256, 512}` set: `select_mma_ncols`'s doc comment confirms
+/// (via a real hardware exception) that both `AMD_WMMA_AVAILABLE` and
+/// `AMD_MFMA_AVAILABLE` reject `DKQ > 256` unconditionally, so the MMA
+/// kernel never launches there, every call falls through to the scalar
+/// tile kernel. Measured on real ROCm hardware (Gemma4's `head_dim=512`
+/// full-attention layers, `gqa_ratio=8`), that tile-kernel path is slower
+/// than this module's own matmul-SDPA fallback, not just slower than MMA:
+/// a 29904-token prefill dropped from 904.7 tok/s to 131.7 tok/s. Returning
+/// `false` here skips the kernel attempt entirely on AMD for this shape, so
+/// `try_causal`/`try_full`/`try_windowed` go straight to matmul SDPA
+/// instead. NVIDIA CUDA has no such restriction (`is_amd_backend` is a
+/// compile-time, `cuda`-takes-priority check, so this exclusion never
+/// applies to a `cuda`-feature build) and may still reach a real MMA kernel
+/// at `head_dim=512`.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 fn head_dim_supported(q: &Tensor) -> bool {
-    matches!(q.dim(3), Ok(64 | 128 | 256 | 512))
+    use crate::ops::fused_ops::fattn::is_amd_backend;
+
+    match q.dim(3) {
+        Ok(d @ (64 | 128 | 256 | 512)) => !(is_amd_backend() && d > 256),
+        _ => false,
+    }
 }
 
 /// Transposes BHSD to BSHD (zero-copy), casts to this kernel family's
@@ -320,9 +341,6 @@ pub(crate) fn try_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option
 /// (`kv_offset` computed the same way as [`try_causal`]). See
 /// [`try_causal`] for the `None`/`Some` contract and the BHSD/GQA shape
 /// conventions.
-// Not wired into any model's prefill path yet - see `attn_dispatch`'s
-// module doc.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn try_windowed(
     q: &Tensor,
