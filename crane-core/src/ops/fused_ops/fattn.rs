@@ -24,6 +24,33 @@
 
 use candle_core::{DType, Device, Layout, Result, Tensor};
 
+/// Prefix marking a candle error built by [`unsupported_config`]: "this
+/// exact shape/GQA-ratio/mask combination has no instantiated kernel",
+/// an expected static limitation the caller should silently fall back on
+/// -- never a sign of a real runtime failure (a launch rejection, OOM, an
+/// invalid argument, ...). `gpu_flash_attn::run`'s dispatch chain checks
+/// this prefix (via [`is_unsupported_config`]) to decide whether to try
+/// the next kernel tier or propagate the error untouched: silently
+/// swallowing every `mma`/`mma_bf16` error regardless of cause previously
+/// hid genuine kernel-execution failures behind the tile-kernel fallback.
+pub(crate) const UNSUPPORTED_CONFIG_PREFIX: &str = "crane_fattn_unsupported_config: ";
+
+/// Builds a candle error tagged with [`UNSUPPORTED_CONFIG_PREFIX`]. Use
+/// only at call sites where the failure is purely a function of the input
+/// shape (no instantiated kernel for this `(head_dim, gqa_ratio, seq_kv)`,
+/// a GQA shape `select_mma_ncols` can't batch, a tile grid too large for
+/// this `seq_kv`), never for a validation bug or an actual launch/runtime
+/// error.
+pub(crate) fn unsupported_config(msg: impl std::fmt::Display) -> candle_core::Error {
+    candle_core::Error::Msg(format!("{UNSUPPORTED_CONFIG_PREFIX}{msg}"))
+}
+
+/// True when `err` was built via [`unsupported_config`]. See that
+/// function's doc comment.
+pub(crate) fn is_unsupported_config(err: &candle_core::Error) -> bool {
+    err.to_string().starts_with(UNSUPPORTED_CONFIG_PREFIX)
+}
+
 /// Byte-for-byte layout of CUDA/HIP's built-in `uint3` (`struct { unsigned
 /// int x, y, z; }`, 12 bytes, 4-byte aligned, no padding to 16 the way
 /// `uint4` has). The kernel's `ne01` parameter is declared `const uint3
