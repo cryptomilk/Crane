@@ -15,9 +15,8 @@
 
 use candle_core::{D, DType, Module, Result, Tensor};
 use candle_nn::VarBuilder;
-use candle_nn::attention::AttnMask;
 
-use super::flash_attn::dispatch_flash_attn;
+use super::attn_dispatch;
 use super::kv_cache;
 use crate::models::utils::repeat_kv;
 use crate::models::with_tracing::{Linear, RmsNorm, linear_b};
@@ -276,47 +275,27 @@ impl GqaAttention {
         #[allow(clippy::cast_possible_truncation)]
         let scale_f32 = scale as f32;
 
-        if q_seq_len == 1 && b_sz == 1 && q.device().is_cpu() {
-            // ── Fused flash attention for decode (seq_len=1), CPU only ──
-            // candle's cpu_flash kernel streams K/V with online softmax
-            // (O(head_dim) working set instead of materializing an O(S)
-            // scores tensor 3 times), and handles GQA natively via integer
-            // division — no K/V repeat needed. b_sz == 1 only: candle's
-            // flash_attn hard-errors for B>1 with an explicit Mask tensor
-            // (only Causal/None are allowed).
-            return self.flash_attn_decode(&q, &k, &v, attention_mask, scale_f32, b_sz);
-        }
-
         // No unconditional flash-attn prefill fast path here: unlike the
         // qwen3-specific model (always a causal decoder), `GqaAttention` is
         // documented to leave causality entirely up to the caller's
         // `attention_mask` — `None` means full (non-causal) attention, as
         // used by Voxtral's bidirectional `AcousticTransformer`. Guessing
-        // `AttnMask::Causal` whenever the mask is absent would silently
-        // break that contract for any single-sequence CPU caller.
+        // a causal mask whenever the mask is absent would silently break
+        // that contract for any single-sequence CPU caller.
 
-        if n_rep > 1 && q_seq_len == 1 {
-            // ── GQA-grouped SDPA for decode (seq_len=1), GPU fallback ──
-            // Reshape Q to group queries with their KV head instead of
-            // repeating K/V n_rep times.
-            let q_g = (q.reshape((b_sz, self.cfg.n_kv_heads, n_rep, self.cfg.head_dim))? * scale)?;
-            let k_t = k.transpose(2, 3)?;
-            let attn_weights = q_g.matmul(&k_t)?;
-            let attn_weights = match attention_mask {
-                Some(mask) => attn_weights.broadcast_add(mask)?,
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_output = attn_weights.matmul(&v)?;
-
-            // [B, n_kv_heads, n_rep, D] → [B, 1, H*D]; flattening (n_kv_heads,
-            // n_rep, D) matches (H, D) since H = n_kv_heads * n_rep.
+        if q_seq_len == 1 {
+            // ── Decode (seq_len=1) ──
+            // CPU single-sequence decode uses the fused CPU flash-attn
+            // kernel internally. Every other case (GPU, or CPU with more
+            // than one sequence) uses a GQA-grouped reshape that avoids
+            // repeating K/V. See `attn_dispatch::decode`.
+            let attn_output = attn_dispatch::decode(&q, &k, &v, scale_f32, attention_mask)?;
             let attn_output =
                 attn_output.reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
             return self.o_proj.forward(&attn_output);
         }
 
-        // ── Standard SDPA for prefill or when n_rep == 1 ──
+        // ── Standard SDPA for prefill ──
         // Softmax in F32 for numerical stability.
         let k = repeat_kv(k, n_rep)?.contiguous()?;
         let v = repeat_kv(v, n_rep)?.contiguous()?;
@@ -361,49 +340,6 @@ impl GqaAttention {
         self.kv_cache = Some(update.buffer);
         self.cache_seq_len = update.seq_len;
         Ok((update.k, update.v))
-    }
-
-    /// Fused flash-attention decode path: `q_seq_len == 1`, `b_sz == 1`, CPU only.
-    ///
-    /// `q`, `k`, `v` are in `[batch, heads, seq, head_dim]` layout. See the
-    /// call site in [`Self::forward`] for why this path is gated the way it is.
-    fn flash_attn_decode(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        attention_mask: Option<&Tensor>,
-        scale_f32: f32,
-        b_sz: usize,
-    ) -> Result<Tensor> {
-        // Non-contiguous is fine — the decode kernel indexes by stride.
-        let q_bshd = q.transpose(1, 2)?;
-        let k_bshd = k.transpose(1, 2)?;
-        let v_bshd = v.transpose(1, 2)?;
-
-        let mask = match attention_mask {
-            Some(mask) => {
-                debug_assert!(
-                    mask.dim(1).is_ok_and(|d| d == 1),
-                    "CPU flash-attn decode broadcasts one mask row across all heads; \
-                     a mask with head dim != 1 would be silently misapplied"
-                );
-                // AttnMask::Mask takes ownership; Tensor is Arc-backed, so
-                // this is a refcount bump, not a data copy.
-                AttnMask::Mask(mask.clone())
-            },
-            None => AttnMask::None,
-        };
-
-        let attn_output = dispatch_flash_attn(&q_bshd, &k_bshd, &v_bshd, scale_f32, mask)?;
-        // Cast back from F32 before `o_proj` — see `dispatch_flash_attn`'s doc.
-        let attn_output = attn_output.to_dtype(q.dtype())?;
-
-        // flash_attn output is BHSD [B, H, 1, D] → [B, 1, H*D].
-        let attn_output = attn_output
-            .reshape((b_sz, self.cfg.n_heads, self.cfg.head_dim))?
-            .reshape((b_sz, 1, self.cfg.n_heads * self.cfg.head_dim))?;
-        self.o_proj.forward(&attn_output)
     }
 }
 
