@@ -34,8 +34,8 @@ use candle_core::{DType, Layout, Result, Tensor};
 
 use super::fattn::{
     FATTN_KQ_STRIDE, MAX_GRID_X_DIM, gqa_z_tiles, init_fastdiv_values, is_amd_backend, mma_config,
-    mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, q_tiles, select_mma_ncols, select_mma_ncols_bf16,
-    unsupported_config,
+    mma_config_bf16, mma_shared_mem_bytes, mma_shared_mem_bytes_bf16, q_tiles, select_mma_ncols,
+    select_mma_ncols_bf16, unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -310,11 +310,12 @@ impl LaunchGeometry {
     }
 
     /// bf16 counterpart of [`LaunchGeometry::new`]: identical grid/block
-    /// computation (`mma_config`'s tuning tables are shared, see
-    /// `fattn.rs`'s `select_mma_ncols_bf16` doc comment), but sizes shared
-    /// memory via `mma_shared_mem_bytes_bf16` instead, since
-    /// `fattn_mma_bf16.cuh` never enables shared-memory swizzle even on
-    /// NVIDIA (see that file's module doc).
+    /// derivation, but looks up `mma_config_bf16` (its own tuning table,
+    /// see that function's doc comment for how/why it now differs from
+    /// `mma_config` at `(128, 32 | 64)`) and sizes shared memory via
+    /// `mma_shared_mem_bytes_bf16` instead, since `fattn_mma_bf16.cuh`
+    /// never enables shared-memory swizzle even on NVIDIA (see that file's
+    /// module doc).
     #[allow(clippy::too_many_arguments)]
     fn new_bf16(
         dkq: usize,
@@ -326,7 +327,7 @@ impl LaunchGeometry {
         gqa_ratio: usize,
         is_amd: bool,
     ) -> Result<Self> {
-        let cfg = mma_config(dkq, ncols1 * ncols2, is_amd)?;
+        let cfg = mma_config_bf16(dkq, ncols1 * ncols2, is_amd)?;
         let nwarps = cfg.nthreads / 32;
         let ntiles_dst = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
         if ntiles_dst > MAX_GRID_X_DIM {
