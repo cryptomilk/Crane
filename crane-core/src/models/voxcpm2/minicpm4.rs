@@ -138,6 +138,12 @@ impl DecoderLayer {
             },
             use_qk_norm: false,
             norm_eps: cfg.rms_norm_eps,
+            // `MiniCpm4Model::forward`'s `is_causal` param controls masking
+            // at runtime: causal sub-networks (base_lm/residual_lm) always
+            // pass an explicit mask when seq_len > 1, bypassing this flag;
+            // bidirectional sub-networks (feat_encoder/feat_decoder) pass
+            // `None` and rely on this flag for `try_full` dispatch.
+            causal: false,
         };
         let self_attn = GqaAttention::new(attn_cfg, vb.pp("self_attn"))?;
         let mlp = SwiGluFfn::new(
