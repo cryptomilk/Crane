@@ -291,6 +291,52 @@ pub(crate) fn select_mma_ncols(
     Some((ncols1, ncols2))
 }
 
+/// bf16 counterpart of [`mma_ncols1`]: identical except the NVIDIA-only
+/// `ncols2 <= 8 && seq_q <= 8 / ncols2` tier is skipped. `fattn_mma_bf16.cuh`
+/// never instantiates `ncols1*ncols2 == 8` (no bf16 counterpart to the
+/// narrow `cols_per_warp == 8` tile shape — see that file's module doc), so
+/// this always falls through to a tier resolving to a product of at least
+/// 16.
+fn mma_ncols1_bf16(head_dim: usize, seq_q: usize, ncols2: usize, is_amd: bool) -> usize {
+    if ncols2 <= 16 && seq_q <= 16 / ncols2 {
+        return 16 / ncols2;
+    }
+    if seq_q <= 32 / ncols2 || (is_amd && head_dim > 256) {
+        return 32 / ncols2;
+    }
+    64 / ncols2
+}
+
+/// bf16 counterpart of [`select_mma_ncols`]: same shape/GQA rejection rules
+/// (see that function's doc comment), but calls [`mma_ncols1_bf16`] instead
+/// of [`mma_ncols1`] so the result never resolves to `ncols1*ncols2 == 8`.
+/// Reuses [`mma_config`]'s existing tuning tables unchanged: `fattn_mma_bf16.cuh`'s
+/// config tables are copied from the same Ampere/RDNA values (see that
+/// file's module doc), just without the `ncols == 8` entries this function
+/// never queries.
+pub(crate) fn select_mma_ncols_bf16(
+    head_dim: usize,
+    gqa_ratio: usize,
+    seq_q: usize,
+    seq_kv: usize,
+    is_amd: bool,
+) -> Option<(usize, usize)> {
+    if is_amd && head_dim > 256 {
+        return None;
+    }
+    let gqa_opt_applies = seq_kv.is_multiple_of(FATTN_KQ_STRIDE);
+    let ncols2 = mma_ncols2(gqa_ratio, gqa_opt_applies, is_amd);
+    if ncols2 == 1 && (is_amd || head_dim == 512) {
+        return None;
+    }
+    let ncols1 = mma_ncols1_bf16(head_dim, seq_q, ncols2, is_amd);
+    debug_assert!(
+        ncols1 * ncols2 >= 16,
+        "fattn_mma_bf16 requires ncols1*ncols2 >= 16, got {ncols1}*{ncols2}"
+    );
+    Some((ncols1, ncols2))
+}
+
 /// Which kernel family [`select_mma_ncols`] would pick for, i.e. whether a
 /// call with these shapes has an instantiated MMA kernel at all.
 #[must_use]
@@ -312,6 +358,12 @@ pub fn select_kernel(
 /// `fattn_mma_f16.cuh`'s `DECL_FATTN_MMA_F16_CASE` macro.
 pub(crate) fn mma_kernel_name(dkq: usize, ncols1: usize, ncols2: usize) -> String {
     format!("crane_fattn_mma_f16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}")
+}
+
+/// `crane_fattn_mma_bf16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}`. See
+/// `fattn_mma_bf16.cuh`'s `DECL_FATTN_MMA_BF16_CASE` macro.
+pub(crate) fn mma_bf16_kernel_name(dkq: usize, ncols1: usize, ncols2: usize) -> String {
+    format!("crane_fattn_mma_bf16_d{dkq}_v{dkq}_c{ncols1}_s{ncols2}")
 }
 
 /// `crane_fattn_tile_f16_d{dkq}_v{dkq}_c16_s1`. The single `(ncols1,
@@ -382,6 +434,21 @@ pub(crate) fn mma_shared_mem_bytes(
         nbytes_shared_q + nbytes_shared_kv + nbytes_shared_mask
     };
     nbytes_shared_combine.max(rest)
+}
+
+/// bf16 counterpart of [`mma_shared_mem_bytes`]: same formula, but always
+/// passes `is_amd = true` to it regardless of actual architecture.
+/// `fattn_mma_bf16.cuh` never enables shared-memory swizzle or multi-stage
+/// `cp.async` pipelining even on NVIDIA (see that file's module doc), which
+/// is exactly the stride/stage behavior `is_amd = true` already selects in
+/// [`mma_shared_mem_bytes`] and [`tile_stride`].
+pub(crate) fn mma_shared_mem_bytes_bf16(
+    dkq: usize,
+    ncols1: usize,
+    ncols2: usize,
+    cfg: &FattnMmaConfig,
+) -> usize {
+    mma_shared_mem_bytes(dkq, ncols1, ncols2, cfg, true)
 }
 
 /// `ggml_cuda_fattn_smem_swizzle::tile_stride(nbatch_2, cc)`'s host
@@ -721,6 +788,84 @@ mod tests {
         assert_eq!(
             tile_kernel_name(256),
             "crane_fattn_tile_f16_d256_v256_c16_s1"
+        );
+    }
+
+    // select_mma_ncols_bf16 must only ever return (ncols1, ncols2) pairs that
+    // fattn_mma_hd{64,128,256,512}_bf16.cu actually instantiate: the same
+    // sets as instantiated_pairs minus every pair whose product is 8 (no
+    // bf16 kernel instantiates that tile shape — see mma_ncols1_bf16's doc
+    // comment).
+    fn instantiated_pairs_bf16(head_dim: usize) -> &'static [(usize, usize)] {
+        const SWEEP_BF16: &[(usize, usize)] = &[
+            (16, 1),
+            (8, 2),
+            (4, 4),
+            (2, 8),
+            (1, 16),
+            (32, 1),
+            (16, 2),
+            (8, 4),
+            (4, 8),
+            (2, 16),
+            (64, 1),
+            (32, 2),
+            (16, 4),
+            (8, 8),
+            (4, 16),
+        ];
+        const HD512_BF16: &[(usize, usize)] = &[
+            (8, 2),
+            (16, 2),
+            (32, 2),
+            (4, 4),
+            (8, 4),
+            (16, 4),
+            (2, 8),
+            (4, 8),
+            (8, 8),
+        ];
+        if head_dim == 512 {
+            HD512_BF16
+        } else {
+            SWEEP_BF16
+        }
+    }
+
+    #[test]
+    fn select_mma_ncols_bf16_only_picks_instantiated_pairs() {
+        for head_dim in [64usize, 128, 256, 512] {
+            for is_amd in [false, true] {
+                for gqa_ratio in [1usize, 2, 3, 4, 5, 6, 7, 8, 16, 32] {
+                    for seq_q in [1usize, 2, 4, 8, 15, 16, 17, 31, 32, 63, 64, 65, 1024] {
+                        for seq_kv in [1usize, 255, 256, 257, 512, 4096] {
+                            let Some(pair) =
+                                select_mma_ncols_bf16(head_dim, gqa_ratio, seq_q, seq_kv, is_amd)
+                            else {
+                                continue;
+                            };
+                            assert!(
+                                instantiated_pairs_bf16(head_dim).contains(&pair),
+                                "head_dim={head_dim} is_amd={is_amd} gqa_ratio={gqa_ratio} \
+                                 seq_q={seq_q} seq_kv={seq_kv} picked uninstantiated bf16 pair {pair:?}"
+                            );
+                            // The chosen config must also actually exist (bf16
+                            // reuses the same tuning tables as f16).
+                            mma_config(head_dim, pair.0 * pair.1, is_amd).unwrap_or_else(|e| {
+                                panic!("head_dim={head_dim} is_amd={is_amd} pair={pair:?}: {e}")
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mma_bf16_kernel_name_matches_decl_macro_naming() {
+        assert_eq!(
+            mma_bf16_kernel_name(128, 8, 1),
+            "crane_fattn_mma_bf16_d128_v128_c8_s1"
         );
     }
 

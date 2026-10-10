@@ -28,7 +28,9 @@ use candle_core::{Result, Tensor};
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use crate::ops::fused_ops::fattn_mma::{
-    fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_windowed,
+    fattn_mma_bf16_causal, fattn_mma_bf16_causal_with_mask, fattn_mma_bf16_full,
+    fattn_mma_bf16_windowed, fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full,
+    fattn_mma_windowed,
 };
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use crate::ops::fused_ops::fattn_tile::{
@@ -75,6 +77,21 @@ fn mma_disabled() -> bool {
     })
 }
 
+/// Whether `CRANE_DISABLE_BF16_FLASH_ATTN` is set, forcing [`run`] to skip
+/// the native-bf16 MMA kernel and fall through to the existing BF16->F16
+/// cast path. Escape hatch for `fattn_mma_bf16.cuh`, which (unlike the f16
+/// kernel) has no production usage history yet: a kernel that launches but
+/// computes wrong values isn't caught by the launch-error fallback below, so
+/// this gives a way to force the proven cast-to-F16 path without rebuilding.
+/// Same `OnceLock`-cached pattern as [`mma_disabled`].
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn bf16_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("CRANE_DISABLE_BF16_FLASH_ATTN").is_ok_and(|v| !matches!(v.trim(), "" | "0"))
+    })
+}
+
 /// `kv_offset` for continuation prefill against an append-only KV cache:
 /// `k`'s sequence length minus `q`'s, as `AttnMask::Causal`'s CPU-path
 /// counterpart already does. `q`/`k` are BHSD, so the sequence axis is
@@ -117,27 +134,43 @@ fn head_dim_supported(q: &Tensor) -> bool {
     }
 }
 
-/// Transposes BHSD to BSHD (zero-copy), casts to this kernel family's
-/// mixed-precision contract (`q` F32, `k`/`v` F16; see this module's doc
-/// comment), tries `mma` then falls back to `tile`, then transposes the
-/// result back to BHSD (also zero-copy, since both kernels are
-/// stride-aware) and casts back to the caller's original dtype.
+/// Ensures the bf16-kernel-fell-back-to-cast note in [`run`] logs once per
+/// process rather than once per forward pass.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+static BF16_FALLBACK_WARNED: Once = Once::new();
+
+/// Transposes BHSD to BSHD (zero-copy). When `q`'s original dtype is BF16
+/// and native bf16 dispatch isn't disabled (see [`bf16_disabled`]), tries
+/// `mma_bf16` first (`k`/`v` passed through as BF16, no downcast) before
+/// falling through to the cast-based path below; `mma_bf16`'s failure is
+/// silent and falls through only when it is tagged "unsupported config"
+/// (`ops::fused_ops::fattn::is_unsupported_config`: no instantiated kernel
+/// for this shape, a GQA/mask combination the kernel can't serve) — a
+/// genuine runtime failure (a launch rejection, an invalid argument, OOM)
+/// propagates instead, since the cast path exists to serve shapes the
+/// native kernel doesn't cover, not to paper over a real failure.
 ///
-/// `mma`'s failure falls through to `tile` only when it is tagged
-/// "unsupported config" (`ops::fused_ops::fattn::is_unsupported_config`:
-/// unsupported GPU architecture, no instantiated kernel for this
-/// `(head_dim, GQA ratio, seq_q, seq_kv)` shape, an unservable mask/GQA
-/// combination) — a genuine runtime failure (a launch rejection, ...)
-/// propagates instead, matching `try_causal` et al.'s `Option`-style
-/// contract one layer up. A kernel that launches but computes wrong
-/// values returns `Ok` here and is not caught, except the known
-/// `head_dim=64` tile bug this module's doc comment calls out, which
-/// routes to `fallback` instead of calling `tile`.
+/// The cast path then casts to this kernel family's mixed-precision
+/// contract (`q` F32, `k`/`v` F16; see this module's doc comment), tries
+/// `mma` then falls back to `tile`, then transposes the result back to BHSD
+/// (also zero-copy, since both kernels are stride-aware) and casts back to
+/// the caller's original dtype.
+///
+/// `mma`'s failure falls through to `tile` under the same "unsupported
+/// config" rule as `mma_bf16` above (unsupported GPU architecture, no
+/// instantiated kernel for this `(head_dim, GQA ratio, seq_q, seq_kv)`
+/// shape, an unservable mask/GQA combination); any other error (a launch
+/// rejection, ...) propagates rather than falling through, matching
+/// `try_causal` et al.'s `Option`-style contract one layer up. A kernel
+/// that launches but computes wrong values returns `Ok` here and is not
+/// caught, except the known `head_dim=64` tile bug this module's doc
+/// comment calls out, which routes to `fallback` instead of calling `tile`.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 fn run(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
+    mma_bf16: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
     mma: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
     tile: impl FnOnce(&Tensor, &Tensor, &Tensor) -> Result<Tensor>,
     fallback: impl FnOnce() -> Result<Tensor>,
@@ -148,6 +181,31 @@ fn run(
     let q_bshd = q.transpose(1, 2)?;
     let k_bshd = k.transpose(1, 2)?;
     let v_bshd = v.transpose(1, 2)?;
+
+    let finish_bf16 = |out_bshd: Tensor| -> Result<Tensor> { out_bshd.transpose(1, 2) };
+
+    if orig_dtype == DType::BF16 && !bf16_disabled() {
+        // See run's doc comment: ops::rocm::device_ptr requires full
+        // contiguity, which the BHSD->BSHD transpose above doesn't provide
+        // on its own (it only swaps axes 1/2 without moving data).
+        let try_bf16 = (|| {
+            let q_f32 = q_bshd.to_dtype(DType::F32)?;
+            let k_bf16 = k_bshd.contiguous()?;
+            let v_bf16 = v_bshd.contiguous()?;
+            mma_bf16(&q_f32, &k_bf16, &v_bf16)
+        })();
+        match try_bf16 {
+            Ok(out_bshd) => return finish_bf16(out_bshd),
+            Err(e) if crate::ops::fused_ops::fattn::is_unsupported_config(&e) => {
+                BF16_FALLBACK_WARNED.call_once(|| {
+                    log::debug!(
+                        "gpu_flash_attn: native-bf16 MMA kernel unavailable, falling back to the BF16->F16 cast path (logged once): {e}"
+                    );
+                });
+            },
+            Err(e) => return Err(e),
+        }
+    }
 
     // ops::rocm::device_ptr requires full contiguity, not just a contiguous
     // last axis (unlike validate_fattn_bshd's own check): the BHSD->BSHD
@@ -266,6 +324,7 @@ pub fn try_causal(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option<Resu
                 q,
                 k,
                 v,
+                |qf, kf, vf| fattn_mma_bf16_causal(qf, kf, vf, scale, offset),
                 |qf, kf, vf| fattn_mma_causal(qf, kf, vf, scale, offset),
                 |qf, kf, vf| fattn_tile_causal(qf, kf, vf, scale, offset),
                 || super::attn_dispatch::causal_without_mask(q, k, v, scale),
@@ -314,6 +373,9 @@ pub(crate) fn try_causal_with_mask(
                 k,
                 v,
                 |qf, kf, vf| {
+                    fattn_mma_bf16_causal_with_mask(qf, kf, vf, scale, offset, mask.as_tensor())
+                },
+                |qf, kf, vf| {
                     fattn_mma_causal_with_mask(qf, kf, vf, scale, offset, mask.as_tensor())
                 },
                 |qf, kf, vf| {
@@ -343,6 +405,7 @@ pub(crate) fn try_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option
             q,
             k,
             v,
+            |qf, kf, vf| fattn_mma_bf16_full(qf, kf, vf, scale),
             |qf, kf, vf| fattn_mma_full(qf, kf, vf, scale),
             |qf, kf, vf| fattn_tile_full(qf, kf, vf, scale),
             || super::attn_dispatch::full_matmul(q, k, v, scale),
@@ -376,6 +439,9 @@ pub(crate) fn try_windowed(
                 q,
                 k,
                 v,
+                |qf, kf, vf| {
+                    fattn_mma_bf16_windowed(qf, kf, vf, scale, offset, window_left, window_right)
+                },
                 |qf, kf, vf| {
                     fattn_mma_windowed(qf, kf, vf, scale, offset, window_left, window_right)
                 },
