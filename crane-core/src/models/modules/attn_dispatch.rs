@@ -5,14 +5,25 @@
 //! `candle_core`/`candle_nn` ops only, with no `#[cfg(feature = ...)]` gate
 //! anywhere in this file, so every function compiles and runs on every
 //! backend. [`decode`] is wired into every model (`GqaAttention`, Qwen3's
-//! `Attention`). [`causal_without_mask`]/[`causal_with_mask`]/[`full_matmul`]/
-//! [`windowed_matmul`] aren't wired into any model's prefill path yet — they exist
-//! as `gpu_flash_attn`'s fallback tier (unsupported `head_dim`, or no
-//! `cuda`/`rocm` feature compiled) and as the eventual per-layer prefill
-//! path once a model wires one up. `GqaAttention`'s prefill path hand-rolls
-//! its own matmul SDPA independently — unlike Qwen3, it documents `None` as
-//! meaning full non-causal attention, so neither `causal*` function applies
-//! there without an explicit `causal` flag (a future commit).
+//! `Attention`). Qwen3's prefill path calls [`causal`], the single entry
+//! point that tries `gpu_flash_attn`'s fused kernel first and falls back to
+//! this module's matmul SDPA — [`causal_with_mask`]/[`causal_without_mask`]
+//! stay `pub(super)` (visible within `modules/`) for `gpu_flash_attn`'s own
+//! internal fallback, but a model's own attention `forward` should reach for
+//! [`causal`] instead of hand-rolling the try-then-fallback match itself.
+//! The `_with_mask`/`_without_mask` split still exists so a per-layer caller
+//! can't reach for the mask-rebuilding form by accident (see below).
+//! [`full`] and [`windowed`] mirror [`causal`]'s try-then-fallback dispatcher
+//! pattern for the non-causal and sliding-window cases; [`full_matmul`]/
+//! [`windowed_matmul`] are their matmul-only fallback tier, internal to
+//! `modules/`. `GqaAttention`'s no-explicit-mask prefill path calls
+//! [`causal`] for the causal case and [`full`] for the non-causal case
+//! (based on its `AttentionConfig::causal` flag); its explicit-mask path
+//! (continuous-batching padding masks) calls [`prefill_masked`], since
+//! neither `causal*` nor `full` represents an arbitrary additive mask and no
+//! kernel-attempt tier exists for one. [`attention_scale`] computes the
+//! shared `1 / sqrt(head_dim)` scale factor so callers don't each repeat the
+//! cast boilerplate.
 //!
 //! **[`causal_with_mask`] vs. [`causal_without_mask`]: pick based on whether
 //! the mask is shared.** [`causal_without_mask`] builds a fresh
@@ -167,7 +178,12 @@ fn prefill_sdpa(
 ///
 /// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible (GQA
 /// head-count divisibility, matching `head_dim`) or if any tensor op fails.
-pub fn causal_without_mask(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+pub(super) fn causal_without_mask(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
     let q_len = q.dim(2)?;
     let kv_len = k.dim(2)?;
     let kv_offset = kv_len.saturating_sub(q_len);
@@ -190,10 +206,7 @@ pub fn causal_without_mask(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Re
 /// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible (GQA
 /// head-count divisibility, matching `head_dim`), if `mask` isn't
 /// broadcastable to `[B, H_q, q_len, kv_len]`, or if any tensor op fails.
-// Not wired into any model's prefill path yet - see this module's doc
-// comment.
-#[allow(dead_code)]
-pub(crate) fn causal_with_mask(
+pub(super) fn causal_with_mask(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -203,10 +216,139 @@ pub(crate) fn causal_with_mask(
     prefill_sdpa(q, k, v, scale, Some(mask.as_tensor()))
 }
 
+/// Causal prefill SDPA with the best available backend: tries the fused GPU
+/// flash-attn kernel first ([`super::gpu_flash_attn::try_causal`]/
+/// [`try_causal_with_mask`](super::gpu_flash_attn::try_causal_with_mask) —
+/// tensor-core MMA, then scalar kernel), falling back to this module's
+/// matmul SDPA on CPU or when the fused kernel can't serve the call
+/// (unsupported `head_dim`, no `cuda`/`rocm` feature compiled).
+///
+/// `mask` is an optional pre-built additive causal mask (see
+/// [`build_additive_causal_mask`]), and **must encode exactly the plain
+/// shifted-diagonal causal pattern** (`j <= i + kv_offset`, nothing else) —
+/// the same pattern [`build_additive_causal_mask`] itself builds. When
+/// `Some`, both the fused-kernel path (threaded straight into the kernel via
+/// [`try_causal_with_mask`](super::gpu_flash_attn::try_causal_with_mask),
+/// instead of rebuilding an equivalent mask from `kv_offset` on every call —
+/// this kernel family's mask build is `O(q_len * kv_len)`, so sharing one
+/// built once per forward pass across every layer, as described below, is
+/// the whole reason this path exists) and the matmul-SDPA fallback (via
+/// [`causal_with_mask`]) read `mask` directly. Despite the fused path now
+/// genuinely reading `mask`'s contents, it still must be exactly the plain
+/// causal pattern: `try_causal`/`try_causal_with_mask`'s analytic `KV_max`
+/// bound (the per-tile KV-loop truncation that makes the fused kernel fast)
+/// is derived purely from `kv_offset`, assuming this exact pattern,
+/// independent of what `mask` itself contains — a mask that folds in
+/// anything beyond plain causality (e.g. continuous-batching padding, a
+/// sliding window) would still apply correctly on the matmul-SDPA fallback
+/// (which has no `KV_max` concept) but could have its extra masking
+/// silently defeated by a `KV_max` bound computed as if it weren't there, a
+/// backend-dependent correctness divergence only visible on `cuda`/`rocm`
+/// hardware. Use [`prefill_masked`] for an arbitrary mask instead. Per-layer
+/// callers in a decoder stack (every layer shares the same
+/// `q_len`/`kv_len`/`kv_offset`) should build the mask once per forward pass
+/// and pass `Some` here — see [`causal_with_mask`]'s doc for why a per-layer
+/// rebuild regressed throughput. Pass `None` only for a caller with no
+/// shared mask to reuse.
+///
+/// # Errors
+///
+/// Returns a candle error under the same conditions as [`causal_without_mask`],
+/// plus any error the fused-kernel dispatch itself returns on the
+/// `cuda`/`rocm` success path (see
+/// [`super::gpu_flash_attn::try_causal`]).
+pub fn causal(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: Option<&CausalMask>,
+) -> Result<Tensor> {
+    let gpu_result = match mask {
+        Some(m) => super::gpu_flash_attn::try_causal_with_mask(q, k, v, scale, m),
+        None => super::gpu_flash_attn::try_causal(q, k, v, scale),
+    };
+    match gpu_result {
+        Some(result) => result,
+        None => {
+            if mask.is_none() && q.dim(0)? == 1 {
+                return causal_cpu_flash(q, k, v, scale);
+            }
+            match mask {
+                Some(m) => causal_with_mask(q, k, v, scale, m),
+                None => causal_without_mask(q, k, v, scale),
+            }
+        },
+    }
+}
+
+/// CPU single-sequence causal prefill: BHSD->BSHD, `dispatch_flash_attn`
+/// with `AttnMask::Causal`, cast the kernel's F32 output back to `q`'s
+/// dtype, return BHSD. Avoids materializing the full
+/// `[B, H_q, q_len, kv_len]` score matrix that [`causal_without_mask`]'s
+/// matmul path would, mirroring [`decode_cpu_flash`]'s CPU fast path for
+/// the prefill case.
+fn causal_cpu_flash(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    let q_bshd = q.transpose(1, 2)?;
+    let k_bshd = k.transpose(1, 2)?;
+    let v_bshd = v.transpose(1, 2)?;
+    let kv_offset = k.dim(2)?.saturating_sub(q.dim(2)?);
+
+    let out = dispatch_flash_attn(
+        &q_bshd,
+        &k_bshd,
+        &v_bshd,
+        scale,
+        AttnMask::Causal { kv_offset },
+    )?;
+    // dispatch_flash_attn always accumulates and returns F32 regardless of
+    // input dtype.
+    out.to_dtype(q.dtype())
+}
+
+/// Non-causal (full, bidirectional) attention dispatcher: tries the fused
+/// GPU flash-attn kernel first ([`super::gpu_flash_attn::try_full`]),
+/// falling back to [`full_matmul`] on CPU or when the fused kernel can't
+/// serve the call. See [`causal`] for the general dispatcher pattern.
+///
+/// # Errors
+///
+/// See [`full_matmul`], plus any error the fused-kernel dispatch itself
+/// returns on the `cuda`/`rocm` success path.
+pub fn full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
+    match super::gpu_flash_attn::try_full(q, k, v, scale) {
+        Some(result) => result,
+        None => full_matmul(q, k, v, scale),
+    }
+}
+
+/// Sliding-window attention dispatcher: tries the fused GPU flash-attn
+/// kernel first ([`super::gpu_flash_attn::try_windowed`]), falling back to
+/// [`windowed_matmul`] on CPU or when the fused kernel can't serve the
+/// call. See [`causal`] for the general dispatcher pattern.
+///
+/// # Errors
+///
+/// See [`windowed_matmul`], plus any error the fused-kernel dispatch itself
+/// returns on the `cuda`/`rocm` success path.
+pub fn windowed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    window_left: usize,
+    window_right: usize,
+) -> Result<Tensor> {
+    match super::gpu_flash_attn::try_windowed(q, k, v, scale, window_left, window_right) {
+        Some(result) => result,
+        None => windowed_matmul(q, k, v, scale, window_left, window_right),
+    }
+}
+
 /// Non-causal (full, bidirectional) matmul-only SDPA: every query attends to
 /// every key. See [`causal_without_mask`] for the error contract and shape
 /// conventions. Internal to `modules/` — [`gpu_flash_attn`](super::gpu_flash_attn)'s
-/// `try_full` fallback is the only caller; model code should call `full`
+/// `try_full` fallback is the only caller; model code should call [`full`]
 /// (the dispatcher) instead.
 ///
 /// # Errors
@@ -442,6 +584,13 @@ mod tests {
         Tensor::randn(0f32, 1f32, shape, device).unwrap()
     }
 
+    // attention_scale() must compute 1/sqrt(head_dim).
+    #[test]
+    fn attention_scale_matches_formula() {
+        assert!((attention_scale(64) - 0.125).abs() < 1e-6);
+        assert!((attention_scale(128) - (1.0 / 128f32.sqrt())).abs() < 1e-6);
+    }
+
     // causal_without_mask() with q_len == kv_len must match a naive causal reference.
     #[test]
     fn causal_matches_naive() {
@@ -475,7 +624,7 @@ mod tests {
         assert_close(&got, &want, 1e-4);
     }
 
-    // causal_with_mask() given the exact mask build_causal_mask() builds
+    // causal_with_mask() given the exact mask build_additive_causal_mask() builds
     // must match causal_without_mask()'s own (self-built) output byte-for-byte — this is
     // the shared-mask path Qwen3's decode() relies on to avoid rebuilding
     // the mask once per layer, so it must compute exactly the same thing as
@@ -496,6 +645,41 @@ mod tests {
         assert_close(
             &got,
             &want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            0.0,
+        );
+    }
+
+    // causal() on CPU (no GPU feature compiled) with b_sz == 1 and no mask
+    // must take the causal_cpu_flash path and match a naive reference
+    // (tolerance, not exact: dispatch_flash_attn accumulates in F32
+    // internally, a different numerical path than causal_without_mask's
+    // matmul SDPA). With an explicit mask it must still fall through to
+    // causal_with_mask exactly, matching gpu_flash_attn's
+    // try_causal/try_causal_with_mask contract for CPU.
+    #[test]
+    fn causal_cpu_matches_direct_calls() {
+        let device = Device::Cpu;
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 3, 9, 8usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let q = randn((b, hq, sq, d), &device);
+        let k = randn((b, hkv, skv, d), &device);
+        let v = randn((b, hkv, skv, d), &device);
+
+        let want_no_mask = naive_attention_bhsd(&q, &k, &v, scale, true, kv_offset, None);
+        let got_no_mask = causal(&q, &k, &v, scale, None).unwrap();
+        assert_close(&got_no_mask, &want_no_mask, 1e-3);
+
+        let mask = CausalMask::new(sq, skv, kv_offset, DType::F32, &device).unwrap();
+        let want_with_mask = causal_with_mask(&q, &k, &v, scale, &mask).unwrap();
+        let got_with_mask = causal(&q, &k, &v, scale, Some(&mask)).unwrap();
+        assert_close(
+            &got_with_mask,
+            &want_with_mask
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
             0.0,
         );
     }
@@ -529,6 +713,48 @@ mod tests {
         let want = naive_attention_bhsd(&q, &k, &v, scale, false, kv_offset, Some((3, 0)));
         let got = windowed_matmul(&q, &k, &v, scale, 3, 0).unwrap();
         assert_close(&got, &want, 1e-4);
+    }
+
+    // full() on CPU (no GPU feature compiled) must fall through to
+    // full_matmul() exactly, matching gpu_flash_attn's try_full contract
+    // for CPU.
+    #[test]
+    fn full_dispatcher_cpu_matches_full_matmul() {
+        let device = Device::Cpu;
+        let (b, hq, hkv, s, d) = (1, 2, 2, 5, 8usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let q = randn((b, hq, s, d), &device);
+        let k = randn((b, hkv, s, d), &device);
+        let v = randn((b, hkv, s, d), &device);
+
+        let want = full_matmul(&q, &k, &v, scale).unwrap();
+        let got = full(&q, &k, &v, scale).unwrap();
+        assert_close(
+            &got,
+            &want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            0.0,
+        );
+    }
+
+    // windowed() on CPU (no GPU feature compiled) must fall through to
+    // windowed_matmul() exactly, matching gpu_flash_attn's try_windowed
+    // contract for CPU.
+    #[test]
+    fn windowed_dispatcher_cpu_matches_windowed_matmul() {
+        let device = Device::Cpu;
+        let (b, hq, hkv, sq, skv, d) = (1, 2, 2, 4, 12, 8usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let q = randn((b, hq, sq, d), &device);
+        let k = randn((b, hkv, skv, d), &device);
+        let v = randn((b, hkv, skv, d), &device);
+
+        let want = windowed_matmul(&q, &k, &v, scale, 3, 0).unwrap();
+        let got = windowed(&q, &k, &v, scale, 3, 0).unwrap();
+        assert_close(
+            &got,
+            &want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            0.0,
+        );
     }
 
     // GQA ratio > 1 must be handled correctly by causal_without_mask()'s repeat_kv expansion.
@@ -704,5 +930,256 @@ mod tests {
             .unwrap();
         let got_flat = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got_flat, want);
+    }
+}
+
+/// End-to-end coverage of [`causal`], [`full`], and [`windowed`] on a real
+/// GPU (this machine's ROCm GPU, or a CUDA GPU when built with
+/// `--features cuda` elsewhere), exercising the fused-kernel dispatch tier
+/// that this file's CPU-only `tests` module can't reach — `gpu_flash_attn`'s
+/// own `gpu_tests` already cover `try_causal`/`try_causal_with_mask`/
+/// `try_full`/`try_windowed` directly, this module checks each dispatcher's
+/// wrapper on top of them.
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+mod gpu_tests {
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::ops::softmax_last_dim;
+
+    use super::{causal, full, windowed};
+    use crate::ops::fused_ops::fattn::test_support::test_gpu_device;
+
+    /// `softmax(q @ k^T * scale [+ mask]) @ v` in F32 on the CPU, BHSD
+    /// layout, with explicit GQA expansion — the same reference this
+    /// module's CPU-only tests use. `causal`/`window` select the masking
+    /// pattern the same way as the CPU `tests` module's helper of the same
+    /// name: no mask when `causal` is false and `window` is `None`.
+    fn naive_attention_bhsd(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        causal: bool,
+        kv_offset: usize,
+        window: Option<(usize, usize)>,
+    ) -> Vec<f32> {
+        let (b, hq, sq, d) = q.dims4().unwrap();
+        let (_, hkv, skv, _) = k.dims4().unwrap();
+        let n_rep = hq / hkv;
+
+        let expand_kv = |t: &Tensor| {
+            t.unsqueeze(2)
+                .unwrap()
+                .expand((b, hkv, n_rep, skv, d))
+                .unwrap()
+                .reshape((b, hq, skv, d))
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        let k = expand_kv(k);
+        let v = expand_kv(v);
+
+        let scores = (q.matmul(&k.transpose(2, 3).unwrap()).unwrap() * f64::from(scale)).unwrap();
+        let scores = if !causal && window.is_none() {
+            scores
+        } else {
+            let mut mask_vals = vec![0f32; sq * skv];
+            for i in 0..sq {
+                for j in 0..skv {
+                    let rel = j as i64 - (i as i64 + kv_offset as i64);
+                    let valid = match window {
+                        Some((left, right)) => rel >= -(left as i64) && rel <= right as i64,
+                        None => rel <= 0,
+                    };
+                    mask_vals[i * skv + j] = if valid { 0.0 } else { f32::NEG_INFINITY };
+                }
+            }
+            let mask = Tensor::from_vec(mask_vals, (1, 1, sq, skv), q.device()).unwrap();
+            scores.broadcast_add(&mask).unwrap()
+        };
+        let probs = softmax_last_dim(&scores).unwrap();
+        probs
+            .matmul(&v)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn got_vec(t: Tensor) -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    fn assert_close(got: &[f32], want: &[f32], tol: f32) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= tol * w.abs().max(1.0),
+                "[{i}] got {g}, want {w}"
+            );
+        }
+    }
+
+    // causal() with no mask on a real ROCm GPU must take the fused-kernel
+    // tier (not the matmul-SDPA fallback) and match the naive reference.
+    #[test]
+    fn causal_gpu_no_mask_matches_reference() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, true, kv_offset, None);
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+
+        let got = causal(&q, &k, &v, scale, None).unwrap();
+        assert_eq!(got.dims(), &[b, hq, sq, d]);
+        assert_close(&got_vec(got), &want, 3e-2);
+    }
+
+    // causal() with a shared pre-built mask on a real ROCm GPU must take the
+    // Some(mask) branch (try_causal_with_mask, not try_causal) and still
+    // match the naive reference — the fused kernel now reads the mask
+    // tensor directly (see try_causal_with_mask's doc comment), so this also
+    // guards that the Some(mask) dispatch arm is wired to the right
+    // gpu_flash_attn function and that the mask it threads through is
+    // correct, not just present.
+    #[test]
+    fn causal_gpu_with_mask_matches_reference() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, true, kv_offset, None);
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let mask =
+            crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F16, &rocm).unwrap();
+
+        let got = causal(&q, &k, &v, scale, Some(&mask)).unwrap();
+        assert_eq!(got.dims(), &[b, hq, sq, d]);
+        assert_close(&got_vec(got), &want, 3e-2);
+    }
+
+    // full() on a real ROCm GPU must take the fused-kernel tier (not the
+    // matmul-SDPA fallback) and match the naive bidirectional reference.
+    #[test]
+    fn full_gpu_matches_reference() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, s, d) = (1, 4, 2, 20, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, s, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, s, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, s, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, false, 0, None);
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+
+        let got = full(&q, &k, &v, scale).unwrap();
+        assert_eq!(got.dims(), &[b, hq, s, d]);
+        assert_close(&got_vec(got), &want, 3e-2);
+    }
+
+    // windowed() on a real ROCm GPU must take the fused-kernel tier (not the
+    // matmul-SDPA fallback) and match the naive sliding-window reference.
+    #[test]
+    fn windowed_gpu_matches_reference() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+        let (window_left, window_right) = (20, 0);
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            false,
+            kv_offset,
+            Some((window_left, window_right)),
+        );
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+
+        let got = windowed(&q, &k, &v, scale, window_left, window_right).unwrap();
+        assert_eq!(got.dims(), &[b, hq, sq, d]);
+        assert_close(&got_vec(got), &want, 3e-2);
     }
 }
