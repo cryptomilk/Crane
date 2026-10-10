@@ -323,6 +323,7 @@ impl CodePredictor {
                 rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
+                causal: true,
             };
             layers.push(TransformerBlock::new(
                 &attn_cfg,
@@ -553,6 +554,7 @@ impl TalkerModel {
                 rope_mode: RopeMode::HalfSplit,
                 use_qk_norm: true,
                 norm_eps: config.rms_norm_eps,
+                causal: true,
             };
             layers.push(TransformerBlock::new(
                 &attn_cfg,
