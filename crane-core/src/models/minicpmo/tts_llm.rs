@@ -149,6 +149,7 @@ impl MiniCpmTts {
             rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: 1e-6, // HF LlamaConfig default; MiniCPMTTSConfig doesn't override it.
+            causal: true,
         };
         let vb_layers = vb.pp("model").pp("layers");
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -249,6 +250,7 @@ impl MiniCpmTts {
             rope_mode: RopeMode::HalfSplit,
             use_qk_norm: false,
             norm_eps: 1e-6,
+            causal: true,
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);

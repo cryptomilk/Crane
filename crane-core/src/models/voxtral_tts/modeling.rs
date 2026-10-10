@@ -159,6 +159,7 @@ impl VoxtralLlm {
             rope_mode: RopeMode::Interleaved,
             use_qk_norm: false,
             norm_eps: cfg.norm_eps,
+            causal: true,
         };
 
         let layers = (0..cfg.n_layers)
@@ -446,6 +447,7 @@ impl AcousticTransformer {
             rope_mode: RopeMode::None,
             use_qk_norm: false,
             norm_eps: cfg.norm_eps,
+            causal: false,
         };
 
         let ac_vb = vb.pp("acoustic_transformer");

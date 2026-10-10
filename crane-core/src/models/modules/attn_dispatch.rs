@@ -1,69 +1,21 @@
 // SPDX-License-Identifier: MIT
-//! Backend-agnostic matmul SDPA, usable as a fallback when `gpu_flash_attn`'s
-//! fused kernels can't serve a call (CPU device, unsupported `head_dim`, or
-//! no `cuda`/`rocm` feature compiled). Metal and SYCL always land here. Plain
-//! `candle_core`/`candle_nn` ops only, with no `#[cfg(feature = ...)]` gate
-//! anywhere in this file, so every function compiles and runs on every
-//! backend. [`decode`] is wired into every model (`GqaAttention`, Qwen3's
-//! `Attention`). Qwen3's prefill path calls [`causal`], the single entry
-//! point that tries `gpu_flash_attn`'s fused kernel first and falls back to
-//! this module's matmul SDPA — [`causal_with_mask`]/[`causal_without_mask`]
-//! stay `pub(super)` (visible within `modules/`) for `gpu_flash_attn`'s own
-//! internal fallback, but a model's own attention `forward` should reach for
-//! [`causal`] instead of hand-rolling the try-then-fallback match itself.
-//! The `_with_mask`/`_without_mask` split still exists so a per-layer caller
-//! can't reach for the mask-rebuilding form by accident (see below).
-//! [`full`] and [`windowed`] mirror [`causal`]'s try-then-fallback dispatcher
-//! pattern for the non-causal and sliding-window cases; [`full_matmul`]/
-//! [`windowed_matmul`] are their matmul-only fallback tier, internal to
-//! `modules/`. `GqaAttention`'s no-explicit-mask prefill path calls
-//! [`causal`] for the causal case and [`full`] for the non-causal case
-//! (based on its `AttentionConfig::causal` flag); its explicit-mask path
-//! (continuous-batching padding masks) calls [`prefill_masked`], since
-//! neither `causal*` nor `full` represents an arbitrary additive mask and no
-//! kernel-attempt tier exists for one. [`attention_scale`] computes the
-//! shared `1 / sqrt(head_dim)` scale factor so callers don't each repeat the
-//! cast boilerplate.
+//! Backend-agnostic matmul SDPA. Pure `candle_core`/`candle_nn` ops, no
+//! feature gates. Compiles and runs on every backend (CPU, CUDA, `ROCm`,
+//! Metal, SYCL).
 //!
-//! **[`causal_with_mask`] vs. [`causal_without_mask`]: pick based on whether
-//! the mask is shared.** [`causal_without_mask`] builds a fresh
-//! `O(q_len * kv_len)` mask (and, on GPU, re-uploads it) on every call —
-//! correct for an occasional caller (`gpu_flash_attn`'s fallback, where no
-//! shared mask exists), but wrong for a decoder stack calling it once per
-//! layer per forward pass, where every layer shares the same
-//! `q_len`/`kv_len`/`kv_offset` and so the exact same mask: rebuilding it
-//! per layer would regress GPU prefill throughput measurably the same way
-//! upcasting `attn_weights` did (see below) — build the mask once per
-//! forward pass and call [`causal_with_mask`] with it instead, once a
-//! caller needs this. [`full_matmul`]/[`windowed_matmul`] only have a
-//! self-building form so far (reachable via `gpu_flash_attn`'s
-//! `try_full`/`try_windowed` fallback, no direct per-layer model call site
-//! yet) — add a `_with_mask` sibling if one ever gets a per-layer caller.
+//! Public entry points (models call these, not the `pub(super)` helpers):
+//! - [`causal`], [`full`], [`windowed`] try `gpu_flash_attn`'s fused kernel
+//!   first and fall back internally on CPU or unsupported `head_dim`.
+//! - [`decode`] handles the `seq_len == 1` case with a GQA-grouped reshape
+//!   that avoids expanding K/V.
+//! - [`prefill_masked`] applies an arbitrary additive mask (e.g. continuous-
+//!   batching padding) with no fused-kernel attempt.
+//! - [`attention_scale`] computes `1 / sqrt(head_dim)`.
 //!
-//! [`causal_without_mask`], [`causal_with_mask`], [`full_matmul`], and
-//! [`windowed_matmul`] mirror `gpu_flash_attn`'s `try_causal`/`try_full`/`try_windowed` in shape
-//! and BHSD convention, but always succeed (no `Option`) and never require a
-//! specific `head_dim` or backend. [`decode`] covers the `seq_len == 1`
-//! case: CPU single-sequence decode delegates to the existing CPU
-//! flash-attn dispatch (`super::flash_attn::dispatch_flash_attn`);
-//! everything else (GPU, or CPU with more than one sequence) uses a
-//! GQA-grouped reshape that avoids expanding K/V.
+//! [`causal_with_mask`], [`causal_without_mask`], [`full_matmul`], and
+//! [`windowed_matmul`] are `pub(super)` fallback helpers for `gpu_flash_attn`.
 //!
-//! **Softmax runs in native dtype, not F32.** An earlier version of
-//! `prefill_sdpa` upcast the full `[B, H_q, q_len, kv_len]` score tensor to
-//! F32 around softmax, matching `GqaAttention`'s existing prefill behavior.
-//! That tensor is `H_q` times larger than the mask, and upcasting it
-//! measurably regressed GPU prefill throughput for long contexts (confirmed
-//! via `crane-serve`); seeing it caught on real hardware this early, before
-//! more callers piled onto this fallback, is why `prefill_sdpa` now casts
-//! only the mask (to `attn_weights`' native dtype — `NEG_INFINITY`/`0.0` are
-//! exact in every float format, so this loses nothing) instead. [`decode`]'s
-//! GQA-grouped-matmul path never upcast either, for the same reason: this
-//! matches Qwen3's prior GPU decode path for every `n_rep`, and matches
-//! `GqaAttention`'s prior GPU decode path only for `n_rep > 1`;
-//! `GqaAttention`'s `n_rep == 1` decode previously fell through to its own
-//! (separate, untouched) F32-upcasting prefill SDPA, so this consolidation
-//! drops that upcast for the `n_rep == 1` decode case.
+//! Softmax runs in native dtype, not F32, to avoid regressing GPU throughput.
 
 use candle_core::{D, DType, Device, Result, Tensor};
 use candle_nn::attention::AttnMask;
@@ -320,6 +272,30 @@ pub fn full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
         Some(result) => result,
         None => full_matmul(q, k, v, scale),
     }
+}
+
+/// Matmul SDPA with a caller-provided arbitrary additive mask (e.g.
+/// continuous-batching padding) — no kernel-attempt tier, since the fused
+/// GPU kernels only support causal/full/windowed patterns, not arbitrary
+/// masks. `mask` must be broadcastable to `[B, H_q, q_len, kv_len]`; unlike
+/// [`causal`]'s `mask` parameter, this one is applied as-is, with no
+/// assumption about its pattern. See [`prefill_sdpa`]'s doc comment for why
+/// the mask is cast to `attn_weights`' native dtype rather than upcasting
+/// `attn_weights` to F32.
+///
+/// # Errors
+///
+/// Returns a candle error if `q`/`k`/`v`'s shapes are incompatible (GQA
+/// head-count divisibility, matching `head_dim`), if `mask` isn't
+/// broadcastable to `[B, H_q, q_len, kv_len]`, or if any tensor op fails.
+pub fn prefill_masked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    mask: &Tensor,
+) -> Result<Tensor> {
+    prefill_sdpa(q, k, v, scale, Some(mask))
 }
 
 /// Sliding-window attention dispatcher: tries the fused GPU flash-attn
@@ -770,6 +746,87 @@ mod tests {
         let want = naive_attention_bhsd(&q, &k, &v, scale, true, 0, None);
         let got = causal_without_mask(&q, &k, &v, scale).unwrap();
         assert_close(&got, &want, 1e-4);
+    }
+
+    /// Reference matching `GqaAttention`'s old hand-rolled masked-prefill
+    /// SDPA: same `repeat_kv` GQA expansion and additive mask as
+    /// `prefill_sdpa`, but upcasts `attn_weights` to F32 around softmax
+    /// instead of casting only the mask. Returns F32 for comparison via
+    /// `assert_close`.
+    fn f32_upcast_softmax_reference(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+        mask: &Tensor,
+    ) -> Vec<f32> {
+        let n_rep = q.dim(1).unwrap() / k.dim(1).unwrap();
+        let k = repeat_kv(k.clone(), n_rep).unwrap().contiguous().unwrap();
+        let v = repeat_kv(v.clone(), n_rep).unwrap().contiguous().unwrap();
+        let q = q.contiguous().unwrap();
+
+        let attn_weights = (q
+            .matmul(&k.transpose(D::Minus1, D::Minus2).unwrap())
+            .unwrap()
+            * f64::from(scale))
+        .unwrap();
+        let attn_weights = attn_weights.broadcast_add(mask).unwrap();
+        let input_dtype = attn_weights.dtype();
+        let attn_weights = softmax_last_dim(&attn_weights.to_dtype(DType::F32).unwrap())
+            .unwrap()
+            .to_dtype(input_dtype)
+            .unwrap();
+        attn_weights
+            .matmul(&v)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    // prefill_masked()'s native-dtype softmax must match a reference that
+    // upcasts attn_weights to F32 around softmax (GqaAttention's old
+    // hand-rolled behavior), for a padding mask of 0.0/NEG_INFINITY in F16
+    // — both values are exactly representable in every float format, so
+    // the upcast is provably unnecessary and dropping it is safe. BF16 is
+    // not tested here: candle's CPU backend doesn't implement `matmul` for
+    // BF16 at all (`unsupported dtype BF16 for op matmul`), so a CPU-only
+    // test can't exercise it; `gpu_flash_attn.rs`'s BF16 coverage is
+    // kernel-based, not matmul-based SDPA. This is the test Round 5 of the
+    // attn_dispatch rebase plan requires before replacing GqaAttention's
+    // hand-rolled block.
+    #[test]
+    fn prefill_masked_matches_f32_upcast_softmax() {
+        let device = Device::Cpu;
+        let (b, hq, hkv, sq, skv, d) = (2, 8, 2, 4, 6, 8usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let q_f32 = randn((b, hq, sq, d), &device);
+        let k_f32 = randn((b, hkv, skv, d), &device);
+        let v_f32 = randn((b, hkv, skv, d), &device);
+
+        // Padding mask: mask out the last 2 of skv kv positions for every query.
+        let mut mask_data = vec![0f32; sq * skv];
+        for i in 0..sq {
+            for j in (skv - 2)..skv {
+                mask_data[i * skv + j] = f32::NEG_INFINITY;
+            }
+        }
+        let mask_f32 = Tensor::from_vec(mask_data, (1, 1, sq, skv), &device).unwrap();
+
+        let q = q_f32.to_dtype(DType::F16).unwrap();
+        let k = k_f32.to_dtype(DType::F16).unwrap();
+        let v = v_f32.to_dtype(DType::F16).unwrap();
+        let mask = mask_f32.to_dtype(DType::F16).unwrap();
+
+        let got = prefill_masked(&q, &k, &v, scale, &mask)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let want = f32_upcast_softmax_reference(&q, &k, &v, scale, &mask);
+        assert_close(&got, &want, 1e-2);
     }
 
     // decode() on a single CPU sequence must match dispatch_flash_attn directly.

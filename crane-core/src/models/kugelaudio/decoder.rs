@@ -374,6 +374,7 @@ impl KugelAudioDecoder {
                     rope_mode: RopeMode::HalfSplit,
                     use_qk_norm: false,
                     norm_eps: cfg.rms_norm_eps,
+                    causal: true,
                 };
                 let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
                 for i in 0..cfg.num_hidden_layers {
