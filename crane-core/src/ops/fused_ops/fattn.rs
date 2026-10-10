@@ -182,6 +182,61 @@ pub(crate) fn mma_config(dkq: usize, ncols: usize, is_amd: bool) -> Result<Fattn
     })
 }
 
+/// bf16 counterpart of [`mma_config_rdna`]: identical to the F16 RDNA table
+/// at every `(dkq, ncols)` pair except `(128, 32 | 64)`, where `nbatch_fa`
+/// is halved (64 -> 32). Experimental: bf16's PV accumulator (`T_C_VKQ` in
+/// `fattn_mma_bf16.cuh`) is always `float`, twice the register footprint of
+/// F16's packed `half2` accumulator at this `(head_dim, ncols)` shape (see
+/// that file's module doc), so halving `nbatch_fa` trades tile size for
+/// occupancy to compensate. Kept only because
+/// `gpu_flash_attn::gpu_tests::bf16_vs_f16_try_causal_with_mask_timing_sweep_native`
+/// measured it as a net win; revert to literally reusing [`mma_config_rdna`]
+/// if a future change to the bf16 kernel body changes that balance.
+#[rustfmt::skip]
+fn mma_config_bf16_rdna(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
+    use FattnMmaConfig as C;
+    Some(match (dkq, ncols) {
+        (64, 8 | 16 | 32 | 64) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 32, nbatch_v2: 32, nbatch_combine: 32, nstages_target: 1, q_in_reg: true },
+        (128, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (128, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 64, nbatch_v2: 64, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (256, 8 | 16) => C { nthreads: 64, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (256, 32 | 64) => C { nthreads: 256, nbatch_fa: 64, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 64, nstages_target: 1, q_in_reg: true },
+        (512, 8 | 16) => C { nthreads: 128, nbatch_fa: 64, nbatch_k2: 96, nbatch_v2: 64, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        (512, 32 | 64) => C { nthreads: 128, nbatch_fa: 32, nbatch_k2: 128, nbatch_v2: 128, nbatch_combine: 128, nstages_target: 1, q_in_reg: true },
+        _ => return None,
+    })
+}
+
+/// bf16 counterpart of [`mma_config_ampere`]: currently an exact copy (the
+/// RDNA table is where [`mma_config_bf16_rdna`] differs); kept separate so
+/// an NVIDIA-specific bf16 tuning change doesn't require touching the F16
+/// table either.
+#[rustfmt::skip]
+fn mma_config_bf16_ampere(dkq: usize, ncols: usize) -> Option<FattnMmaConfig> {
+    mma_config_ampere(dkq, ncols)
+}
+
+/// bf16 counterpart of [`mma_config`]: looks up [`mma_config_bf16_rdna`]/
+/// [`mma_config_bf16_ampere`] instead of the F16 tables.
+///
+/// # Errors
+///
+/// Returns an error if no config exists for this `(dkq, ncols)` pair (see
+/// [`mma_config`]'s doc comment).
+pub(crate) fn mma_config_bf16(dkq: usize, ncols: usize, is_amd: bool) -> Result<FattnMmaConfig> {
+    let cfg = if is_amd {
+        mma_config_bf16_rdna(dkq, ncols)
+    } else {
+        mma_config_bf16_ampere(dkq, ncols)
+    };
+    cfg.ok_or_else(|| {
+        candle_core::Error::Msg(format!(
+            "fattn_mma_bf16: no MMA config for head_dim={dkq} ncols={ncols} ({})",
+            if is_amd { "RDNA" } else { "Ampere" }
+        ))
+    })
+}
+
 /// Picks `ncols2` (how many GQA-sibling Q heads share one block's K/V load):
 /// port of `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2`'s non-Volta
 /// branches. `ncols2=1` is always valid for any `gqa_ratio` (it divides

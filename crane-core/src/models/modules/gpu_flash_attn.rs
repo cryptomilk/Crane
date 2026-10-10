@@ -865,8 +865,9 @@ mod gpu_tests {
     // must route to `fallback()` and match the naive reference, the same way
     // `unsupported_head_dim_falls_back_to_matmul_sdpa` does for shapes
     // `head_dim_supported()` rejects outright. `mma_disabled()` caches its
-    // env var read in a `OnceLock` for the life of the process, so this must
-    // run alone in its own process:
+    // env var read in a `OnceLock` for the life of the process (same
+    // constraint as `bf16_vs_f16_try_causal_with_mask_timing_sweep_fallback`
+    // below), so this must run alone in its own process:
     // `cargo test -p crane-core --no-default-features --features "rocm,onnx"
     // -- --ignored --exact
     // models::modules::gpu_flash_attn::gpu_tests::head_dim_64_tile_kernel_routes_to_matmul_fallback
@@ -1116,5 +1117,360 @@ mod gpu_tests {
             .expect("GPU device must return Some even for unsupported head_dim")
             .unwrap();
         assert_close(&got_vec(got), &want, 3e-2);
+    }
+
+    // Kernel-launch timing comparison between the native-bf16 and
+    // cast-to-F16-fallback dispatch paths, at the real chunked-prefill
+    // `seq_kv` lengths an 18387-token Qwen3-4B-Instruct-2507 prompt hits
+    // (`PREFILL_CHUNK_SIZE=2048`, 9 chunks). Real callers (e.g.
+    // `models::qwen3::modeling`'s `Attention::forward`) build Q/K/V in
+    // BSHD, transpose to BHSD for the KV cache, and call
+    // `try_causal_with_mask` — `run()` then transposes back to BSHD,
+    // producing a *non-contiguous* view that `.contiguous()`/`.to_dtype()`
+    // must materialize on every call. This test reproduces that exact
+    // construction (BSHD alloc -> transpose -> BHSD, matching real
+    // provenance) and goes through the real `try_causal_with_mask` entry
+    // point (real F32 `CausalMask`, real native-bf16-vs-disabled dispatch
+    // via `bf16_disabled()` reading `CRANE_DISABLE_BF16_FLASH_ATTN`),
+    // instead of calling the `fattn_mma` kernel wrappers directly. Not a
+    // correctness check and not run by default. `bf16_disabled()` caches
+    // its env var read in a
+    // `OnceLock` for the life of the process, and this worktree's `cargo`
+    // proxy does not forward shell-set env vars to the host process it
+    // execs, so the fallback variant below sets `CRANE_DISABLE_BF16_FLASH_ATTN`
+    // via `std::env::set_var` (operates on the process's own env table
+    // directly, unaffected by the proxy) as its very first line, before
+    // `bf16_disabled()`'s first read. Run each test name on its own so the
+    // two never share a process and the `OnceLock` can't already be
+    // initialized by the other variant:
+    // `cargo test -p crane-core --no-default-features --features "rocm,onnx"
+    // --release -- --ignored --exact
+    // models::modules::gpu_flash_attn::gpu_tests::bf16_vs_f16_try_causal_with_mask_timing_sweep_native
+    // --nocapture` and the `_fallback` counterpart.
+    fn bf16_vs_f16_try_causal_with_mask_timing_sweep_impl(label: &str) {
+        let gpu = test_gpu_device();
+        let (hq, hkv, d) = (32, 8, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        for (sq, skv) in [
+            (2048usize, 2048usize),
+            (2048, 4096),
+            (2048, 6144),
+            (2048, 8192),
+            (2048, 10240),
+            (2048, 12288),
+            (2048, 14336),
+            (2048, 16384),
+            (2003, 18387),
+        ] {
+            let kv_offset = skv - sq;
+
+            // Build Q/K/V in BSHD (as `qkv_proj.forward` + reshape does in
+            // real model code), cast, then transpose to BHSD — the same
+            // non-contiguous construction `Attention::forward` feeds into
+            // `attn_dispatch::causal`, unlike handing `try_causal_with_mask`
+            // an already-contiguous BHSD tensor directly.
+            let q_bshd = Tensor::randn(0f32, 1f32, (1, sq, hq, d), &gpu).unwrap();
+            let k_bshd = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &gpu).unwrap();
+            let v_bshd = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &gpu).unwrap();
+
+            let q_bf16 = q_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let k_bf16 = k_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let v_bf16 = v_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+
+            let mask = crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F32, &gpu)
+                .unwrap();
+
+            let time = |label: &str, f: &dyn Fn() -> Tensor| -> f64 {
+                for _ in 0..5 {
+                    let _ = f();
+                }
+                gpu.synchronize().unwrap();
+
+                let iters = 15;
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = std::time::Instant::now();
+                    let out = f();
+                    gpu.synchronize().unwrap();
+                    samples.push(t.elapsed().as_secs_f64() * 1e6);
+                    drop(out);
+                }
+                let mean = samples.iter().sum::<f64>() / iters as f64;
+                let var = samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / iters as f64;
+                println!("{label:<6} mean={mean:9.1}us sd={:.1}us", var.sqrt());
+                mean
+            };
+
+            println!("--- sq={sq} skv={skv} [{label}] ---");
+            let _ = time(label, &|| {
+                try_causal_with_mask(&q_bf16, &k_bf16, &v_bf16, scale, &mask)
+                    .expect("GPU device must return Some")
+                    .unwrap()
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_try_causal_with_mask_timing_sweep_native() {
+        bf16_vs_f16_try_causal_with_mask_timing_sweep_impl("native");
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_try_causal_with_mask_timing_sweep_fallback() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_DISABLE_BF16_FLASH_ATTN`.
+        unsafe {
+            std::env::set_var("CRANE_DISABLE_BF16_FLASH_ATTN", "1");
+        }
+        bf16_vs_f16_try_causal_with_mask_timing_sweep_impl("fallback");
+    }
+
+    // Same comparison as `bf16_vs_f16_try_causal_with_mask_timing_sweep_impl`,
+    // but grows K/V through the real `kv_cache::update_kv_cache` buffer
+    // (`ROOM`-padded, reallocating) instead of a freshly-allocated,
+    // tightly-sized tensor. The sweep above's K/V happen to land back on a
+    // dense buffer by the time `run()`'s `.contiguous()`/`.to_dtype()` runs
+    // on them (its `to_dtype(BF16)` always produces a dense result, and the
+    // single `transpose(1, 2)` on top is undone by `run()`'s own transpose),
+    // so those calls are free no-ops there. In production,
+    // `models::qwen3::modeling::Attention::update_kv_cache` hands
+    // `try_causal_with_mask` a `narrow()` view into a larger cache buffer
+    // instead, making those same calls real `O(seq_kv)` copies — this test
+    // reproduces that by growing the cache across the same 9 chunks a real
+    // 18387-token Qwen3-4B-Instruct-2507 prompt hits
+    // (`PREFILL_CHUNK_SIZE=2048`). Same single-process-per-variant run
+    // instructions as the sweep above apply here.
+    fn bf16_vs_f16_real_kv_cache_timing_sweep_impl(label: &str) {
+        let gpu = test_gpu_device();
+        let (hq, hkv, d) = (32, 8, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let mut cache: Option<(Tensor, Tensor)> = None;
+        let mut cache_seq_len = 0usize;
+
+        for chunk_len in [2048usize, 2048, 2048, 2048, 2048, 2048, 2048, 2048, 2003] {
+            let kv_offset = cache_seq_len;
+
+            // Same BSHD-alloc -> transpose -> BHSD provenance as the sweep
+            // above, for Q (never cached) and the new K/V chunk about to be
+            // appended to the cache.
+            let q_bshd = Tensor::randn(0f32, 1f32, (1, chunk_len, hq, d), &gpu).unwrap();
+            let k_bshd = Tensor::randn(0f32, 1f32, (1, chunk_len, hkv, d), &gpu).unwrap();
+            let v_bshd = Tensor::randn(0f32, 1f32, (1, chunk_len, hkv, d), &gpu).unwrap();
+
+            let q_bf16 = q_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let k_bf16 = k_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+            let v_bf16 = v_bshd
+                .to_dtype(DType::BF16)
+                .unwrap()
+                .transpose(1, 2)
+                .unwrap();
+
+            let crate::models::modules::kv_cache::KvCacheUpdate {
+                buffer,
+                seq_len,
+                k: k_view,
+                v: v_view,
+            } = crate::models::modules::kv_cache::update_kv_cache(
+                cache.take(),
+                cache_seq_len,
+                &k_bf16,
+                &v_bf16,
+            )
+            .expect("update_kv_cache");
+            cache = Some(buffer);
+            cache_seq_len = seq_len;
+            let skv = cache_seq_len;
+
+            let mask =
+                crate::models::utils::CausalMask::new(chunk_len, skv, kv_offset, DType::F32, &gpu)
+                    .unwrap();
+
+            let time = |label: &str, f: &dyn Fn() -> Tensor| -> f64 {
+                for _ in 0..5 {
+                    let _ = f();
+                }
+                gpu.synchronize().unwrap();
+
+                let iters = 15;
+                let mut samples = Vec::with_capacity(iters);
+                for _ in 0..iters {
+                    let t = std::time::Instant::now();
+                    let out = f();
+                    gpu.synchronize().unwrap();
+                    samples.push(t.elapsed().as_secs_f64() * 1e6);
+                    drop(out);
+                }
+                let mean = samples.iter().sum::<f64>() / iters as f64;
+                let var = samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / iters as f64;
+                println!("{label:<6} mean={mean:9.1}us sd={:.1}us", var.sqrt());
+                mean
+            };
+
+            println!("--- sq={chunk_len} skv={skv} [{label}] ---");
+            let _ = time(label, &|| {
+                try_causal_with_mask(&q_bf16, &k_view, &v_view, scale, &mask)
+                    .expect("GPU device must return Some")
+                    .unwrap()
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_real_kv_cache_timing_sweep_native() {
+        bf16_vs_f16_real_kv_cache_timing_sweep_impl("native");
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_real_kv_cache_timing_sweep_fallback() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_DISABLE_BF16_FLASH_ATTN`.
+        unsafe {
+            std::env::set_var("CRANE_DISABLE_BF16_FLASH_ATTN", "1");
+        }
+        bf16_vs_f16_real_kv_cache_timing_sweep_impl("fallback");
+    }
+
+    // A different hypothesis from the two sweeps above: both of those time
+    // 15 back-to-back calls against the *same* K/V buffer, so the GPU's L2
+    // cache stays warm with that one buffer's contents across every sample
+    // — a repetition a real forward pass never gets, since each of the
+    // model's ~36 decoder layers touches its own distinct KV-cache memory
+    // exactly once, cold, while the GPU is also busy running that layer's
+    // (and neighboring layers') much larger MLP matmuls in between. This
+    // allocates a brand-new, never-touched-before, `ROOM`-padded K/V buffer
+    // for every single timed sample (kept alive in `keep_alive` so the
+    // allocator can't hand the "next" sample the same physical address and
+    // accidentally restore the warm-cache effect this test exists to
+    // remove), to check whether losing that warm-cache advantage flips the
+    // native-vs-fallback ranking. Builds the padded buffer directly
+    // (`(1, hkv, skv+ROOM, dim)` zeros, `slice_set` at offset 0, `narrow`
+    // back to `skv`) instead of replaying every prior chunk through
+    // `kv_cache::update_kv_cache`, since only the buffer's final
+    // non-contiguous shape matters here, not how it was grown. Not a
+    // correctness check and not run by default; same
+    // `CRANE_DISABLE_BF16_FLASH_ATTN` single-process-per-variant rule as the
+    // sweeps above.
+    fn bf16_vs_f16_cold_kv_cache_timing_sweep_impl(label: &str) {
+        let gpu = test_gpu_device();
+        let (hq, hkv, d) = (32, 8, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        const ROOM: usize = 256;
+
+        for (sq, skv) in [
+            (2048usize, 2048usize),
+            (2048, 4096),
+            (2048, 6144),
+            (2048, 8192),
+            (2048, 10240),
+            (2048, 12288),
+            (2048, 14336),
+            (2048, 16384),
+            (2003, 18387),
+        ] {
+            let kv_offset = skv - sq;
+            let mask = crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F32, &gpu)
+                .unwrap();
+
+            let mut keep_alive: Vec<Tensor> = Vec::new();
+            let iters = 15;
+            let mut samples = Vec::with_capacity(iters);
+
+            for _ in 0..iters {
+                let q_bshd = Tensor::randn(0f32, 1f32, (1, sq, hq, d), &gpu).unwrap();
+                let k_bshd = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &gpu).unwrap();
+                let v_bshd = Tensor::randn(0f32, 1f32, (1, skv, hkv, d), &gpu).unwrap();
+
+                let q_bf16 = q_bshd
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+                    .transpose(1, 2)
+                    .unwrap();
+                let k_bf16 = k_bshd
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+                    .transpose(1, 2)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+                let v_bf16 = v_bshd
+                    .to_dtype(DType::BF16)
+                    .unwrap()
+                    .transpose(1, 2)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap();
+
+                let buf_k = Tensor::zeros((1, hkv, skv + ROOM, d), DType::BF16, &gpu).unwrap();
+                let buf_v = Tensor::zeros((1, hkv, skv + ROOM, d), DType::BF16, &gpu).unwrap();
+                buf_k.slice_set(&k_bf16, 2, 0).unwrap();
+                buf_v.slice_set(&v_bf16, 2, 0).unwrap();
+                let k_view = buf_k.narrow(2, 0, skv).unwrap();
+                let v_view = buf_v.narrow(2, 0, skv).unwrap();
+
+                gpu.synchronize().unwrap();
+                let t = std::time::Instant::now();
+                let out = try_causal_with_mask(&q_bf16, &k_view, &v_view, scale, &mask)
+                    .expect("GPU device must return Some")
+                    .unwrap();
+                gpu.synchronize().unwrap();
+                samples.push(t.elapsed().as_secs_f64() * 1e6);
+
+                keep_alive.push(q_bf16);
+                keep_alive.push(k_bf16);
+                keep_alive.push(v_bf16);
+                keep_alive.push(buf_k);
+                keep_alive.push(buf_v);
+                keep_alive.push(out);
+            }
+
+            let mean = samples.iter().sum::<f64>() / iters as f64;
+            let var = samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / iters as f64;
+            println!("--- sq={sq} skv={skv} [{label}] cold ---");
+            println!("{label:<6} mean={mean:9.1}us sd={:.1}us", var.sqrt());
+            drop(keep_alive);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_cold_kv_cache_timing_sweep_native() {
+        bf16_vs_f16_cold_kv_cache_timing_sweep_impl("native");
+    }
+
+    #[test]
+    #[ignore = "manual GPU timing comparison, not a correctness check"]
+    fn bf16_vs_f16_cold_kv_cache_timing_sweep_fallback() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_DISABLE_BF16_FLASH_ATTN`.
+        unsafe {
+            std::env::set_var("CRANE_DISABLE_BF16_FLASH_ATTN", "1");
+        }
+        bf16_vs_f16_cold_kv_cache_timing_sweep_impl("fallback");
     }
 }
