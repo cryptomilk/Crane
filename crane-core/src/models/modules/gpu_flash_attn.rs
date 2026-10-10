@@ -27,9 +27,13 @@
 use candle_core::{Result, Tensor};
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-use crate::ops::fused_ops::fattn_mma::{fattn_mma_causal, fattn_mma_full, fattn_mma_windowed};
+use crate::ops::fused_ops::fattn_mma::{
+    fattn_mma_causal, fattn_mma_causal_with_mask, fattn_mma_full, fattn_mma_windowed,
+};
 #[cfg(any(feature = "cuda", feature = "rocm"))]
-use crate::ops::fused_ops::fattn_tile::{fattn_tile_causal, fattn_tile_full, fattn_tile_windowed};
+use crate::ops::fused_ops::fattn_tile::{
+    fattn_tile_causal, fattn_tile_causal_with_mask, fattn_tile_full, fattn_tile_windowed,
+};
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use candle_core::DType;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -239,26 +243,23 @@ pub fn try_causal(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option<Resu
 
 /// Same as [`try_causal`], but for callers that already have a mask shared
 /// across multiple layers in one forward pass (e.g. a decoder stack whose
-/// `forward()` builds the mask once and passes it to every layer). The
-/// fused-kernel success path ignores `mask` entirely (both
-/// [`fattn_mma_causal`]/[`fattn_tile_causal`] build their own mask
-/// internally from `kv_offset`, never reading a caller-provided tensor), so
-/// `mask` is only read on the fallback path, via
-/// [`attn_dispatch::causal_with_mask`](super::attn_dispatch::causal_with_mask)
-/// instead of [`try_causal`]'s self-building
-/// [`attn_dispatch::causal_without_mask`](super::attn_dispatch::causal_without_mask).
-/// This matters even when the fused kernel is expected to succeed on every
-/// call: without it, a build with neither `cuda` nor `rocm` compiled (Metal,
-/// SYCL) would silently take the self-building fallback on *every* call,
-/// once per layer, reintroducing the exact regression this function exists
-/// to avoid.
+/// `forward()` builds the mask once and passes it to every layer). Unlike
+/// `try_causal`, the fused-kernel success path here threads `mask` straight
+/// into [`fattn_mma_causal_with_mask`]/[`fattn_tile_causal_with_mask`]
+/// instead of letting them rebuild an equivalent mask from `kv_offset` on
+/// every call — this kernel family's mask build is `O(seq_q * seq_kv)`, so
+/// doing it once per forward pass and reusing it here (rather than once per
+/// layer, as [`try_causal`]'s self-building path does) is the entire point
+/// of this function existing separately. `mask` (any dtype; cast to F16
+/// internally if needed) must encode exactly the plain shifted-diagonal
+/// causal pattern `j <= i + kv_offset` — the fallback path
+/// ([`attn_dispatch::causal_with_mask`](super::attn_dispatch::causal_with_mask))
+/// reads the same tensor under the same contract, so fused and fallback stay
+/// consistent.
 ///
 /// # Errors
 ///
 /// See [`try_causal`].
-// Not wired into any model's prefill path yet - see `attn_dispatch`'s
-// module doc.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn try_causal_with_mask(
     q: &Tensor,
@@ -278,8 +279,12 @@ pub(crate) fn try_causal_with_mask(
                 q,
                 k,
                 v,
-                |qf, kf, vf| fattn_mma_causal(qf, kf, vf, scale, offset),
-                |qf, kf, vf| fattn_tile_causal(qf, kf, vf, scale, offset),
+                |qf, kf, vf| {
+                    fattn_mma_causal_with_mask(qf, kf, vf, scale, offset, mask.as_tensor())
+                },
+                |qf, kf, vf| {
+                    fattn_tile_causal_with_mask(qf, kf, vf, scale, offset, mask.as_tensor())
+                },
             )
         })());
     }
@@ -751,15 +756,22 @@ mod gpu_tests {
         assert_close(&got_vec(got_windowed), &want_windowed, 3e-2);
     }
 
-    // On the fused-kernel (MMA) success path, `try_causal_with_mask` ignores
-    // `mask` entirely (both fattn_mma_causal/fattn_tile_causal build their
-    // own mask internally from kv_offset), so it must match `try_causal`'s
-    // own result exactly, regardless of what `mask` contains.
+    // On the fused-kernel (MMA/tile) success path, `try_causal_with_mask` now
+    // threads `mask` straight into the kernel (fattn_mma_causal_with_mask/
+    // fattn_tile_causal_with_mask), so a wrong-offset mask must change the
+    // output relative to the correct causal mask — proving the mask is
+    // actually read, not silently ignored the way the old (superseded)
+    // Crane kernels were. Mirrors `fattn_mma.rs`'s `garbage_mask_changes_output`
+    // at this module's dispatch layer. `q`/`k`/`v`/`scale` and the kernel's
+    // own `kv_offset` argument (computed from `q`/`k`'s shapes) are identical
+    // between both calls — only the mask tensor's content differs — so this
+    // isolates the mask as the one varying input.
     #[test]
-    fn try_causal_with_mask_matches_try_causal_on_mma_path() {
+    fn try_causal_with_mask_garbage_mask_changes_output() {
         let rocm = test_gpu_device();
         let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
         let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
 
         let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
         let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
@@ -780,18 +792,112 @@ mod gpu_tests {
             .unwrap()
             .to_device(&rocm)
             .unwrap();
-        // A causal mask built with a deliberately wrong `kv_offset` (0
-        // instead of the correct `skv - sq`): must be ignored on the
-        // fused-kernel success path.
-        let mask = crate::models::utils::CausalMask::new(sq, skv, 0, DType::F16, &rocm).unwrap();
 
-        let want = try_causal(&q, &k, &v, scale)
+        let correct_mask =
+            crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F16, &rocm).unwrap();
+        // A causal mask built with a deliberately wrong `kv_offset` (0
+        // instead of the correct `skv - sq`): still a valid `CausalMask`
+        // (shifted-diagonal pattern), just for the wrong diagonal, so it
+        // masks out most of the keys the correct mask allows.
+        let wrong_mask =
+            crate::models::utils::CausalMask::new(sq, skv, 0, DType::F16, &rocm).unwrap();
+
+        let out_correct = try_causal_with_mask(&q, &k, &v, scale, &correct_mask)
             .expect("GPU device must return Some")
             .unwrap();
+        let out_wrong = try_causal_with_mask(&q, &k, &v, scale, &wrong_mask)
+            .expect("GPU device must return Some")
+            .unwrap();
+        let max_diff = got_vec(out_correct)
+            .iter()
+            .zip(&got_vec(out_wrong))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "wrong-offset mask produced the same output as the correct mask (max diff {max_diff})"
+        );
+    }
+
+    // A correct, caller-built mask on the fused-kernel path must match
+    // `try_causal`'s own (internally-built) result, and the naive reference
+    // — proving `try_causal_with_mask` isn't just "mask changes something,"
+    // but specifically computes the same correct causal attention.
+    #[test]
+    fn try_causal_with_mask_correct_mask_matches_try_causal() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, true, kv_offset, None);
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let mask =
+            crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F16, &rocm).unwrap();
+
         let got = try_causal_with_mask(&q, &k, &v, scale, &mask)
             .expect("GPU device must return Some")
             .unwrap();
-        assert_close(&got_vec(got), &got_vec(want), 0.0);
+        assert_close(&got_vec(got), &want, 3e-2);
+    }
+
+    // Deliberately unaligned seq_kv (not a FATTN_KQ_STRIDE=256 multiple) at
+    // GQA ratio 8, matching the shape that regressed on real hardware
+    // (Qwen3-Coder-30B-A3B/Qwen3.5-4B are both GQA ratio 8, head_dim 128).
+    // Must still match the naive reference, proving the K/V padding this
+    // unlocks is bit-correct, not just fast.
+    #[test]
+    fn try_causal_with_mask_unaligned_seq_kv_gqa_ratio_8() {
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 8, 1, 37, 1000, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let want = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, true, kv_offset, None);
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let mask =
+            crate::models::utils::CausalMask::new(sq, skv, kv_offset, DType::F16, &rocm).unwrap();
+
+        let got = try_causal_with_mask(&q, &k, &v, scale, &mask)
+            .expect("GPU device must return Some")
+            .unwrap();
+        assert_close(&got_vec(got), &want, 3e-2);
     }
 
     // On the matmul-SDPA fallback (unsupported head_dim), `try_causal_with_mask`
