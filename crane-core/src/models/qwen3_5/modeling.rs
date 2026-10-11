@@ -880,16 +880,20 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(x)?;
-        let up = self.up.forward(x)?;
-        let h = if matches!(gate.dtype(), DType::BF16 | DType::F16) {
-            candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?
-                .to_dtype(gate.dtype())?
-                .mul(&up)?
-        } else {
-            crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?
-        };
-        self.down.forward(&h)
+        use crate::utils::prof::{Span, timed};
+
+        let gate = timed(Span::MlpGate, || self.gate.forward(x))?;
+        let up = timed(Span::MlpUp, || self.up.forward(x))?;
+        let h = timed(Span::MlpActivation, || {
+            if matches!(gate.dtype(), DType::BF16 | DType::F16) {
+                candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?
+                    .to_dtype(gate.dtype())?
+                    .mul(&up)
+            } else {
+                crate::ops::fused_ops::swiglu::swiglu(&gate, &up)
+            }
+        })?;
+        timed(Span::MlpDown, || self.down.forward(&h))
     }
 }
 
