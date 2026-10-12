@@ -86,7 +86,26 @@
 #include "mma.cuh"
 #include "fattn_common.cuh"
 
+// Needed for CRANE_BF16_DBG's printf() below: unlike llama.cpp's
+// common.cuh, nothing else included above declares it, so without this it
+// relies entirely on an implicit/transitive declaration.
+#include <cstdio>
+
 using namespace ggml_cuda_mma;
+
+// TEMPORARY DEBUG INSTRUMENTATION, not for upstream: dumps intermediate
+// values from thread (0,0) of block (0,0,0) during the very first KV chunk
+// of the very first tile, to help pin down the inf/wrong-value bf16 MMA
+// results reported on real NVIDIA hardware (RTX 5070 Ti / Blackwell,
+// PR #181) that nobody working on this has a CUDA GPU to reproduce locally.
+// Remove before merging.
+#define CRANE_BF16_DBG(fmt, ...) \
+    do { \
+        if (threadIdx.x == 0 && threadIdx.y == 0 && \
+            blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { \
+            printf("[crane-bf16-dbg] " fmt "\n", ##__VA_ARGS__); \
+        } \
+    } while (0)
 
 // Config options for the MMA kernel. Identical shape to fattn_mma_f16.cuh's
 // fattn_mma_config; duplicated (not shared) because this is a separate
@@ -510,6 +529,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         __syncthreads(); // Only needed if tile_K == tile_V.
     }
 
+    CRANE_BF16_DBG("kb0=%d KQ_C[0].x[0] raw post-mma=%g", kb0, KQ_C[0].x[0]);
+
     if (use_logit_softcap) {
 #pragma unroll
         for (int i = 0; i < nbatch_fa/(np*T_C_KQ::J); ++i) {
@@ -556,6 +577,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         }
     }
 
+    CRANE_BF16_DBG("kb0=%d KQ_C[0].x[0] post-mask=%g KQ_max_new[0] pre-reduce=%g", kb0, KQ_C[0].x[0], KQ_max_new[0]);
+
     // Calculate softmax for each KQ column using the current max. value.
     // The divisor is stored in KQ_rowsum and will be applied at the end.
 #pragma unroll
@@ -591,6 +614,9 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         }
     }
 
+    CRANE_BF16_DBG("kb0=%d KQ_max_new post-reduce: [0]=%g [%d]=%g", kb0, KQ_max_new[0],
+        cols_per_thread - 1, KQ_max_new[cols_per_thread - 1]);
+
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
 #pragma unroll
@@ -609,6 +635,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
         }
     }
 
+    CRANE_BF16_DBG("kb0=%d KQ_C[0].x[0] post-exp=%g KQ_rowsum_add[0]=%g", kb0, KQ_C[0].x[0], KQ_rowsum_add[0]);
+
     {
         float KQ_max_scale[cols_per_thread];
 #pragma unroll
@@ -619,8 +647,15 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
 
             *((uint32_t *) &KQ_max_scale[col]) *= KQ_max_diff >= SOFTMAX_FTZ_THRESHOLD;
 
+            const float KQ_rowsum_old = KQ_rowsum[col];
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
+            CRANE_BF16_DBG("kb0=%d col=%d KQ_max_new=%g KQ_max_diff=%g KQ_max_scale(post-ftz)=%g "
+                "KQ_rowsum_old=%g KQ_rowsum_add=%g KQ_rowsum_new=%g",
+                kb0, col, KQ_max_new[col], KQ_max_diff, KQ_max_scale[col],
+                KQ_rowsum_old, KQ_rowsum_add[col], KQ_rowsum[col]);
         }
+
+        CRANE_BF16_DBG("kb0=%d KQ_max_scale[0]=%g KQ_rowsum[0]=%g", kb0, KQ_max_scale[0], KQ_rowsum[0]);
 
         // T_C_VKQ is always float here (see this file's module doc), with
         // the exact same physical layout as T_C_KQ: reuse T_C_KQ's own
@@ -638,6 +673,7 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
                 VKQ_C[i].x[l] *= KQ_max_scale[KQ_idx];
             }
         }
+        CRANE_BF16_DBG("kb0=%d VKQ_C[0].x[0] post-rescale=%g", kb0, VKQ_C[0].x[0]);
     }
 
     // Convert KQ C tiles into B tiles for VKQ calculation (always the
@@ -647,6 +683,11 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
     static_assert(nbatch_fa % (np*2*T_B_VKQ::J) == 0, "bad loop size");
     for (int k = 0; k < nbatch_fa/(np*2*T_B_VKQ::J); ++k) {
         B[k] = get_bf16(KQ_C[k]);
+    }
+
+    {
+        const float2 b00 = __bfloat1622float2(B[0].x[0]);
+        CRANE_BF16_DBG("kb0=%d B[0].x[0] (get_bf16 output)=(%g, %g)", kb0, b00.x, b00.y);
     }
 
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
@@ -685,6 +726,8 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_iter(
 
         __syncthreads(); // Only needed if tile_K == tile_V.
     }
+
+    CRANE_BF16_DBG("kb0=%d VKQ_C[0].x[0] post-PV-mma=%g", kb0, VKQ_C[0].x[0]);
 #else
     GGML_UNUSED_VARS(Q_f2, K_h2, V_h2, mask_h, indices, dstk, dstk_fixup,
         scale, slope, logit_softcap, ne01, ne02,
@@ -774,6 +817,24 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
     nv_bfloat162 * tile_V    = tile_K;
     half         * tile_mask = (half *) (tile_V + nbatch_fa * stride_tile_KV_max);
 
+    if (kb0_start == 0) {
+#if defined(AMPERE_MMA_AVAILABLE)
+        CRANE_BF16_DBG("entry: AMPERE_MMA_AVAILABLE=1 arch=%d DKQ=%d DV=%d ncols1=%d ncols2=%d "
+            "scale=%g logit_softcap=%g slope=%g nbatch_fa=%d",
+            __CUDA_ARCH__, DKQ, DV, ncols1, ncols2, scale, logit_softcap, slope, nbatch_fa);
+#elif defined(AMD_WMMA_AVAILABLE)
+        CRANE_BF16_DBG("entry: AMD_WMMA_AVAILABLE=1 DKQ=%d DV=%d ncols1=%d ncols2=%d "
+            "scale=%g logit_softcap=%g slope=%g nbatch_fa=%d",
+            DKQ, DV, ncols1, ncols2, scale, logit_softcap, slope, nbatch_fa);
+#elif defined(AMD_MFMA_AVAILABLE)
+        CRANE_BF16_DBG("entry: AMD_MFMA_AVAILABLE=1 DKQ=%d DV=%d ncols1=%d ncols2=%d "
+            "scale=%g logit_softcap=%g slope=%g nbatch_fa=%d",
+            DKQ, DV, ncols1, ncols2, scale, logit_softcap, slope, nbatch_fa);
+#else
+        CRANE_BF16_DBG("entry: NO MMA PATH AVAILABLE (should never launch)");
+#endif
+    }
+
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
     // T_C_VKQ is always float (see this file's module doc), so unlike
     // fattn_mma_f16.cuh there is no per-architecture tile-shape ternary
@@ -834,6 +895,11 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
     }
 
     __syncthreads();
+
+    if (kb0_start == 0) {
+        const float2 q00 = __bfloat1622float2(tile_Q[0]);
+        CRANE_BF16_DBG("tile_Q[0] after load+scale: (%g, %g)", q00.x, q00.y);
+    }
 
     if (Q_in_reg) {
         const int j0 = (threadIdx.y / np) * cols_per_warp;
