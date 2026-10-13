@@ -54,7 +54,7 @@ impl VarBuilder {
         })
     }
 
-    pub fn pp<S: ToString>(&self, s: S) -> Self {
+    pub fn pp<S: ToString + ?Sized>(&self, s: &S) -> Self {
         let mut path = self.path.clone();
         path.push(s.to_string());
         Self {

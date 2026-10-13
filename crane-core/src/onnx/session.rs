@@ -26,14 +26,14 @@ impl Session {
     /// Returns an error if the model has no graph, an initializer tensor
     /// fails to decode, or graph optimization fails.
     pub fn new(model: proto::ModelProto) -> Result<Self> {
-        Self::with_options(model, SessionOptions::default())
+        Self::with_options(model, &SessionOptions::default())
     }
 
     /// # Errors
     ///
     /// Returns an error if the model has no graph, an initializer tensor
     /// fails to decode, or graph optimization fails.
-    pub fn with_options(mut model: proto::ModelProto, options: SessionOptions) -> Result<Self> {
+    pub fn with_options(mut model: proto::ModelProto, options: &SessionOptions) -> Result<Self> {
         let graph = model
             .graph
             .as_mut()
@@ -48,7 +48,7 @@ impl Session {
         }
         // Crane Added 20260731: simplify only the in-memory session graph.
         // The source ONNX file and the vendored evaluator remain unchanged.
-        let optimization_report = optimizer::optimize(graph, &mut initializers, &options)?;
+        let optimization_report = optimizer::optimize(graph, &mut initializers, options)?;
         if std::env::var_os("CRANE_ONNX_OPT_REPORT").is_some() {
             eprintln!(
                 "Crane ONNX optimized '{}': {} -> {} nodes (folded {}, aliases {}, dead {}, initializers {}, fused_atan2 {}, fused_snake {})",
