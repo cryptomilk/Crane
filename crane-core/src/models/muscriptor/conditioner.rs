@@ -96,7 +96,7 @@ impl MelSpectrogramConditioner {
         output_dim: usize,
         device: &Device,
         dtype: DType,
-        vb: VarBuilder,
+        vb: &VarBuilder,
         filterbank: Tensor,
     ) -> Result<Self> {
         let output_proj = linear(N_MELS, output_dim, vb.pp("output_proj"))?;
@@ -126,7 +126,7 @@ impl MelSpectrogramConditioner {
         output_dim: usize,
         device: &Device,
         dtype: DType,
-        vb: VarBuilder,
+        vb: &VarBuilder,
     ) -> Result<Self> {
         let raw = build_mel_filterbank(SAMPLE_RATE, N_FFT, N_MELS, 0.0, 8000.0);
         // `build_mel_filterbank` returns `[n_mels, n_bins]` (row-major,
@@ -292,7 +292,7 @@ impl ClassConditioner {
     pub fn from_embedding_tensor(
         num_classes: usize,
         output_dim: usize,
-        weight: Tensor,
+        weight: &Tensor,
     ) -> Result<Self> {
         let embeddings = weight.reshape((num_classes + 1, output_dim))?;
         let embed = Embedding::new(embeddings, output_dim);
@@ -426,8 +426,8 @@ mod tests {
     fn mel_for_silence_has_expected_frame_count() {
         let device = Device::Cpu;
         let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &device);
-        let cond =
-            MelSpectrogramConditioner::new_without_filterbank(64, &device, DType::F32, vb).unwrap();
+        let cond = MelSpectrogramConditioner::new_without_filterbank(64, &device, DType::F32, &vb)
+            .unwrap();
         let wav = Tensor::zeros((1, 1, SAMPLE_RATE), DType::F32, &device).unwrap();
         let length = Tensor::from_vec(vec![SAMPLE_RATE as u32], (1,), &device).unwrap();
         let wc = WavCondition {
