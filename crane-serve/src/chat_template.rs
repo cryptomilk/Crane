@@ -129,7 +129,7 @@ impl ChatTemplateProcessor for AutoChatTemplate {
         self.tokenizer
             .apply_chat_template_full(
                 &template_messages,
-                opts.tools_json(),
+                opts.tools_json().as_ref(),
                 true,
                 opts.thinking.enable_thinking,
                 opts.thinking.reasoning_effort.as_deref(),
