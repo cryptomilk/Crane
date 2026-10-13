@@ -100,7 +100,7 @@ fn build_causal_mask(
 /// against the real checkpoint: after this, the GGUF tensor matches the
 /// known-correct safetensors tensor to float32 rounding (~3e-8 max abs
 /// diff); without it, the two diverge substantially (~0.5).
-fn undo_llamacpp_rope_permute(w: Tensor, n_head: usize, head_dim: usize) -> Result<Tensor> {
+fn undo_llamacpp_rope_permute(w: &Tensor, n_head: usize, head_dim: usize) -> Result<Tensor> {
     let in_dim = w.dim(1)?;
     let half = head_dim / 2;
     w.reshape((n_head, half, 2, in_dim))?
@@ -258,7 +258,7 @@ impl MiniCpmTts {
             t.insert(
                 "self_attn.q_proj.weight".into(),
                 undo_llamacpp_rope_permute(
-                    gg.dequant_tensor(&format!("{prefix}.attn_q.weight"))?,
+                    &gg.dequant_tensor(&format!("{prefix}.attn_q.weight"))?,
                     config.num_attention_heads,
                     head_dim,
                 )?,
@@ -266,7 +266,7 @@ impl MiniCpmTts {
             t.insert(
                 "self_attn.k_proj.weight".into(),
                 undo_llamacpp_rope_permute(
-                    gg.dequant_tensor(&format!("{prefix}.attn_k.weight"))?,
+                    &gg.dequant_tensor(&format!("{prefix}.attn_k.weight"))?,
                     config.num_key_value_heads,
                     head_dim,
                 )?,
