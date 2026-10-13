@@ -968,6 +968,10 @@ impl DecoderLayer {
     /// # Errors
     ///
     /// Returns an error if a required weight tensor is missing or has an unexpected shape.
+    // `vb` should be borrowed (`&VarBuilder`): it is only used to derive
+    // children. Changing it would break downstream callers (Soma) of this
+    // public API, so it stays by value.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         cfg: &TextConfig,
         layer_idx: usize,
