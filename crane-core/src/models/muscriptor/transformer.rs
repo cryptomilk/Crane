@@ -124,7 +124,7 @@ struct StreamingMultiheadAttention {
 }
 
 impl StreamingMultiheadAttention {
-    fn new(vb: VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
+    fn new(vb: &VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
         let embed_dim = config.dim;
         let head_dim = config.head_dim();
         let num_heads = config.num_heads;
@@ -305,8 +305,8 @@ struct StreamingTransformerLayer {
 }
 
 impl StreamingTransformerLayer {
-    fn new(vb: VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
-        let self_attn = StreamingMultiheadAttention::new(vb.pp("self_attn"), config, quant)?;
+    fn new(vb: &VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
+        let self_attn = StreamingMultiheadAttention::new(&vb.pp("self_attn"), config, quant)?;
         let norm1 = candle_nn::layer_norm(config.dim, 1e-5, vb.pp("norm1"))?;
         let norm2 = candle_nn::layer_norm(config.dim, 1e-5, vb.pp("norm2"))?;
         let linear1 = linear_layer(
@@ -353,7 +353,7 @@ pub(crate) struct StreamingTransformer {
 
 impl StreamingTransformer {
     pub(crate) fn new(
-        vb: VarBuilder,
+        vb: &VarBuilder,
         config: &VariantConfig,
         quant: Option<GgmlDType>,
     ) -> Result<Self> {
@@ -361,7 +361,7 @@ impl StreamingTransformer {
         let layers_vb = vb.pp("layers");
         for i in 0..config.num_layers {
             layers.push(StreamingTransformerLayer::new(
-                layers_vb.pp(i),
+                &layers_vb.pp(i),
                 config,
                 quant,
             )?);
