@@ -79,7 +79,11 @@ impl Qwen35RmsNorm {
 impl Module for Qwen35RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         if matches!(x.dtype(), DType::BF16 | DType::F16) {
-            return crate::ops::float_math::rms_norm_low_precision(x,&self.alpha.to_dtype(DType::F32)?,self.eps);
+            return crate::ops::float_math::rms_norm_low_precision(
+                x,
+                &self.alpha.to_dtype(DType::F32)?,
+                self.eps,
+            );
         }
         let alpha = self.alpha.to_dtype(x.dtype())?;
         candle_nn::ops::rms_norm(&x.contiguous()?, &alpha, self.eps)
@@ -680,12 +684,17 @@ impl FullAttention {
         {
             Some(
                 {
-                    let fq=q.transpose(1,2)?.contiguous()?;
-                    let fk=k.transpose(1,2)?.contiguous()?;
-                    let fv=v.transpose(1,2)?.contiguous()?;
-                    if q.dtype()==DType::BF16 && self.head_dim==256 && fq.dim(1)?==fk.dim(1)? {
-                        crate::ops::flash_split::causal_bf16_256_auto(&fq,&fk,&fv)
-                    } else {crate::ops::flash_split::attention(&fq,&fk,&fv,scale as f32,true)}
+                    let fq = q.transpose(1, 2)?.contiguous()?;
+                    let fk = k.transpose(1, 2)?.contiguous()?;
+                    let fv = v.transpose(1, 2)?.contiguous()?;
+                    if q.dtype() == DType::BF16
+                        && self.head_dim == 256
+                        && fq.dim(1)? == fk.dim(1)?
+                    {
+                        crate::ops::flash_split::causal_bf16_256_auto(&fq, &fk, &fv)
+                    } else {
+                        crate::ops::flash_split::attention(&fq, &fk, &fv, scale as f32, true)
+                    }
                 }?
                 .reshape((b_sz, seq_len, self.num_heads * self.head_dim))?,
             )
@@ -918,7 +927,7 @@ impl Module for Mlp {
         let gate = self.gate.forward(x)?;
         let up = self.up.forward(x)?;
         let h = if matches!(gate.dtype(), DType::BF16 | DType::F16) {
-            crate::ops::float_math::swiglu_low_precision(&gate,&up)?
+            crate::ops::float_math::swiglu_low_precision(&gate, &up)?
         } else {
             crate::ops::fused_ops::swiglu::swiglu(&gate, &up)?
         };
