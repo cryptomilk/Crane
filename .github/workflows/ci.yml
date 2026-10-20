@@ -66,8 +66,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: Jimver/cuda-toolkit@v0.2.35
+      - uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
+        with:
+          # Recent CUDA runfile installers dropped bundled samples; passing
+          # --samples (the action's default) makes the installer exit
+          # non-zero. We only need the toolkit to compile against.
+          linux-local-args: '["--toolkit"]'
       - name: Install protoc and ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libasound2-dev
       - name: Build (CUDA)
