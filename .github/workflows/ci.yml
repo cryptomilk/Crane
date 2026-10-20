@@ -69,10 +69,16 @@ jobs:
       - uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
-          # Recent CUDA runfile installers dropped bundled samples; passing
-          # --samples (the action's default) makes the installer exit
-          # non-zero. We only need the toolkit to compile against.
-          linux-local-args: '["--toolkit"]'
+          # 'local' installs the full toolkit meta-package, including
+          # GDS/nvidia-fs, Nsight, and cuda-demo-suite; their post-install
+          # scripts fail on this runner (no GPU/driver) even with
+          # --toolkit-only args. 'network' lets us request only what
+          # candle's cudarc build links against (see cudarc's feature list
+          # in .tmp/candle/Cargo.toml: cublas, cublaslt, curand, driver,
+          # nvrtc) plus nvcc/cudart.
+          method: network
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "nvrtc", "nvrtc-dev", "driver-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcurand", "libcurand-dev"]'
       - name: Install protoc and ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libasound2-dev
       - name: Build (CUDA)
