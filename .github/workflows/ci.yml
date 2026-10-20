@@ -77,6 +77,11 @@ jobs:
           # in .tmp/candle/Cargo.toml: cublas, cublaslt, curand, driver,
           # nvrtc) plus nvcc/cudart.
           method: network
+          # The runner image is on Ubuntu 26.04 now, whose NVIDIA apt repo
+          # only carries CUDA 13.3+ (no -13-2 packages, the action's
+          # default). Pin to 13.3.1, the newest version this action's
+          # release still recognizes (13.4 isn't in its version list yet).
+          cuda: '13.3.1'
           sub-packages: '["nvcc", "cudart", "cudart-dev", "nvrtc", "nvrtc-dev", "driver-dev"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev", "libcurand", "libcurand-dev"]'
       - name: Install protoc and ALSA dev headers
