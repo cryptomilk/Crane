@@ -36,6 +36,35 @@ fn cu_files_in(dir: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
+/// Compiles `kernels/cuda/`'s (and `kernels/cuda/fattn/`'s) `.cu` sources
+/// into the `crane_kernels_ptx.rs` bindings `ops::fused_ops`'s CUDA
+/// dispatchers `include!`. `flash_attention/` holds a separately built host
+/// launch adapter (cudaforge + CUTLASS, gated behind
+/// `flash-attn`/`flash-inference`) that must not go through this PTX-only
+/// pipeline, so it's deliberately not globbed here.
+#[cfg(feature = "cuda")]
+fn build_cuda_ptx() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    let mut kernel_paths = cu_files_in("kernels/cuda");
+    kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
+
+    let builder = bindgen_cuda::Builder::default()
+        .kernel_paths(kernel_paths)
+        .arg("--expt-relaxed-constexpr")
+        .arg("--extended-lambda")
+        .arg("-std=c++17")
+        .arg("-O3");
+
+    let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
+    bindings
+        .write(out_dir.join("crane_kernels_ptx.rs"))
+        .expect("Failed to write PTX bindings");
+}
+
 fn main() {
     #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
@@ -97,32 +126,7 @@ fn main() {
 
     // Only compile CUDA kernels when the cuda feature is enabled.
     #[cfg(feature = "cuda")]
-    {
-        use std::env;
-        use std::path::PathBuf;
-
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-        // Top-level CUDA sources and `fattn/`'s per-head-dim instantiation
-        // units are embedded PTX kernels. `flash_attention/` instead holds a
-        // separately built host launch adapter (cudaforge + CUTLASS, gated
-        // behind `flash-attn`/`flash-inference`) that must not go through
-        // this PTX-only pipeline, so it's deliberately not globbed here.
-        let mut kernel_paths = cu_files_in("kernels/cuda");
-        kernel_paths.extend(cu_files_in("kernels/cuda/fattn"));
-
-        let builder = bindgen_cuda::Builder::default()
-            .kernel_paths(kernel_paths)
-            .arg("--expt-relaxed-constexpr")
-            .arg("--extended-lambda")
-            .arg("-std=c++17")
-            .arg("-O3");
-
-        let bindings = builder.build_ptx().expect("Failed to compile CUDA kernels");
-        bindings
-            .write(out_dir.join("crane_kernels_ptx.rs"))
-            .expect("Failed to write PTX bindings");
-    }
+    build_cuda_ptx();
 
     // Compile the fused SYCL kernels into `libcrane_gdn_sycl.so` with `icpx`.
     // Only when `--features sycl` — a plain build never needs oneAPI. The
