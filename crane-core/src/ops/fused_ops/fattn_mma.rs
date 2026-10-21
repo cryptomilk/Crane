@@ -2553,11 +2553,11 @@ mod ck_parity {
         );
 
         assert!(
-            crane_vs_naive.max_abs <= 3e-2,
+            crane_vs_naive.max_abs <= 2e-3,
             "crane fattn_mma_full diverged from naive reference: {crane_vs_naive}"
         );
         assert!(
-            ck_vs_naive.max_abs <= 3e-2,
+            ck_vs_naive.max_abs <= 2e-3,
             "candle-flash-attn-rocm diverged from naive reference: {ck_vs_naive}"
         );
     }
@@ -2598,11 +2598,11 @@ mod ck_parity {
         );
 
         assert!(
-            crane_vs_naive.max_abs <= 3e-2,
+            crane_vs_naive.max_abs <= 2e-3,
             "crane fattn_mma_causal diverged from naive reference: {crane_vs_naive}"
         );
         assert!(
-            ck_vs_naive.max_abs <= 3e-2,
+            ck_vs_naive.max_abs <= 2e-3,
             "candle-flash-attn-rocm diverged from naive reference: {ck_vs_naive}"
         );
     }
@@ -2673,11 +2673,11 @@ mod ck_parity {
         );
 
         assert!(
-            crane_vs_naive.max_abs <= 3e-2,
+            crane_vs_naive.max_abs <= 1e-2,
             "crane fattn_mma_bf16_full diverged from naive reference: {crane_vs_naive}"
         );
         assert!(
-            ck_vs_naive.max_abs <= 3e-2,
+            ck_vs_naive.max_abs <= 1e-2,
             "candle-flash-attn-rocm (bf16) diverged from naive reference: {ck_vs_naive}"
         );
     }
@@ -2730,11 +2730,11 @@ mod ck_parity {
         );
 
         assert!(
-            crane_vs_naive.max_abs <= 3e-2,
+            crane_vs_naive.max_abs <= 1e-2,
             "crane fattn_mma_bf16_causal diverged from naive reference: {crane_vs_naive}"
         );
         assert!(
-            ck_vs_naive.max_abs <= 3e-2,
+            ck_vs_naive.max_abs <= 1e-2,
             "candle-flash-attn-rocm (bf16) diverged from naive reference: {ck_vs_naive}"
         );
     }
