@@ -15,6 +15,10 @@
 //! `CRANE_DISABLE_MMA_FLASH_ATTN=1` forces the tile kernel, skipping
 //! tensor-core dispatch entirely (see [`mma_disabled`]).
 //!
+//! `CRANE_FORCE_MATMUL_SDPA=1` skips every fused-kernel tier, routing
+//! straight to `attn_dispatch`'s matmul SDPA via `Some` even on a
+//! GPU-eligible shape (see [`matmul_sdpa_forced`]).
+//!
 //! **Known gap:** the tile kernel produces numerically wrong output at
 //! `head_dim=64` on real `ROCm` hardware, for reasons not yet root-caused
 //! (see `ops::fused_ops::fattn_tile`'s `#[ignore]`d `causal_hd64`/
@@ -89,6 +93,26 @@ fn bf16_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var("CRANE_DISABLE_BF16_FLASH_ATTN").is_ok_and(|v| !matches!(v.trim(), "" | "0"))
+    })
+}
+
+/// Whether `CRANE_FORCE_MATMUL_SDPA` is set, forcing [`try_causal`]/
+/// [`try_causal_with_mask`]/[`try_full`]/[`try_windowed`] to skip every
+/// fused-kernel tier and go straight to `attn_dispatch`'s matmul-SDPA
+/// fallback, even on a GPU-eligible shape. Lets the pre-fused-kernel
+/// numerics be reproduced in this binary for an A/B comparison, without a
+/// second checkout. Same `OnceLock`-cached pattern as [`mma_disabled`] and
+/// [`bf16_disabled`], but checked alongside [`head_dim_supported`] so a
+/// forced call still goes through `Some(fallback)`, not `None` — `None`
+/// means "GPU can't serve this at all", which would route the caller's own
+/// CPU-only special cases (e.g. `attn_dispatch::causal`'s single-sequence
+/// `causal_cpu_flash` path) at a GPU tensor instead of the matmul fallback
+/// this flag is meant to force.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn matmul_sdpa_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("CRANE_FORCE_MATMUL_SDPA").is_ok_and(|v| !matches!(v.trim(), "" | "0"))
     })
 }
 
@@ -317,7 +341,7 @@ pub fn try_causal(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option<Resu
         return None;
     }
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if head_dim_supported(q) {
+    if head_dim_supported(q) && !matmul_sdpa_forced() {
         return Some((|| {
             let offset = kv_offset(q, k)?;
             run(
@@ -365,7 +389,7 @@ pub(crate) fn try_causal_with_mask(
         return None;
     }
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if head_dim_supported(q) {
+    if head_dim_supported(q) && !matmul_sdpa_forced() {
         return Some((|| {
             let offset = kv_offset(q, k)?;
             run(
@@ -400,7 +424,7 @@ pub(crate) fn try_full(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Option
         return None;
     }
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if head_dim_supported(q) {
+    if head_dim_supported(q) && !matmul_sdpa_forced() {
         return Some(run(
             q,
             k,
@@ -432,7 +456,7 @@ pub(crate) fn try_windowed(
         return None;
     }
     #[cfg(any(feature = "cuda", feature = "rocm"))]
-    if head_dim_supported(q) {
+    if head_dim_supported(q) && !matmul_sdpa_forced() {
         return Some((|| {
             let offset = kv_offset(q, k)?;
             run(

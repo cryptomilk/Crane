@@ -1233,4 +1233,79 @@ mod gpu_tests {
         assert_eq!(got.dims(), &[b, hq, sq, d]);
         assert_close(&got_vec(got), &want, 3e-2);
     }
+
+    // CRANE_FORCE_MATMUL_SDPA=1 on a real ROCm GPU must route causal()/
+    // full()/windowed() to the matmul-SDPA fallback and still match the
+    // naive reference. causal() with b_sz == 1 and no mask is the
+    // regression case: before gpu_flash_attn::try_causal itself honored the
+    // flag, forcing it here made attn_dispatch::causal's post-match
+    // fallback take the CPU-only causal_cpu_flash path on a GPU tensor,
+    // which errors instead of running matmul SDPA. Checking that path
+    // explicitly guards against that regression recurring.
+    // `matmul_sdpa_forced()` caches its env var read in a `OnceLock` for the
+    // life of the process (same constraint as `mma_disabled()`'s
+    // `head_dim_64_tile_kernel_routes_to_matmul_fallback` test in
+    // `gpu_flash_attn.rs`), so this must run alone in its own process:
+    // `cargo test -p crane-core --no-default-features --features "rocm,onnx"
+    // -- --ignored --exact
+    // models::modules::attn_dispatch::gpu_tests::force_matmul_sdpa_routes_to_matmul_fallback
+    // --nocapture`
+    #[test]
+    #[ignore = "sets a process-global env var cached by matmul_sdpa_forced(); run alone, see doc comment"]
+    fn force_matmul_sdpa_routes_to_matmul_fallback() {
+        // SAFETY: run with `--exact`, alone in its own process, before any
+        // other code reads `CRANE_FORCE_MATMUL_SDPA`.
+        unsafe {
+            std::env::set_var("CRANE_FORCE_MATMUL_SDPA", "1");
+        }
+
+        let rocm = test_gpu_device();
+        let (b, hq, hkv, sq, skv, d) = (1, 4, 2, 20, 150, 128usize);
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let kv_offset = skv - sq;
+
+        let q_f32 = Tensor::randn(0f32, 1f32, (b, hq, sq, d), &Device::Cpu).unwrap();
+        let k_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+        let v_f32 = Tensor::randn(0f32, 1f32, (b, hkv, skv, d), &Device::Cpu).unwrap();
+
+        let q = q_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let k = k_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+        let v = v_f32
+            .to_dtype(DType::F16)
+            .unwrap()
+            .to_device(&rocm)
+            .unwrap();
+
+        // causal() with b_sz == 1 and no mask: the regression case.
+        let want_causal =
+            naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, true, kv_offset, None);
+        let got_causal = causal(&q, &k, &v, scale, None).unwrap();
+        assert_eq!(got_causal.dims(), &[b, hq, sq, d]);
+        assert_close(&got_vec(got_causal), &want_causal, 3e-2);
+
+        let want_full = naive_attention_bhsd(&q_f32, &k_f32, &v_f32, scale, false, 0, None);
+        let got_full = full(&q, &k, &v, scale).unwrap();
+        assert_close(&got_vec(got_full), &want_full, 3e-2);
+
+        let (window_left, window_right) = (20, 0);
+        let want_windowed = naive_attention_bhsd(
+            &q_f32,
+            &k_f32,
+            &v_f32,
+            scale,
+            false,
+            kv_offset,
+            Some((window_left, window_right)),
+        );
+        let got_windowed = windowed(&q, &k, &v, scale, window_left, window_right).unwrap();
+        assert_close(&got_vec(got_windowed), &want_windowed, 3e-2);
+    }
 }
