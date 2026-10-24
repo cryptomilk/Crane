@@ -1320,3 +1320,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 #[path = "fla_decode_tests.rs"]
 mod fla_decode_tests;
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[path = "attn_parity_tests.rs"]
+mod attn_parity_tests;
