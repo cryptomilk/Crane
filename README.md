@@ -782,6 +782,8 @@ Q/K/V preparation and gated normalization for batch-one BF16 inputs with
 the convolution-only optimization also supports other head widths. This path is
 opt-in, continues directly from the shared FLA prefill states, and preserves
 current single-token rounding. Multi-token FLA arithmetic is unchanged.
+F32 activations, as in GGUF models on CUDA, use F32 builds of the same three
+kernels instead of the op-by-op path.
 
 Tests: `cargo test -p crane-core --features cuda --test gdn_fused --test topk_rows -- --ignored`
 (legacy fused vs op chain, plus default FLA state/rollback/decode; use

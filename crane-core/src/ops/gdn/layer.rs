@@ -59,6 +59,24 @@ struct FusedConsts {
     conv_w: Tensor,
     /// Gated-norm weight `[head_v_dim]` f32 (via the activation dtype).
     norm_w: Tensor,
+    /// `conv_w` / `norm_w` without the bf16 round trip, for f32 (GGUF) decode.
+    #[cfg(feature = "cuda")]
+    conv_w_f32: Tensor,
+    #[cfg(feature = "cuda")]
+    norm_w_f32: Tensor,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl FusedConsts {
+    /// The conv and norm weights matching the activation dtype `act`.
+    fn weights(&self, act: DType) -> (&Tensor, &Tensor) {
+        #[cfg(feature = "cuda")]
+        if act == DType::F32 {
+            return (&self.conv_w_f32, &self.norm_w_f32);
+        }
+        let _ = act;
+        (&self.conv_w, &self.norm_w)
+    }
 }
 
 impl GatedDeltaNet {
@@ -237,9 +255,15 @@ impl GatedDeltaNet {
             match act {
                 Some(act) if norm.activation() == super::norm::GateActivation::Silu => {
                     let via = |t: &Tensor| t.to_dtype(act)?.to_dtype(DType::F32)?.contiguous();
+                    #[cfg(feature = "cuda")]
+                    let exact = |t: &Tensor| t.to_dtype(DType::F32)?.contiguous();
                     Some(FusedConsts {
                         conv_w: via(&conv1d_weight.squeeze(1)?)?,
                         norm_w: via(norm.weight())?,
+                        #[cfg(feature = "cuda")]
+                        conv_w_f32: exact(&conv1d_weight.squeeze(1)?)?,
+                        #[cfg(feature = "cuda")]
+                        norm_w_f32: exact(norm.weight())?,
                     })
                 },
                 _ => None,
@@ -454,7 +478,8 @@ impl GatedDeltaNet {
         })
     }
 
-    /// The fused BF16 path on CUDA (decode opt-in), any pass on Metal;
+    /// The fused path on CUDA (BF16, or F32 single-token; decode opt-in),
+    /// any pass on Metal;
     /// `split` is the speculative-decoding checkpoint position
     /// (`0 < p < seq_len`).
     #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -473,6 +498,7 @@ impl GatedDeltaNet {
         let h = dims.num_v_heads;
         let x2 = mixed.reshape((seq_len, dims.conv_dim))?.contiguous()?;
         let act = x2.dtype();
+        let (conv_w, norm_w) = fused.weights(act);
         if cache.conv_state.dtype() != act {
             cache.conv_state = cache.conv_state.to_dtype(act)?;
         }
@@ -482,13 +508,13 @@ impl GatedDeltaNet {
             {
                 if seq_len == 1 {
                     // Preserve main's S=1 BF16 rounding; FLA prefill uses its own profile.
-                    return gf::decode_conv_silu(&x2, &state, &fused.conv_w);
+                    return gf::decode_conv_silu(&x2, &state, conv_w);
                 }
-                gf::conv_silu_with_numerics(&x2, &state, &fused.conv_w, split, cache.fla_numerics)
+                gf::conv_silu_with_numerics(&x2, &state, conv_w, split, cache.fla_numerics)
             }
             #[cfg(not(feature = "cuda"))]
             {
-                gf::conv_silu(&x2, &state, &fused.conv_w, split)
+                gf::conv_silu(&x2, &state, conv_w, split)
             }
         })?;
         cache.conv_state = conv.state.clone();
@@ -533,7 +559,7 @@ impl GatedDeltaNet {
                     &out_buf,
                     &y,
                     &projected.z,
-                    &fused.norm_w,
+                    norm_w,
                     self.norm.eps(),
                     t0,
                     len,
@@ -613,7 +639,7 @@ impl GatedDeltaNet {
                     &out_buf,
                     &y,
                     &projected.z,
-                    &fused.norm_w,
+                    norm_w,
                     self.norm.eps(),
                     t0,
                     len,

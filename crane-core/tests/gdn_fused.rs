@@ -511,6 +511,62 @@ fn decode_stages_match_across_steps_and_checkpoints() {
     }
 }
 
+/// GGUF decode: F32 activations through the fused single-token kernels,
+/// starting from the BF16 conv state that a BF16 prefill leaves behind.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs a CUDA GPU; run with --test-threads=1"]
+fn fused_f32_decode_matches_op_chain() {
+    let _env = FlaTestEnv::new();
+    use crane_core::ops::gdn::VHeadOrder;
+    let (dev, _) = gpu();
+    for v_heads in [4, 8] {
+        let cfg = Cfg {
+            hidden: 512,
+            k_heads: 4,
+            v_heads,
+        };
+        let (gdn, mut dims) = layer(&dev, &cfg, DType::F32);
+        for order in [VHeadOrder::Interleaved, VHeadOrder::Chunked] {
+            dims.v_head_order = order;
+            let base = GdnLayerCache::new(&cfg, DType::F32, &dev).unwrap();
+            let prefix = rand(&dev, &[1, 11, cfg.hidden], 1.);
+            let (_, mut reference) = run(&gdn, &dims, &prefix, &base, None, false);
+            reference.conv_state = reference.conv_state.to_dtype(DType::BF16).unwrap();
+            let mut fused = reference.clone();
+            // Without this the "fused" run is the op chain and every check is vacuous.
+            unsafe { std::env::set_var("CRANE_GDN_FUSED", "1") };
+            let probe = rand(&dev, &[1, 1, cfg.hidden], 1.);
+            assert!(crane_core::ops::gdn::gdn_fused::supported(&probe, &dims));
+            for step in 0..8 {
+                let x = rand(&dev, &[1, 1, cfg.hidden], 1.);
+                let checkpoint = match step {
+                    0 => Some(0),
+                    1 => Some(1),
+                    _ => None,
+                };
+                let (ya, ca) = run(&gdn, &dims, &x, &reference, checkpoint, false);
+                let (yb, cb) = run(&gdn, &dims, &x, &fused, checkpoint, true);
+                assert_eq!(yb.dtype(), DType::F32);
+                let (_, _, ymax) = diff(&ya, &yb);
+                let (cd, _, _) = diff(&ca.conv_state, &cb.conv_state);
+                let (_, _, rmax) = diff(&ca.recurrent_state, &cb.recurrent_state);
+                println!("v_heads={v_heads} {order:?} step={step}: y {ymax:e}, state {rmax:e}");
+                assert_eq!(cd, 0, "conv step {step}, {order:?}");
+                assert!(rmax <= 1e-5, "state step {step}, {order:?}: {rmax}");
+                assert!(ymax <= 1e-4, "output step {step}, {order:?}: {ymax}");
+                assert_eq!(ca.checkpoint.is_some(), cb.checkpoint.is_some());
+                if let (Some((ac, ar)), Some((bc, br))) = (&ca.checkpoint, &cb.checkpoint) {
+                    assert_eq!(diff(ac, bc).0, 0);
+                    assert!(diff(ar, br).2 <= 1e-5);
+                }
+                reference = ca;
+                fused = cb;
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "needs a CUDA GPU"]

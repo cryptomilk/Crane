@@ -211,3 +211,121 @@ fn real_qwen35_fla_decode_parity() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "needs CUDA and CRANE_QWEN35_GGUF pointing to a local .gguf"]
+fn real_qwen35_gguf_fused_decode_parity() -> Result<()> {
+    let _env = EnvRestore::new();
+    let path = std::env::var("CRANE_QWEN35_GGUF").context("set CRANE_QWEN35_GGUF")?;
+    let report_path = std::env::var("CRANE_GGUF_REPORT")
+        .context("set CRANE_GGUF_REPORT for per-step CSV evidence")?;
+    let dev = Device::new_cuda(0)?;
+    let mut reference = Model::new(&path, &dev, &DType::F32)?;
+    let mut actual = Model::new(&path, &dev, &DType::F32)?;
+    let text = "Explain how a computer processes a sentence, stores intermediate results, and generates the next word. Use a concrete example and describe each calculation carefully. ".repeat(40);
+    let encoding = actual
+        .tokenizer
+        .tokenizer()
+        .encode(text, false)
+        .map_err(E::msg)?;
+    let tokens = encoding.get_ids();
+    anyhow::ensure!(
+        tokens.len() >= 258,
+        "need at least 258 teacher-forced tokens"
+    );
+    let mut report = std::io::BufWriter::new(std::fs::File::create(report_path)?);
+    writeln!(
+        report,
+        "prefix,step,tensor,layer,max_abs,mean_abs,relative_l2"
+    )?;
+    let mut failures = Vec::new();
+    let mut first_flip = Vec::new();
+    let mut worst: std::collections::BTreeMap<String, (usize, usize, ErrorStats)> =
+        Default::default();
+    for prefix in [64usize, 130] {
+        reference.inner.reset_gdn_caches()?;
+        actual.inner.reset_gdn_caches()?;
+        let ids = Tensor::new(&tokens[..prefix], &dev)?.unsqueeze(0)?;
+        let mask =
+            super::super::prefill::causal_mask(prefix, 0, &dev, reference.inner.attention_dtype())?;
+        let expected = reference.inner.forward_layers(&ids, 0, Some(&mask))?;
+        let y = actual.inner.forward_layers(&ids, 0, Some(&mask))?;
+        let stats = error_stats(&y, &expected)?;
+        assert_eq!(stats.max_abs, 0., "all prefill hidden positions");
+        let mut bitwise = true;
+        for step in 0..128 {
+            let pos = prefix + step;
+            let ids = Tensor::new(&[[tokens[pos]]], &dev)?;
+            unsafe {
+                std::env::set_var("CRANE_GDN_FUSED", "0");
+            }
+            let expected = reference.inner.forward_layers(&ids, pos, None)?;
+            let expected_logits = reference.inner.head(&expected)?;
+            unsafe {
+                std::env::set_var("CRANE_GDN_FUSED", "1");
+            }
+            let y = actual.inner.forward_layers(&ids, pos, None)?;
+            let logits = actual.inner.head(&y)?;
+            anyhow::ensure!(y.dtype() == DType::F32, "GGUF decode must stay F32");
+            // GGUF attention runs in BF16, so once an ulp-level GDN difference
+            // flips one BF16 rounding the hidden states diverge by ~3%, the same
+            // as main's portable GDN path does against main. Until then the GDN
+            // caches must agree to rounding error; afterwards the error must stay
+            // bounded and the greedy token must not change.
+            if bitwise && error_stats(&y, &expected)?.max_abs != 0. {
+                bitwise = false;
+                first_flip.push((prefix, step));
+            }
+            let mut compare = |name: &str, layer: usize, a: &Tensor, b: &Tensor| -> Result<()> {
+                let stats = error_stats(a, b)?;
+                writeln!(
+                    report,
+                    "{prefix},{step},{name},{layer},{:.12e},{:.12e},{:.12e}",
+                    stats.max_abs, stats.mean_abs, stats.relative_l2
+                )?;
+                let ok = match name {
+                    "conv" => !bitwise || stats.max_abs == 0.,
+                    "state" => !bitwise || stats.max_abs <= 1e-6,
+                    _ => stats.relative_l2 <= 0.05,
+                };
+                if !ok {
+                    failures.push(format!("{name} layer={layer} prefix={prefix} step={step}"));
+                }
+                if worst
+                    .get(name)
+                    .is_none_or(|(_, _, old)| stats.max_abs > old.max_abs)
+                {
+                    worst.insert(name.to_owned(), (prefix, step, stats));
+                }
+                Ok(())
+            };
+            compare("hidden", 0, &y, &expected)?;
+            compare("logits", 0, &logits, &expected_logits)?;
+            for (layer, (a, b)) in actual
+                .inner
+                .gdn_caches
+                .iter()
+                .zip(&reference.inner.gdn_caches)
+                .enumerate()
+            {
+                if let (Some(a), Some(b)) = (a, b) {
+                    compare("conv", layer, &a.conv_state, &b.conv_state)?;
+                    compare("state", layer, &a.recurrent_state, &b.recurrent_state)?;
+                }
+            }
+            let top = |l: &Tensor| l.flatten_all()?.argmax(0)?.to_scalar::<u32>();
+            if top(&logits)? != top(&expected_logits)? {
+                failures.push(format!("argmax prefix={prefix} step={step}"));
+            }
+        }
+    }
+    report.flush()?;
+    println!("first hidden difference (prefix, step): {first_flip:?}");
+    for (name, (prefix, step, stats)) in worst {
+        println!("worst {name} prefix={prefix} step={step}: {stats:?}");
+    }
+    // A silent fallback to the op chain would match bit for bit at every step.
+    assert_eq!(first_flip.len(), 2, "fused decode never ran");
+    assert!(failures.is_empty(), "parity gates failed: {failures:?}");
+    Ok(())
+}

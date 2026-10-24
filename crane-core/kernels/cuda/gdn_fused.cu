@@ -13,11 +13,16 @@
 //                          recurrence kernel reads
 //   gdn_post_norm_bf16     recurrence output -> bf16 -> gated RMSNorm -> bf16
 //
+// gdn_prep and gdn_post_norm also have _f32 variants for single-token GGUF
+// decode, where every bf16 rounding point becomes a no-op.
+//
 // Every f32 mul/add that the Candle chain performs as a separate op is spelled
 // with __fmul_rn/__fadd_rn so nvcc cannot contract it into an FMA.
 
 #include <cuda_bf16.h>
 #include <math.h>
+
+#include "gdn_act.cuh"
 
 #define GDN_HEAD_DIM 128
 #define GDN_CONV_K 4
@@ -102,10 +107,11 @@ extern "C" __global__ void gdn_conv_silu_bf16(
 // Candle's L2 norm for bf16 inputs, per 128-wide row, one warp per row: squares
 // rounded to bf16 individually, four lane-local accumulators (elements
 // lane + 32 j), warp tree reduce, eps added to the *sum*.
+template <typename T>
 __device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], bool modern, bool decode) {
     float p[4];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) p[j] = modern ? __fmul_rn(v[j], v[j]) : bf16_round(v[j] * v[j]);
+    for (int j = 0; j < 4; ++j) p[j] = modern ? __fmul_rn(v[j], v[j]) : to_f(from_f<T>(v[j] * v[j]));
     // Match current single-token Candle normalization; keep prefill arithmetic unchanged.
     float sum = modern && decode ? __fadd_rn(__fadd_rn(p[0], p[2]), __fadd_rn(p[1], p[3]))
                        : __fadd_rn(__fadd_rn(__fadd_rn(p[0], p[1]), p[2]), p[3]);
@@ -113,7 +119,7 @@ __device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], boo
     float denom = __fadd_rn(__shfl_sync(0xffffffff, sum, 0), 1e-6f);
     float inv = modern && decode ? __frcp_rn(__fsqrt_rn(denom)) : rsqrtf(denom);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[j] = modern ? bf16_round(__fmul_rn(v[j], inv)) : v[j] * inv;
+    for (int j = 0; j < 4; ++j) out[j] = modern ? to_f(from_f<T>(__fmul_rn(v[j], inv))) : v[j] * inv;
 }
 
 // Grid: (len, ceil(H / warps), 1); each warp owns one (t, value head).
@@ -122,9 +128,10 @@ __device__ __forceinline__ void l2_row(const float (&v)[4], float (&out)[4], boo
 //   q3,k3,v3: [H, len, 128] f32, g2/beta2: [H, len] f32 for tokens t0 .. t0+len
 // Key head of value head hv: order 0 (interleaved) hv / vpg, order 1 (chunked)
 // hv % num_k.
-extern "C" __global__ void gdn_prep_bf16(
-    const __nv_bfloat16* __restrict__ conv, const __nv_bfloat16* __restrict__ a,
-    const __nv_bfloat16* __restrict__ b, const float* __restrict__ neg_exp_a_log,
+template <typename T>
+__device__ void gdn_prep(
+    const T* __restrict__ conv, const T* __restrict__ a,
+    const T* __restrict__ b, const float* __restrict__ neg_exp_a_log,
     const float* __restrict__ dt_bias, float* __restrict__ q3, float* __restrict__ k3,
     float* __restrict__ v3, float* __restrict__ g2, float* __restrict__ beta2,
     int t0, int len, int H, int num_k, int vpg, int order, int key_dim, int C, int as_,
@@ -138,33 +145,33 @@ extern "C" __global__ void gdn_prep_bf16(
     int t = t0 + tt;
     int kh = order == 0 ? hv / vpg : hv % num_k;
 
-    const __nv_bfloat16* qrow = conv + (size_t)t * C + kh * GDN_HEAD_DIM;
-    const __nv_bfloat16* krow = conv + (size_t)t * C + key_dim + kh * GDN_HEAD_DIM;
-    const __nv_bfloat16* vrow = conv + (size_t)t * C + 2 * key_dim + hv * GDN_HEAD_DIM;
+    const T* qrow = conv + (size_t)t * C + kh * GDN_HEAD_DIM;
+    const T* krow = conv + (size_t)t * C + key_dim + kh * GDN_HEAD_DIM;
+    const T* vrow = conv + (size_t)t * C + 2 * key_dim + hv * GDN_HEAD_DIM;
     size_t out_row = ((size_t)hv * len + tt) * GDN_HEAD_DIM;
 
     float qv[4], kv[4], qn[4], kn[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        qv[j] = __bfloat162float(qrow[lane + 32 * j]);
-        kv[j] = __bfloat162float(krow[lane + 32 * j]);
+        qv[j] = to_f(qrow[lane + 32 * j]);
+        kv[j] = to_f(krow[lane + 32 * j]);
     }
-    l2_row(qv, qn, fla_numerics != 0, decode != 0);
-    l2_row(kv, kn, fla_numerics != 0, decode != 0);
+    l2_row<T>(qv, qn, fla_numerics != 0, decode != 0);
+    l2_row<T>(kv, kn, fla_numerics != 0, decode != 0);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         q3[out_row + lane + 32 * j] = __fmul_rn(qn[j], scale);
         k3[out_row + lane + 32 * j] = kn[j];
-        v3[out_row + lane + 32 * j] = __bfloat162float(vrow[lane + 32 * j]);
+        v3[out_row + lane + 32 * j] = to_f(vrow[lane + 32 * j]);
     }
     if (lane == 0) {
-        float bv = __bfloat162float(b[(size_t)t * bs_ + hv]);
-        float av = __bfloat162float(a[(size_t)t * as_ + hv]);
+        float bv = to_f(b[(size_t)t * bs_ + hv]);
+        float av = to_f(a[(size_t)t * as_ + hv]);
         float beta = 1.0f / (1.0f + expf(-bv));
         float sp = __fadd_rn(av, dt_bias[hv]);
         sp = sp > 20.f ? sp : log1pf(expf(sp));
         g2[(size_t)hv * len + tt] = __fmul_rn(neg_exp_a_log[hv], sp);
-        beta2[(size_t)hv * len + tt] = bf16_round(beta);  // beta is rounded to bf16
+        beta2[(size_t)hv * len + tt] = to_f(from_f<T>(beta));  // beta is rounded like T
     }
 }
 
@@ -172,9 +179,10 @@ extern "C" __global__ void gdn_prep_bf16(
 //   x = bf16(y); n = bf16(rms_norm(x) in the ordered-f32 layout); w' = bf16(n * w);
 //   out = bf16(w' * silu(z))
 // rms_norm uses the `rms_norm_f32_ordered` lane layout (lane*4 + j).
-extern "C" __global__ void gdn_post_norm_bf16(
-    const float* __restrict__ y, const __nv_bfloat16* __restrict__ z,
-    const float* __restrict__ w, __nv_bfloat16* __restrict__ out, int t0, int len, int H,
+template <typename T>
+__device__ void gdn_post_norm(
+    const float* __restrict__ y, const T* __restrict__ z,
+    const float* __restrict__ w, T* __restrict__ out, int t0, int len, int H,
     int zs, float eps) {
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
@@ -184,12 +192,12 @@ extern "C" __global__ void gdn_post_norm_bf16(
     if (hv >= H) return;
     int t = t0 + tt;
     const float* yrow = y + ((size_t)hv * len + tt) * GDN_HEAD_DIM;
-    const __nv_bfloat16* zrow = z + (size_t)t * zs + hv * GDN_HEAD_DIM;
+    const T* zrow = z + (size_t)t * zs + hv * GDN_HEAD_DIM;
 
     float xv[4], sums[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        xv[j] = bf16_round(yrow[lane * 4 + j]);
+        xv[j] = to_f(from_f<T>(yrow[lane * 4 + j]));
         sums[j] = __fadd_rn(0.f, __fmul_rn(xv[j], xv[j]));
     }
     float sum = __fadd_rn(__fadd_rn(__fadd_rn(sums[0], sums[1]), sums[2]), sums[3]);
@@ -199,10 +207,35 @@ extern "C" __global__ void gdn_post_norm_bf16(
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         int col = lane * 4 + j;
-        float normalized = bf16_round(__fmul_rn(xv[j], inv));
-        float weighted = bf16_round(__fmul_rn(normalized, w[col]));
-        float gate = silu_f32(__bfloat162float(zrow[col]));
+        float normalized = to_f(from_f<T>(__fmul_rn(xv[j], inv)));
+        float weighted = to_f(from_f<T>(__fmul_rn(normalized, w[col])));
+        float gate = silu_f32(to_f(zrow[col]));
         out[(size_t)t * H * GDN_HEAD_DIM + hv * GDN_HEAD_DIM + col] =
-            __float2bfloat16_rn(__fmul_rn(weighted, gate));
+            from_f<T>(__fmul_rn(weighted, gate));
     }
 }
+
+#define GDN_POSTNORM_KERNEL(T, NAME)                                              \
+    extern "C" __global__ void gdn_post_norm_##NAME(                              \
+        const float* __restrict__ y, const T* __restrict__ z,                     \
+        const float* __restrict__ w, T* __restrict__ out, int t0, int len, int H, \
+        int zs, float eps) {                                                      \
+        gdn_post_norm<T>(y, z, w, out, t0, len, H, zs, eps);                      \
+    }
+
+#define GDN_PREP_KERNEL(T, NAME)                                                              \
+    extern "C" __global__ void gdn_prep_##NAME(                                               \
+        const T* __restrict__ conv, const T* __restrict__ a, const T* __restrict__ b,         \
+        const float* __restrict__ neg_exp_a_log, const float* __restrict__ dt_bias,           \
+        float* __restrict__ q3, float* __restrict__ k3, float* __restrict__ v3,               \
+        float* __restrict__ g2, float* __restrict__ beta2, int t0, int len, int H, int num_k, \
+        int vpg, int order, int key_dim, int C, int as_, int bs_, float scale,                \
+        int fla_numerics, int decode) {                                                       \
+        gdn_prep<T>(conv, a, b, neg_exp_a_log, dt_bias, q3, k3, v3, g2, beta2, t0, len, H,    \
+            num_k, vpg, order, key_dim, C, as_, bs_, scale, fla_numerics, decode);            \
+    }
+
+GDN_PREP_KERNEL(float, f32)
+GDN_PREP_KERNEL(__nv_bfloat16, bf16)
+GDN_POSTNORM_KERNEL(float, f32)
+GDN_POSTNORM_KERNEL(__nv_bfloat16, bf16)

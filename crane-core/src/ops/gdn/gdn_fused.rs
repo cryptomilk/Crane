@@ -1,5 +1,5 @@
-//! Launchers for the fused multi-token GDN stages in
-//! `kernels/cuda/gdn_fused.cu` (bf16 activations, head dim 128, batch 1).
+//! Launchers for the fused GDN stages in `kernels/cuda/gdn_fused.cu` (bf16
+//! activations, or f32 for single-token decode; head dim 128, batch 1).
 //!
 //! Short passes through a GDN layer -- speculative-decoding verification
 //! blocks, prefill chunks -- are dispatch-bound: the op-by-op conv / split /
@@ -26,14 +26,19 @@ const CONV_K: usize = 4;
 /// Warps (value heads) per block in the prep / post kernels.
 const WARPS: usize = 4;
 
-/// Whether the fused path can run for this layer and input: CUDA, bf16, batch 1,
-/// 128-wide heads and a 4-tap conv. Single-token decode remains opt-in.
+/// Whether the fused path can run for this layer and input: CUDA, batch 1,
+/// 128-wide heads and a 4-tap conv; bf16 for any length, f32 (GGUF decode)
+/// for single tokens only. Single-token decode remains opt-in.
 pub fn supported(x: &Tensor, dims: &GdnDims) -> bool {
     x.device().is_cuda()
-        && x.dtype() == DType::BF16
         && x.dim(0).is_ok_and(|b| b == 1)
         && x.dim(1).is_ok_and(|s| {
-            s > 1 || (s == 1 && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1"))
+            let decode = s == 1 && std::env::var("CRANE_GDN_FUSED").is_ok_and(|v| v == "1");
+            match x.dtype() {
+                DType::BF16 => s > 1 || decode,
+                DType::F32 => decode,
+                _ => false,
+            }
         })
         && dims.head_k_dim == HEAD_DIM
         && dims.head_v_dim == HEAD_DIM
@@ -78,7 +83,7 @@ fn wrap<T: candle_core::cuda_backend::CudaDType>(
 
 /// Result of [`conv_silu`].
 pub struct ConvOut {
-    /// `[S, C]` bf16, silu already applied.
+    /// `[S, C]` in the input dtype, silu already applied.
     pub y: Tensor,
     /// `[1, C, 4]` conv state after all `S` tokens.
     pub state: Tensor,
@@ -166,7 +171,9 @@ pub fn conv_silu_with_numerics(
     })
 }
 
-/// Single-token convolution rounding through BF16 before FP32 SiLU.
+/// Single-token convolution + SiLU. `x` and `state` are both BF16 (rounded
+/// through BF16 before the FP32 SiLU) or both F32 (GGUF decode); `weight` is
+/// F32 and `y`/`state` come back in the input dtype.
 ///
 /// # Errors
 ///
@@ -185,17 +192,33 @@ pub(super) fn decode_conv_silu(x: &Tensor, state: &Tensor, weight: &Tensor) -> R
     if !x.device().same_device(state.device()) || !x.device().same_device(weight.device()) {
         candle_core::bail!("gdn decode conv: inputs must be on the same CUDA device");
     }
+    if state.dtype() != x.dtype() {
+        candle_core::bail!("gdn decode conv: x and state must share a dtype");
+    }
+    match x.dtype() {
+        DType::BF16 => decode_conv_launch::<bf16>(x, state, weight, "gdn_decode_conv_silu_bf16"),
+        DType::F32 => decode_conv_launch::<f32>(x, state, weight, "gdn_decode_conv_silu_f32"),
+        d => candle_core::bail!("gdn decode conv: unsupported dtype {d:?}"),
+    }
+}
+
+fn decode_conv_launch<
+    T: candle_core::cuda_backend::CudaDType + candle_core::cuda_backend::cudarc::driver::DeviceRepr,
+>(
+    x: &Tensor,
+    state: &Tensor,
+    weight: &Tensor,
+    kernel: &str,
+) -> Result<ConvOut> {
+    let c = x.dim(1)?;
     let dev = x.device().as_cuda_device()?.clone();
-    cuda_view!(x_v, x_g, x, bf16);
-    cuda_view!(state_v, state_g, state, bf16);
+    cuda_view!(x_v, x_g, x, T);
+    cuda_view!(state_v, state_g, state, T);
     cuda_view!(w_v, w_g, weight, f32);
-    let y = unsafe { dev.alloc::<bf16>(c) }?;
-    let new_state = unsafe { dev.alloc::<bf16>(c * CONV_K) }?;
-    let func = dev.get_or_load_custom_func(
-        "gdn_decode_conv_silu_bf16",
-        "crane_gdn_decode_conv",
-        ptx::GDN_DECODE_CONV,
-    )?;
+    let y = unsafe { dev.alloc::<T>(c) }?;
+    let new_state = unsafe { dev.alloc::<T>(c * CONV_K) }?;
+    let func =
+        dev.get_or_load_custom_func(kernel, "crane_gdn_decode_conv", ptx::GDN_DECODE_CONV)?;
     let c_i = c as i32;
     let mut launch = func.builder();
     launch.arg(&x_v);
@@ -276,15 +299,64 @@ pub fn prep_with_numerics(
     scale: f32,
     fla_numerics: bool,
 ) -> Result<Prepped> {
+    if a.dtype() != conv.dtype() || b.dtype() != conv.dtype() {
+        candle_core::bail!("gdn fused prep: conv, a and b must share a dtype");
+    }
+    let (nea, dt) = (neg_exp_a_log, dt_bias);
+    match conv.dtype() {
+        DType::BF16 => prep_launch::<bf16>(
+            conv,
+            a,
+            b,
+            nea,
+            dt,
+            dims,
+            t0,
+            len,
+            scale,
+            fla_numerics,
+            "gdn_prep_bf16",
+        ),
+        DType::F32 => prep_launch::<f32>(
+            conv,
+            a,
+            b,
+            nea,
+            dt,
+            dims,
+            t0,
+            len,
+            scale,
+            fla_numerics,
+            "gdn_prep_f32",
+        ),
+        d => candle_core::bail!("gdn fused prep: unsupported dtype {d:?}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prep_launch<T: candle_core::cuda_backend::CudaDType>(
+    conv: &Tensor,
+    a: &Tensor,
+    b: &Tensor,
+    neg_exp_a_log: &Tensor,
+    dt_bias: &Tensor,
+    dims: &GdnDims,
+    t0: usize,
+    len: usize,
+    scale: f32,
+    fla_numerics: bool,
+    kernel: &str,
+) -> Result<Prepped> {
     let c = conv.dim(1)?;
     let h = dims.num_v_heads;
     let dev = conv.device().as_cuda_device()?.clone();
     let (Some(as_), Some(bs_)) = (token_stride(a), token_stride(b)) else {
         candle_core::bail!("gdn fused prep: a/b must have packed head dims");
     };
-    cuda_view!(conv_v, conv_g, conv, bf16);
-    cuda_view!(a_v, a_g, a, bf16);
-    cuda_view!(b_v, b_g, b, bf16);
+    cuda_view!(conv_v, conv_g, conv, T);
+    cuda_view!(a_v, a_g, a, T);
+    cuda_view!(b_v, b_g, b, T);
     cuda_view!(nea_v, nea_g, neg_exp_a_log, f32);
     cuda_view!(dt_v, dt_g, dt_bias, f32);
     let q3 = unsafe { dev.alloc::<f32>(h * len * HEAD_DIM) }?;
@@ -293,7 +365,7 @@ pub fn prep_with_numerics(
     let g2 = unsafe { dev.alloc::<f32>(h * len) }?;
     let beta2 = unsafe { dev.alloc::<f32>(h * len) }?;
 
-    let func = dev.get_or_load_custom_func("gdn_prep_bf16", MODULE, ptx::GDN_FUSED)?;
+    let func = dev.get_or_load_custom_func(kernel, MODULE, ptx::GDN_FUSED)?;
     let order = i32::from(dims.v_head_order == VHeadOrder::Chunked);
     let ints = [
         t0 as i32,
@@ -342,29 +414,36 @@ pub fn prep_with_numerics(
     })
 }
 
-/// Allocate the `[S, H*128]` bf16 output of [`post_norm`].
+/// The `[S, H*128]` output of [`post_norm`], in the activation dtype.
+pub enum PostBuf {
+    Bf16(candle_core::cuda_backend::cudarc::driver::CudaSlice<bf16>),
+    F32(candle_core::cuda_backend::cudarc::driver::CudaSlice<f32>),
+}
+
+/// Allocate the output of [`post_norm`] in `like`'s dtype (bf16 or f32).
 ///
 /// # Errors
 ///
-/// Returns an error if the allocation fails.
-pub fn alloc_post_out(
-    like: &Tensor,
-    seq_len: usize,
-    h: usize,
-) -> Result<candle_core::cuda_backend::cudarc::driver::CudaSlice<bf16>> {
+/// Returns an error if the allocation fails or the dtype is unsupported.
+pub fn alloc_post_out(like: &Tensor, seq_len: usize, h: usize) -> Result<PostBuf> {
     let dev = like.device().as_cuda_device()?;
-    Ok(unsafe { dev.alloc::<bf16>(seq_len * h * HEAD_DIM) }?)
+    let n = seq_len * h * HEAD_DIM;
+    match like.dtype() {
+        DType::BF16 => Ok(PostBuf::Bf16(unsafe { dev.alloc::<bf16>(n) }?)),
+        DType::F32 => Ok(PostBuf::F32(unsafe { dev.alloc::<f32>(n) }?)),
+        d => candle_core::bail!("gdn fused post: unsupported dtype {d:?}"),
+    }
 }
 
 /// Recurrence output `y: [H, len, 128]` f32 for tokens `t0 .. t0 + len` ->
-/// bf16 -> gated RMSNorm with `z: [1, S, H, 128]` -> rows of `out`.
+/// activation dtype -> gated RMSNorm with `z: [1, S, H, 128]` -> rows of `out`.
 ///
 /// # Errors
 ///
 /// Returns an error if `z` is not packed per head or the launch fails.
 #[allow(clippy::too_many_arguments)]
 pub fn post_norm(
-    out: &candle_core::cuda_backend::cudarc::driver::CudaSlice<bf16>,
+    out: &PostBuf,
     y: &Tensor,
     z: &Tensor,
     weight: &Tensor,
@@ -373,15 +452,38 @@ pub fn post_norm(
     len: usize,
     h: usize,
 ) -> Result<()> {
+    match (out, z.dtype()) {
+        (PostBuf::Bf16(o), DType::BF16) => {
+            post_norm_launch::<bf16>(o, y, z, weight, eps, t0, len, h, "gdn_post_norm_bf16")
+        },
+        (PostBuf::F32(o), DType::F32) => {
+            post_norm_launch::<f32>(o, y, z, weight, eps, t0, len, h, "gdn_post_norm_f32")
+        },
+        (_, d) => candle_core::bail!("gdn fused post: z is {d:?}, which doesn't match the output"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_norm_launch<T: candle_core::cuda_backend::CudaDType>(
+    out: &candle_core::cuda_backend::cudarc::driver::CudaSlice<T>,
+    y: &Tensor,
+    z: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    t0: usize,
+    len: usize,
+    h: usize,
+    kernel: &str,
+) -> Result<()> {
     let dev = y.device().as_cuda_device()?.clone();
     let zs = z.layout().stride()[1];
     if z.layout().stride()[2] != HEAD_DIM || z.layout().stride()[3] != 1 {
         candle_core::bail!("gdn fused post: z must be packed per head");
     }
     cuda_view!(y_v, y_g, y, f32);
-    cuda_view!(z_v, z_g, z, bf16);
+    cuda_view!(z_v, z_g, z, T);
     cuda_view!(w_v, w_g, weight, f32);
-    let func = dev.get_or_load_custom_func("gdn_post_norm_bf16", MODULE, ptx::GDN_FUSED)?;
+    let func = dev.get_or_load_custom_func(kernel, MODULE, ptx::GDN_FUSED)?;
     let (t0_i, len_i, h_i, zs_i) = (t0 as i32, len as i32, h as i32, zs as i32);
     let mut b = func.builder();
     b.arg(&y_v);
@@ -403,14 +505,13 @@ pub fn post_norm(
 }
 
 /// Wrap the buffer filled by [`post_norm`] as a `[S, H*128]` tensor.
-pub fn post_out_tensor(
-    buf: candle_core::cuda_backend::cudarc::driver::CudaSlice<bf16>,
-    like: &Tensor,
-    seq_len: usize,
-    h: usize,
-) -> Result<Tensor> {
+pub fn post_out_tensor(buf: PostBuf, like: &Tensor, seq_len: usize, h: usize) -> Result<Tensor> {
     let dev = like.device().as_cuda_device()?.clone();
-    Ok(wrap(buf, &dev, (seq_len, h * HEAD_DIM)))
+    let shape = (seq_len, h * HEAD_DIM);
+    Ok(match buf {
+        PostBuf::Bf16(b) => wrap(b, &dev, shape),
+        PostBuf::F32(b) => wrap(b, &dev, shape),
+    })
 }
 
 #[cfg(test)]
@@ -492,6 +593,105 @@ mod decode_conv_tests {
         assert!(decode_conv_silu(&x, &state, &weight.to_device(&Device::Cpu)?).is_err());
         assert!(decode_conv_silu(&x.narrow(1, 0, 0)?, &state, &weight).is_err());
         assert!(decode_conv_silu(&x.broadcast_as((2, 7))?, &state, &weight).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn decode_conv_f32_matches_reference_and_preserves_history() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let f32s = |t: &Tensor| t.flatten_all()?.to_vec1::<f32>();
+        for c in [1, 7, 6144] {
+            let mut state = Tensor::arange(0f32, (c * CONV_K + 4) as f32, &dev)?
+                .affine(0.003, -1.)?
+                .narrow(0, 4, c * CONV_K)?
+                .reshape((1, c, CONV_K))?;
+            let weight = Tensor::arange(0f32, (c * CONV_K + 4) as f32, &dev)?
+                .affine(0.0001, -0.5)?
+                .narrow(0, 4, c * CONV_K)?
+                .reshape((c, CONV_K))?;
+            for step in 0..8 {
+                let x = Tensor::arange(0f32, (c + 1) as f32, &dev)?
+                    .affine(0.002, step as f64 * 0.01)?
+                    .narrow(0, 1, c)?
+                    .reshape((1, c))?;
+                let original = f32s(&state)?;
+                let window = Tensor::cat(&[&state.narrow(2, 1, 3)?, &x.reshape((1, c, 1))?], 2)?;
+                let expected = candle_nn::ops::silu(
+                    &window
+                        .broadcast_mul(&weight.unsqueeze(0)?)?
+                        .sum_keepdim(2)?,
+                )?
+                .reshape((1, c))?;
+                let out = decode_conv_silu(&x, &state, &weight)?;
+                assert_eq!(out.y.dtype(), DType::F32);
+                assert_eq!(out.y.dims(), &[1, c]);
+                let max_abs = (&out.y - &expected)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert!(max_abs <= 1e-6, "C={c}, step={step}: max_abs {max_abs}");
+                assert_eq!(f32s(&out.state)?, f32s(&window)?);
+                assert_eq!(f32s(&state)?, original, "input state was modified");
+                assert!(out.ckpt.is_none());
+                state = out.state;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn decode_conv_rejects_mixed_dtypes() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let x = Tensor::zeros((1, 7), DType::F32, &dev)?;
+        let state = Tensor::zeros((1, 7, 4), DType::F32, &dev)?;
+        let weight = Tensor::ones((7, 4), DType::F32, &dev)?;
+        assert!(decode_conv_silu(&x, &state.to_dtype(DType::BF16)?, &weight).is_err());
+        assert!(decode_conv_silu(&x.to_dtype(DType::BF16)?, &state, &weight).is_err());
+        assert!(
+            decode_conv_silu(
+                &x.to_dtype(DType::F16)?,
+                &state.to_dtype(DType::F16)?,
+                &weight
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "needs a CUDA GPU"]
+    fn prep_and_post_reject_mixed_dtypes() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        let h = 1;
+        let dims = GdnDims {
+            hidden_size: HEAD_DIM,
+            num_k_heads: h,
+            num_v_heads: h,
+            head_k_dim: HEAD_DIM,
+            head_v_dim: HEAD_DIM,
+            conv_kernel_size: CONV_K,
+            key_dim: HEAD_DIM,
+            value_dim: HEAD_DIM,
+            conv_dim: 3 * HEAD_DIM,
+            v_per_group: 1,
+            v_head_order: VHeadOrder::Interleaved,
+        };
+        let conv = Tensor::zeros((1, dims.conv_dim), DType::F32, &dev)?;
+        let ab = Tensor::zeros((1, 1, h), DType::F32, &dev)?;
+        let gate = Tensor::zeros(h, DType::F32, &dev)?;
+        let bf = |t: &Tensor| t.to_dtype(DType::BF16);
+        let prep = |a: &Tensor, b: &Tensor| {
+            prep_with_numerics(&conv, a, b, &gate, &gate, &dims, 0, 1, 1., false)
+        };
+        assert!(prep(&bf(&ab)?, &ab).is_err());
+        assert!(prep(&ab, &bf(&ab)?).is_err());
+
+        let y = Tensor::zeros((h, 1, HEAD_DIM), DType::F32, &dev)?;
+        let z = Tensor::zeros((1, 1, h, HEAD_DIM), DType::F32, &dev)?;
+        let w = Tensor::ones(HEAD_DIM, DType::F32, &dev)?;
+        let f32_out = alloc_post_out(&y, 1, h)?;
+        assert!(post_norm(&f32_out, &y, &bf(&z)?, &w, 1e-6, 0, 1, h).is_err());
+        let bf16_out = alloc_post_out(&bf(&y)?, 1, h)?;
+        assert!(post_norm(&bf16_out, &y, &z, &w, 1e-6, 0, 1, h).is_err());
         Ok(())
     }
 }
