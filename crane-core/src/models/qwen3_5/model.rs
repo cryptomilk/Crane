@@ -59,6 +59,11 @@ pub struct Qwen3_5TextModel {
     ///
     /// [`FullAttention::set_attention_dtype`]: super::FullAttention::set_attention_dtype
     attn_dtype: Option<DType>,
+    /// Single-token CUDA graph per run of GDN layers, keyed by the run's first
+    /// layer (`CRANE_QWEN35_CUDA_GRAPH=1`); `None` once capture has failed.
+    /// Graphs hold no request state, see [`Self::replay_gdn_run`].
+    #[cfg(feature = "cuda")]
+    decode_graphs: std::collections::HashMap<usize, Option<crate::ops::cuda_graph::GraphPlan>>,
 }
 
 impl Qwen3_5TextModel {
@@ -181,6 +186,8 @@ impl Qwen3_5TextModel {
             device: device.clone(),
             dtype,
             attn_dtype: None,
+            #[cfg(feature = "cuda")]
+            decode_graphs: Default::default(),
         })
     }
 
@@ -403,6 +410,8 @@ impl Qwen3_5TextModel {
             device: device.clone(),
             dtype,
             attn_dtype,
+            #[cfg(feature = "cuda")]
+            decode_graphs: Default::default(),
         })
     }
 
@@ -740,7 +749,20 @@ impl Qwen3_5TextModel {
             xs = xs.to_dtype(self.attention_dtype())?;
         }
         let debug = std::env::var_os("CRANE_QWEN35_DEBUG_LAYERS").is_some();
-        for i in 0..self.layers.len() {
+        #[cfg(feature = "cuda")]
+        let graphs = xs.dim(1)? == 1
+            && !debug
+            && xs.device().is_cuda()
+            && !crate::utils::prof::enabled()
+            && std::env::var("CRANE_QWEN35_CUDA_GRAPH").is_ok_and(|v| v == "1");
+        let mut i = 0;
+        while i < self.layers.len() {
+            #[cfg(feature = "cuda")]
+            if graphs && let Some((end, out)) = self.replay_gdn_run(i, &xs, rope)? {
+                xs = out;
+                i = end;
+                continue;
+            }
             let layer = &self.layers[i];
             let gdn_slot = self.gdn_caches[i].as_mut();
             let attn_slot = self.attn_caches[i].as_mut();
@@ -761,8 +783,88 @@ impl Qwen3_5TextModel {
                     v.len()
                 );
             }
+            i += 1;
         }
         Ok(xs)
+    }
+
+    /// Run the GDN layers `start..end` (up to the next full-attention layer) as
+    /// one CUDA graph, capturing it on first use. The graph's inputs are `xs`
+    /// and each layer's conv/recurrent state and its outputs the new ones, so
+    /// resets, snapshots and state swaps need no invalidation. Returns `None`
+    /// to run the layers eagerly: not a GDN run, a speculative checkpoint or
+    /// serial pass pending, the prefill-to-decode conv-state cast still due, or
+    /// capture failed.
+    #[cfg(feature = "cuda")]
+    fn replay_gdn_run(
+        &mut self,
+        start: usize,
+        xs: &Tensor,
+        rope: RopeSlice<'_>,
+    ) -> Result<Option<(usize, Tensor)>> {
+        let n = self.layers.len();
+        let end = (start..n)
+            .find(|&j| !self.layers[j].is_linear())
+            .unwrap_or(n);
+        let caches: Vec<_> = self.gdn_caches[start..end]
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        if caches.is_empty()
+            || caches.iter().any(|c| {
+                c.checkpoint_at.is_some() || c.prefer_serial || c.conv_state.dtype() != xs.dtype()
+            })
+        {
+            return Ok(None);
+        }
+        let mut inputs = vec![xs];
+        for c in &caches {
+            inputs.extend([&c.conv_state, &c.recurrent_state]);
+        }
+        if let Some(Some(g)) = self.decode_graphs.get(&start)
+            && !g.matches(&inputs)
+        {
+            self.decode_graphs.remove(&start);
+        }
+        if !self.decode_graphs.contains_key(&start) {
+            let layers = &self.layers[start..end];
+            // Safety: the captured layers' weights live as long as `self`, and
+            // their decode path reads no host values.
+            let plan = unsafe {
+                crate::ops::cuda_graph::GraphPlan::capture(&inputs, |v| {
+                    let mut xs = v[0].clone();
+                    let mut out = vec![];
+                    for (j, (layer, c)) in layers.iter().zip(&caches).enumerate() {
+                        let mut c = crate::ops::gdn::GdnLayerCache {
+                            conv_state: v[2 * j + 1].clone(),
+                            recurrent_state: v[2 * j + 2].clone(),
+                            ..c.clone()
+                        };
+                        xs = layer.forward(&xs, rope, None, Some(&mut c), None)?;
+                        out.extend([c.conv_state, c.recurrent_state]);
+                    }
+                    out.insert(0, xs);
+                    Ok(out)
+                })
+            };
+            if let Err(e) = &plan {
+                eprintln!(
+                    "[qwen3_5] CUDA graph for layers {start}..{end} failed, running them eagerly: {e}"
+                );
+            }
+            self.decode_graphs.insert(start, plan.ok());
+        }
+        let Some(Some(plan)) = self.decode_graphs.get_mut(&start) else {
+            return Ok(None);
+        };
+        let mut out = plan.replay(&inputs)?.into_iter();
+        let xs = out.next().expect("graph returns xs");
+        for c in self.gdn_caches[start..end].iter_mut().flatten() {
+            c.conv_state = out.next().expect("graph returns conv state");
+            c.recurrent_state = out.next().expect("graph returns recurrent state");
+        }
+        Ok(Some((end, xs)))
     }
 
     /// Final norm + `lm_head` over a single position `[B, 1, hidden_size]`,
