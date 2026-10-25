@@ -68,6 +68,7 @@ impl EnvRestore {
             "CRANE_GDN_SERIAL_PREFILL",
             "CRANE_GDN_SERIAL_MAX",
             "CRANE_ISQ",
+            "CRANE_QWEN35_CUDA_GRAPH",
         ];
         let saved = keys.into_iter().map(|k| (k, std::env::var_os(k))).collect();
         for k in keys {
@@ -327,5 +328,99 @@ fn real_qwen35_gguf_fused_decode_parity() -> Result<()> {
     // A silent fallback to the op chain would match bit for bit at every step.
     assert_eq!(first_flip.len(), 2, "fused decode never ran");
     assert!(failures.is_empty(), "parity gates failed: {failures:?}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs CUDA and CRANE_QWEN35_GRAPH_MODEL pointing to a local .gguf or checkpoint"]
+fn real_qwen35_cuda_graph_decode_parity() -> Result<()> {
+    let _env = EnvRestore::new();
+    let path = std::env::var("CRANE_QWEN35_GRAPH_MODEL").context("set CRANE_QWEN35_GRAPH_MODEL")?;
+    let dev = Device::new_cuda(0)?;
+    let mut reference = Model::new(&path, &dev, &DType::BF16)?;
+    let mut actual = Model::new(&path, &dev, &DType::BF16)?;
+    let text = "Explain how a computer processes a sentence, stores intermediate results, and generates the next word. ".repeat(40);
+    let encoding = actual
+        .tokenizer
+        .tokenizer()
+        .encode(text, false)
+        .map_err(E::msg)?;
+    let tokens = encoding.get_ids();
+    anyhow::ensure!(
+        tokens.len() >= 194,
+        "need at least 194 teacher-forced tokens"
+    );
+    let layers = &actual.inner.layers;
+    let runs = (0..layers.len())
+        .filter(|&i| layers[i].is_linear() && (i == 0 || !layers[i - 1].is_linear()))
+        .count();
+    let ne = |a: &Tensor, b: &Tensor| -> Result<f32> {
+        Ok(a.ne(b)?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?)
+    };
+    let graph = |on: &str| unsafe { std::env::set_var("CRANE_QWEN35_CUDA_GRAPH", on) };
+    for fused in ["0", "1"] {
+        unsafe { std::env::set_var("CRANE_GDN_FUSED", fused) };
+        // Graphs replay whatever path they captured; a new GDN path needs new ones.
+        actual.inner.decode_graphs.clear();
+        for prefix in [64usize, 130] {
+            reference.inner.reset_gdn_caches()?;
+            actual.inner.reset_gdn_caches()?;
+            let ids = Tensor::new(&tokens[..prefix], &dev)?.unsqueeze(0)?;
+            let mask = super::super::prefill::causal_mask(
+                prefix,
+                0,
+                &dev,
+                actual.inner.attention_dtype(),
+            )?;
+            reference.inner.forward_layers(&ids, 0, Some(&mask))?;
+            actual.inner.forward_layers(&ids, 0, Some(&mask))?;
+            let (reference_snap, actual_snap) =
+                (reference.snapshot_state(), actual.snapshot_state());
+            for round in 0..2 {
+                if round == 1 {
+                    reference.restore_state(&reference_snap)?;
+                    actual.restore_state(&actual_snap)?;
+                }
+                for step in 0..64 {
+                    let pos = prefix + step;
+                    let ids = Tensor::new(&[[tokens[pos]]], &dev)?;
+                    graph("0");
+                    let expected = reference.inner.forward_layers(&ids, pos, None)?;
+                    let expected_logits = reference.inner.head(&expected)?;
+                    graph("1");
+                    let y = actual.inner.forward_layers(&ids, pos, None)?;
+                    let logits = actual.inner.head(&y)?;
+                    let at = format!("fused={fused} prefix={prefix} round={round} step={step}");
+                    assert_eq!(ne(&y, &expected)?, 0., "hidden {at}");
+                    assert_eq!(ne(&logits, &expected_logits)?, 0., "logits {at}");
+                    let top = |l: &Tensor| l.flatten_all()?.argmax(0)?.to_scalar::<u32>();
+                    assert_eq!(top(&logits)?, top(&expected_logits)?, "argmax {at}");
+                    for (a, b) in actual
+                        .inner
+                        .gdn_caches
+                        .iter()
+                        .flatten()
+                        .zip(reference.inner.gdn_caches.iter().flatten())
+                    {
+                        assert_eq!(ne(&a.conv_state, &b.conv_state)?, 0., "conv {at}");
+                        assert_eq!(
+                            ne(&a.recurrent_state, &b.recurrent_state)?,
+                            0.,
+                            "state {at}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(reference.inner.decode_graphs.is_empty());
+        assert_eq!(actual.inner.decode_graphs.len(), runs, "fused={fused}");
+        assert!(
+            actual.inner.decode_graphs.values().all(Option::is_some),
+            "capture failed, fused={fused}"
+        );
+    }
     Ok(())
 }
