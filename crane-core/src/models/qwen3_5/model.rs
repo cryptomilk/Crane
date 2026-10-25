@@ -61,7 +61,8 @@ pub struct Qwen3_5TextModel {
     attn_dtype: Option<DType>,
     /// Single-token CUDA graph per run of GDN layers, keyed by the run's first
     /// layer (`CRANE_QWEN35_CUDA_GRAPH=1`); `None` once capture has failed.
-    /// Graphs hold no request state, see [`Self::replay_gdn_run`].
+    /// Graphs hold no request state, see [`Self::replay_gdn_run`]. GDN env
+    /// flags (`CRANE_GDN_FUSED`, …) are read at capture, so they are frozen.
     #[cfg(feature = "cuda")]
     decode_graphs: std::collections::HashMap<usize, Option<crate::ops::cuda_graph::GraphPlan>>,
 }
@@ -751,6 +752,7 @@ impl Qwen3_5TextModel {
         let debug = std::env::var_os("CRANE_QWEN35_DEBUG_LAYERS").is_some();
         #[cfg(feature = "cuda")]
         let graphs = xs.dim(1)? == 1
+            && xs.dim(0)? == 1
             && !debug
             && xs.device().is_cuda()
             && !crate::utils::prof::enabled()
@@ -794,7 +796,8 @@ impl Qwen3_5TextModel {
     /// resets, snapshots and state swaps need no invalidation. Returns `None`
     /// to run the layers eagerly: not a GDN run, a speculative checkpoint or
     /// serial pass pending, the prefill-to-decode conv-state cast still due, or
-    /// capture failed.
+    /// capture failed. Capture on a thread that outlives the model: candle's
+    /// kernel-param cache the graph reads from is thread-local.
     #[cfg(feature = "cuda")]
     fn replay_gdn_run(
         &mut self,
@@ -802,6 +805,9 @@ impl Qwen3_5TextModel {
         xs: &Tensor,
         rope: RopeSlice<'_>,
     ) -> Result<Option<(usize, Tensor)>> {
+        if start > 0 && self.layers[start - 1].is_linear() {
+            return Ok(None);
+        }
         let n = self.layers.len();
         let end = (start..n)
             .find(|&j| !self.layers[j].is_linear())
