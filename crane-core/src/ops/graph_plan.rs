@@ -287,3 +287,161 @@ impl Drop for GraphPlan {
         self.pool.take();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GraphPlan;
+    use candle_core::{Device, Result, Tensor};
+
+    /// A two-GEMM chain (`a @ w1 @ w2`) with an intermediate allocation
+    /// between the two matmuls, exercising both rocBLAS dispatch and the
+    /// VMM pool's address-stable intermediates within a captured region.
+    fn matmul_chain(inputs: &[Tensor]) -> Result<Vec<Tensor>> {
+        let hidden = inputs[0].matmul(&inputs[1])?;
+        let out = hidden.matmul(&inputs[2])?;
+        Ok(vec![out])
+    }
+
+    /// Returns early when the machine has no GPU of the built feature,
+    /// matching `gdn/chunked.rs`'s convention; `#[ignore]` keeps these off
+    /// the default `cargo test` run since they do real capture/replay work.
+    #[cfg(feature = "cuda")]
+    fn test_device() -> Option<Device> {
+        Device::new_cuda(0).ok()
+    }
+    #[cfg(all(feature = "rocm", not(feature = "cuda")))]
+    fn test_device() -> Option<Device> {
+        Device::new_rocm(0).ok()
+    }
+
+    /// Whether `GraphPlan::capture`'s ROCm path reports this runtime's VMM
+    /// allocator cannot back a capture at all (`ROCm/rocm-systems#2516`),
+    /// rather than a real failure the test should fail over. Matched by the
+    /// HIP error name `VmmPool::new` returns for that case, since
+    /// `candle_core::Error::Rocm`'s wrapped error carries no structured code
+    /// Crane can match on without depending on `candle-rocm` internals.
+    fn is_vmm_unsupported(err: &candle_core::Error) -> bool {
+        matches!(err, candle_core::Error::Rocm(_))
+            && err.to_string().contains("hipErrorNotSupported")
+    }
+
+    /// `GraphPlan::replay` over a captured multi-kernel matmul chain must
+    /// produce the same result as running that chain eagerly -- the whole
+    /// point of graph replay is that it's observably equivalent to the
+    /// uncaptured path, just without per-kernel dispatch overhead.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    #[ignore]
+    fn graph_plan_capture_replay_matches_eager() -> Result<()> {
+        let Some(dev) = test_device() else {
+            return Ok(());
+        };
+        let a = Tensor::randn(0f32, 1.0, (4, 64), &dev)?;
+        let w1 = Tensor::randn(0f32, 1.0, (64, 64), &dev)?;
+        let w2 = Tensor::randn(0f32, 1.0, (64, 32), &dev)?;
+
+        let expected = matmul_chain(&[a.clone(), w1.clone(), w2.clone()])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        // SAFETY: `matmul_chain` only reads its input slice and the tensors
+        // it captures over, depends on no host values, and every tensor
+        // involved lives on `dev`'s single stream for the plan's lifetime.
+        let mut plan = match unsafe { GraphPlan::capture(&[&a, &w1, &w2], matmul_chain) } {
+            Ok(plan) => plan,
+            Err(e) if is_vmm_unsupported(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let replayed = plan.replay(&[&a, &w1, &w2])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        for (e, r) in expected.iter().zip(replayed.iter()) {
+            assert!((e - r).abs() < 1e-5, "expected {e}, got {r}");
+        }
+        Ok(())
+    }
+
+    /// Replaying with new input values (same shapes/dtype/device) must
+    /// update the graph's internal `Var`s rather than replaying stale data
+    /// -- the captured graph's kernels read from fixed addresses, so this
+    /// also proves the `Var::set` + relaunch path is wired correctly.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    #[ignore]
+    fn graph_plan_replay_with_new_inputs() -> Result<()> {
+        let Some(dev) = test_device() else {
+            return Ok(());
+        };
+        let a1 = Tensor::randn(0f32, 1.0, (4, 64), &dev)?;
+        let w1 = Tensor::randn(0f32, 1.0, (64, 64), &dev)?;
+        let w2 = Tensor::randn(0f32, 1.0, (64, 32), &dev)?;
+
+        // SAFETY: see `graph_plan_capture_replay_matches_eager`.
+        let mut plan = match unsafe { GraphPlan::capture(&[&a1, &w1, &w2], matmul_chain) } {
+            Ok(plan) => plan,
+            Err(e) if is_vmm_unsupported(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        let replayed_1 = plan.replay(&[&a1, &w1, &w2])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected_1 = matmul_chain(&[a1.clone(), w1.clone(), w2.clone()])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (e, r) in expected_1.iter().zip(replayed_1.iter()) {
+            assert!((e - r).abs() < 1e-5, "expected {e}, got {r}");
+        }
+
+        let a2 = Tensor::randn(10f32, 1.0, (4, 64), &dev)?;
+        let replayed_2 = plan.replay(&[&a2, &w1, &w2])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let expected_2 = matmul_chain(&[a2.clone(), w1.clone(), w2.clone()])?[0]
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (e, r) in expected_2.iter().zip(replayed_2.iter()) {
+            assert!((e - r).abs() < 1e-5, "expected {e}, got {r}");
+        }
+
+        let max_abs_diff = replayed_1
+            .iter()
+            .zip(replayed_2.iter())
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(
+            max_abs_diff > 1e-3,
+            "replay with different inputs returned near-identical output, \
+             suggesting stale graph data"
+        );
+        Ok(())
+    }
+
+    /// `GraphPlan::matches` must reject an input whose shape differs from
+    /// what the plan was captured against -- the invalidation check the
+    /// `GraphState` state machine (Step 5) relies on to decide whether a
+    /// captured graph is still safe to replay.
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    #[test]
+    #[ignore]
+    fn graph_plan_matches_rejects_shape_mismatch() -> Result<()> {
+        let Some(dev) = test_device() else {
+            return Ok(());
+        };
+        let a = Tensor::randn(0f32, 1.0, (4, 64), &dev)?;
+        let w1 = Tensor::randn(0f32, 1.0, (64, 64), &dev)?;
+        let w2 = Tensor::randn(0f32, 1.0, (64, 32), &dev)?;
+
+        // SAFETY: see `graph_plan_capture_replay_matches_eager`.
+        let plan = match unsafe { GraphPlan::capture(&[&a, &w1, &w2], matmul_chain) } {
+            Ok(plan) => plan,
+            Err(e) if is_vmm_unsupported(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        assert!(plan.matches(&[&a, &w1, &w2]));
+
+        let a_bigger = Tensor::randn(0f32, 1.0, (8, 64), &dev)?;
+        assert!(!plan.matches(&[&a_bigger, &w1, &w2]));
+        Ok(())
+    }
+}
