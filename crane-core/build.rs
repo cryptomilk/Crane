@@ -24,7 +24,6 @@ fn oneapi_runtime_dirs() -> Vec<String> {
 }
 
 fn main() {
-
     #[cfg(any(feature = "flash-attn", feature = "flash-inference"))]
     {
         use std::path::PathBuf;
@@ -39,19 +38,26 @@ fn main() {
         });
         println!("cargo::rerun-if-env-changed=CRANE_FLASH_ATTN_HEADERS");
         println!("cargo::rerun-if-changed=kernels/cuda/flash_attention/");
-        let out=PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+        let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
         cudaforge::KernelBuilder::new()
             .source_files(["kernels/cuda/flash_attention/launch.cu"])
             .out_dir(&out)
             .with_cutlass(Some("7d49e6c7e2f8896c47f586706e67e1fb215529dc"))
-            .arg(&format!("-I{}",headers.display()))
-            .arg("-std=c++17").arg("-O3").arg("--fmad=true")
-            .arg("--expt-relaxed-constexpr").arg("--expt-extended-lambda")
-            .arg("-U__CUDA_NO_HALF_OPERATORS__").arg("-U__CUDA_NO_HALF_CONVERSIONS__")
-            .arg("-U__CUDA_NO_HALF2_OPERATORS__").arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-            .arg("-Xcompiler").arg("-fPIC")
-            .build_lib(out.join("libcrane_flash_split.a")).expect("build Crane split-KV launcher");
-        println!("cargo::rustc-link-search=native={}",out.display());
+            .arg(&format!("-I{}", headers.display()))
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("--fmad=true")
+            .arg("--expt-relaxed-constexpr")
+            .arg("--expt-extended-lambda")
+            .arg("-U__CUDA_NO_HALF_OPERATORS__")
+            .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+            .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+            .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .build_lib(out.join("libcrane_flash_split.a"))
+            .expect("build Crane split-KV launcher");
+        println!("cargo::rustc-link-search=native={}", out.display());
         println!("cargo::rustc-link-lib=static=crane_flash_split");
         println!("cargo::rustc-link-lib=dylib=cudart");
         println!("cargo::rustc-link-lib=dylib=stdc++");
