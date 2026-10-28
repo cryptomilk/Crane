@@ -34,7 +34,7 @@ use candle_core::{DType, Layout, Result, Tensor};
 
 use super::fattn::{
     FATTN_KQ_STRIDE, MAX_GRID_X_DIM, gqa_z_tiles, init_fastdiv_values, is_amd_backend, mma_config,
-    mma_shared_mem_bytes, q_tiles, select_mma_ncols,
+    mma_shared_mem_bytes, q_tiles, select_mma_ncols, unsupported_config,
 };
 
 /// Bounds-checked scalar arguments for a `crane_fattn_mma_f16_*` launch,
@@ -296,9 +296,9 @@ impl LaunchGeometry {
         let nwarps = cfg.nthreads / 32;
         let ntiles_dst = q_tiles(seq_q, ncols1) * gqa_z_tiles(gqa_ratio, ncols2) * h_kv * batch;
         if ntiles_dst > MAX_GRID_X_DIM {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: grid size ({ntiles_dst}) exceeds the CUDA/HIP grid x-dimension limit ({MAX_GRID_X_DIM})"
-            );
+            )));
         }
         let shared_mem_bytes = mma_shared_mem_bytes(dkq, ncols1, ncols2, &cfg, is_amd);
         Ok(Self {
@@ -428,7 +428,7 @@ fn mma_ncols1_for(q: &Tensor, k: &Tensor) -> Result<usize> {
     select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd)
         .map(|(ncols1, _)| ncols1)
         .ok_or_else(|| {
-            candle_core::Error::Msg(format!(
+            unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_q={seq_q} seq_kv={seq_kv}"
             ))
         })
@@ -726,7 +726,9 @@ mod cuda {
     use candle_core::cuda_backend::{CudaStorage, CudaStorageSlice, WrapErr};
 
     use super::{LaunchGeometry, LaunchScalars};
-    use crate::ops::fused_ops::fattn::{mma_kernel_name, select_mma_ncols, validate_fattn_bshd};
+    use crate::ops::fused_ops::fattn::{
+        mma_kernel_name, select_mma_ncols, unsupported_config, validate_fattn_bshd,
+    };
     use candle_core::{Result, Tensor};
 
     mod ptx {
@@ -789,19 +791,19 @@ mod cuda {
         let is_amd = false;
 
         let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
-            );
+            )));
         };
         // See fattn_mma_prefill's doc comment: the kernel unconditionally
         // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
         // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
         // safe.
         if mask.is_none() && ncols2 != 1 {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
-            );
+            )));
         }
         let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
         let kernel_name = mma_kernel_name(d, ncols1, ncols2);
@@ -934,7 +936,9 @@ mod rocm {
     use candle_core::{DType, Result, Tensor};
 
     use super::{LaunchGeometry, LaunchScalars};
-    use crate::ops::fused_ops::fattn::{mma_kernel_name, select_mma_ncols, validate_fattn_bshd};
+    use crate::ops::fused_ops::fattn::{
+        mma_kernel_name, select_mma_ncols, unsupported_config, validate_fattn_bshd,
+    };
     use crate::ops::rocm;
 
     /// Each leaf vendored header is spliced into the final source exactly
@@ -1019,19 +1023,19 @@ mod rocm {
         let is_amd = true;
 
         let Some((ncols1, ncols2)) = select_mma_ncols(d, gqa_ratio, seq_q, seq_kv, is_amd) else {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: no instantiated kernel for head_dim={d} gqa_ratio={gqa_ratio} seq_kv={seq_kv}"
-            );
+            )));
         };
         // See fattn_mma_prefill's doc comment: the kernel unconditionally
         // computes `sequence % ne33` whenever ncols2 > 1, which null-derefs/
         // div-by-zeros when mask=None (ne33=0). Only ncols2==1 makes None
         // safe.
         if mask.is_none() && ncols2 != 1 {
-            candle_core::bail!(
+            return Err(unsupported_config(format!(
                 "fattn_mma: mask=None requires ncols2 == 1 (got ncols2={ncols2}); \
                  pass an explicit all-zero mask for unmasked attention with this GQA shape"
-            );
+            )));
         }
         let geometry = LaunchGeometry::new(d, ncols1, ncols2, seq_q, h_kv, b, gqa_ratio, is_amd)?;
         let kernel_name = mma_kernel_name(d, ncols1, ncols2);
