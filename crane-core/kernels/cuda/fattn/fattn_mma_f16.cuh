@@ -1077,50 +1077,18 @@ template<int DV, int ncols> struct mma_tile_sizes {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_A_VKQ = tile<32,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
-    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
-};
-template<int ncols> struct mma_tile_sizes<80, ncols> {
-    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
-    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
-    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
-    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
-};
-template<int ncols> struct mma_tile_sizes<112, ncols> {
-    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
-    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
-    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
     using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
 #else
 template<int DV, int ncols> struct mma_tile_sizes {
-    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
-    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // column-major
-    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;           // column-major
-    using T_A_VKQ = tile<32,  8, half2, DATA_LAYOUT_I_MAJOR>;           // row-major
-    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>;           // column-major
-    using T_C_VKQ = tile<16, 16, half2, DATA_LAYOUT_I_MAJOR_SCRAMBLED>; // column-major
-};
-template<int ncols> struct mma_tile_sizes<80, ncols> {
-    using T_A_KQ  = tile<16,  8, half2>; // row-major
-    using T_B_KQ  = tile<16,  8, half2>; // column-major
-    using T_C_KQ  = tile<16, 16, float>; // column-major
-    using T_A_VKQ = tile<16,  8, half2>; // row-major
-    using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
-};
-template<int ncols> struct mma_tile_sizes<112, ncols> {
-    using T_A_KQ  = tile<16,  8, half2>; // row-major
-    using T_B_KQ  = tile<16,  8, half2>; // column-major
-    using T_C_KQ  = tile<16, 16, float>; // column-major
-    using T_A_VKQ = tile<16,  8, half2>; // row-major
-    using T_B_VKQ = tile<16,  8, half2>; // column-major
-    using T_C_VKQ = tile<16,  8, half2>; // column-major
+    using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // row-major
+    using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // column-major
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>; // column-major
+    using T_A_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // row-major
+    using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR>; // column-major
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>; // column-major
 };
 #endif // RDNA3
 #elif defined(AMD_MFMA_AVAILABLE)
@@ -1214,10 +1182,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
-#elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
-#elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-    T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
+#elif defined(AMD_WMMA_AVAILABLE)
+    T_C_VKQ VKQ_C[DV/T_C_VKQ::J];
+#elif defined(AMD_MFMA_AVAILABLE)
+    T_C_VKQ VKQ_C[DV/(2*T_C_VKQ::J)];
 #else // Volta
     T_C_VKQ VKQ_C[                                     DV/(2*T_C_VKQ::J)];
 #endif // defined(TURING_MMA_AVAILABLE)
