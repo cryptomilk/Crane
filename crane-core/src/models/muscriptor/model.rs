@@ -192,10 +192,10 @@ impl LMModel {
     /// Returns an error if building the embedding, transformer, output norm,
     /// or LM head linear fails, typically from missing or mismatched weights
     /// in `vb`.
-    pub fn new(vb: VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
+    pub fn new(vb: &VarBuilder, config: &VariantConfig, quant: Option<GgmlDType>) -> Result<Self> {
         let device = vb.device().clone();
         let emb = ScaledEmbedding::new(config.card + 1, config.dim, vb.pp("emb"))?;
-        let transformer = StreamingTransformer::new(vb.pp("transformer"), config, quant)?;
+        let transformer = StreamingTransformer::new(&vb.pp("transformer"), config, quant)?;
         let out_norm = layer_norm(config.dim, 1e-5, vb.pp("out_norm"))?;
         let linear =
             crate::ops::linear::linear_layer(config.dim, config.card, vb.pp("linear"), quant)?;
@@ -533,25 +533,25 @@ impl Model {
                 config.dim,
                 device,
                 DType::F32,
-                vb_f32.pp("condition_provider.conditioners.self_wav"),
+                &vb_f32.pp("condition_provider.conditioners.self_wav"),
                 filterbank,
             )?),
         );
         class.insert(
             "instrument_group".to_string(),
             Arc::new(ClassConditioner::from_embedding_tensor(
-                1000, config.dim, lg_emb,
+                1000, config.dim, &lg_emb,
             )?),
         );
         class.insert(
             "dataset_name".to_string(),
             Arc::new(ClassConditioner::from_embedding_tensor(
-                4, config.dim, ds_emb,
+                4, config.dim, &ds_emb,
             )?),
         );
         let conditioner = Arc::new(ConditioningProvider::new(mel, class));
 
-        let inner = LMModel::new(vb, &config, quant)?;
+        let inner = LMModel::new(&vb, &config, quant)?;
         Ok(Self {
             inner,
             conditioner,
