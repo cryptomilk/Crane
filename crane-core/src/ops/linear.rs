@@ -338,7 +338,7 @@ pub fn quantize_linear_onto(
     in_dim: usize,
     out_dim: usize,
     bias: bool,
-    vb_cpu: VarBuilder,
+    vb_cpu: &VarBuilder,
     dtype: GgmlDType,
     target_device: &Device,
 ) -> Result<LinearLayer> {

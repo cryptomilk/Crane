@@ -52,7 +52,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, vb: &VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -181,8 +181,8 @@ pub struct ModelForCausalLM {
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base_model = Model::new(cfg, vb.clone())?;
+    pub fn new(cfg: &Config, vb: &VarBuilder) -> Result<Self> {
+        let base_model = Model::new(cfg, vb)?;
         let lm_head = if vb.contains_tensor("lm_head.weight") {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         } else {
