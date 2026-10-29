@@ -1,4 +1,5 @@
 use crate::onnx;
+use crate::utils::float_cast::f64_to_usize;
 use anyhow::{Ok, Result};
 use candle_core::{Device, IndexOp, Tensor};
 use std::collections::HashMap;
@@ -69,7 +70,7 @@ impl MoonshineASR {
     /// `last_hidden_state`/`logits` tensors.
     pub fn generate(&self, audio: &[f32], max_len: Option<usize>) -> Result<Vec<i64>> {
         let max_len = max_len.unwrap_or_else(|| {
-            ((audio.len() as f64 / 16_000.0) * (self.token_rate as f64)).ceil() as usize
+            f64_to_usize(((audio.len() as f64 / 16_000.0) * (self.token_rate as f64)).ceil())
         });
 
         let encoder_model = self.load_onnx_model(&self.encoder_path)?;
