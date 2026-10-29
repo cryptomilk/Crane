@@ -7,6 +7,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 pub mod cast_var_builder;
+pub mod float_cast;
 pub mod image_utils;
 pub mod prof;
 pub mod quantized_var_builder;
