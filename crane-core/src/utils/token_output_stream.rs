@@ -34,10 +34,10 @@ impl TokenOutputStream {
     /// Return the decodable prefix and withhold an incomplete byte sequence.
     /// Tokenizers use U+FFFD while decoding such a partial sequence, which
     /// must never be forwarded to an SSE client — a later token completes it.
-    fn safe_delta(&mut self, decoded: String) -> Option<String> {
+    fn safe_delta(&mut self, decoded: &str) -> Option<String> {
         let safe = match decoded.find('\u{fffd}') {
             Some(index) => &decoded[..index],
-            None => decoded.as_str(),
+            None => decoded,
         };
         if !safe.starts_with(&self.emitted) {
             // A tokenizer should only extend a decoded prefix. If it does not,
@@ -57,7 +57,7 @@ impl TokenOutputStream {
     pub fn next_token(&mut self, token: u32) -> Result<Option<String>> {
         self.tokens.push(token);
         let decoded = self.decode(&self.tokens)?;
-        Ok(self.safe_delta(decoded))
+        Ok(self.safe_delta(&decoded))
     }
 
     /// # Errors
@@ -66,7 +66,7 @@ impl TokenOutputStream {
     /// token sequence.
     pub fn decode_rest(&mut self) -> Result<Option<String>> {
         let decoded = self.decode(&self.tokens)?;
-        Ok(self.safe_delta(decoded))
+        Ok(self.safe_delta(&decoded))
     }
 
     /// # Errors

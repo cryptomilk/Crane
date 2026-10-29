@@ -433,7 +433,7 @@ impl AutoTokenizer {
     pub fn apply_chat_template_with_tools<S: serde::Serialize, T: serde::Serialize>(
         &self,
         ctx: S,
-        tools: Option<T>,
+        tools: Option<&T>,
         add_generation_prompt: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.apply_chat_template_with_options(ctx, tools, add_generation_prompt, None)
@@ -457,7 +457,7 @@ impl AutoTokenizer {
     pub fn apply_chat_template_with_options<S: serde::Serialize, T: serde::Serialize>(
         &self,
         ctx: S,
-        tools: Option<T>,
+        tools: Option<&T>,
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -487,7 +487,7 @@ impl AutoTokenizer {
     pub fn apply_chat_template_full<S: serde::Serialize, T: serde::Serialize>(
         &self,
         ctx: S,
-        tools: Option<T>,
+        tools: Option<&T>,
         add_generation_prompt: bool,
         enable_thinking: Option<bool>,
         reasoning_effort: Option<&str>,
@@ -662,7 +662,7 @@ impl AutoTokenizer {
         // to `[]`, so an explicit `none` skips that fallback and later fails
         // on `tools | length`.
         let tools = match tools {
-            Some(ref t) => minijinja::Value::from_serialize(t),
+            Some(t) => minijinja::Value::from_serialize(t),
             None => minijinja::Value::UNDEFINED,
         };
 
