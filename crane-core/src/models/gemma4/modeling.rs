@@ -36,6 +36,7 @@ pub use crate::quantized::gguf_file::Gguf;
 use crate::quantized::gguf_metadata::GgufMetadata;
 #[cfg(not(feature = "rocm"))]
 use crate::utils::DeviceExt;
+use crate::utils::float_cast::f64_to_usize;
 
 // Note: Gemma 4 norms use standard `x * weight` (no `+1` shift unlike Gemma 3).
 // Weights are stored in final form. Use candle_nn::rms_norm / gg.rms_norm directly.
@@ -1202,7 +1203,7 @@ impl Gemma4Model {
             .unwrap_or(0.25);
 
         let global_hd = config.global_head_dim();
-        let full_rotated_dim = (global_hd as f64 * partial_factor) as usize;
+        let full_rotated_dim = f64_to_usize(global_hd as f64 * partial_factor);
 
         let rotary_sliding = RotaryEmbedding::new(
             sliding_theta,
