@@ -1163,7 +1163,11 @@ static __device__ __forceinline__ void flash_attn_ext_bf16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // The next pass restages rows that other warps may still be reading,
+        // so a barrier is needed between passes for np == 1 as well. The
+        // float stage takes two passes where fattn_mma_f16.cuh's half2 stage
+        // takes one, so llama.cpp's "only if np > 1" no longer holds here.
+        if (np > 1 || k00 + nbatch_combine_f32 < DV/2) {
             __syncthreads();
         }
     }
