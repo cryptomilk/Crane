@@ -1,3 +1,7 @@
+// Kept close to upstream candle-onnx so it stays diffable against it. Its
+// `i64` -> `usize` casts of ONNX dims/attributes are left as upstream has them.
+#![allow(clippy::cast_sign_loss)]
+
 use super::ops;
 use super::proto::attribute_proto::AttributeType;
 use super::proto::tensor_proto::DataType;
