@@ -20,6 +20,7 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex as FftComplex};
 
 use crate::models::modules::mel::{hann_window, reflect_pad};
 use crate::models::voxtral_tts::codec::reconstruct_weight_norm;
+use crate::utils::float_cast::f64_to_usize;
 
 const SAMPLING_RATE: usize = 24_000;
 const BASE_CHANNELS: usize = 512;
@@ -299,7 +300,7 @@ fn linear_interpolate_1d(x: &Tensor, out_len: usize) -> Result<Tensor> {
                 let src = ((o as f64 + 0.5) * scale - 0.5)
                     .max(0.0)
                     .min((in_len - 1) as f64);
-                let i0 = src.floor() as usize;
+                let i0 = f64_to_usize(src.floor());
                 let i1 = (i0 + 1).min(in_len - 1);
                 let frac = (src - i0 as f64) as f32;
                 *dst = src_row[i0] * (1.0 - frac) + src_row[i1] * frac;
