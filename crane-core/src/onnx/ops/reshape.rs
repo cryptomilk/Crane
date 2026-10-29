@@ -29,6 +29,8 @@ pub(crate) fn reshape(input: &Tensor, target: &[i64]) -> Result<Tensor> {
                 shape.push(dimension);
             },
             dimension if dimension > 0 => {
+                // The match guard above ensures `dimension > 0`.
+                #[allow(clippy::cast_sign_loss)]
                 let dimension = dimension as usize;
                 known_elements = known_elements.checked_mul(dimension).ok_or_else(|| {
                     candle_core::Error::Msg(
