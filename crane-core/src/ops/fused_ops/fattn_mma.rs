@@ -3059,3 +3059,7 @@ mod flashattn2_parity {
         run_causal_vs_flashattn2_bf16(1, 32, 256, 4, 2, 128);
     }
 }
+
+#[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
+#[path = "fattn_long_seq_tests.rs"]
+mod long_seq_tests;
