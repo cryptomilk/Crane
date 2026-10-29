@@ -19,6 +19,7 @@ use candle_nn::VarBuilder;
 use super::config::VisionConfig;
 use crate::quantized::gguf_file::Gguf;
 use crate::quantized::gguf_metadata::GgufMetadata;
+use crate::utils::float_cast::f64_to_usize;
 
 /// Everything a mmproj tells us that `config.json` would otherwise provide.
 pub struct Mmproj {
@@ -146,7 +147,7 @@ pub fn load_mmproj(path: &Path, device: &Device, dtype: DType) -> Result<Mmproj>
         .get("model.vision_tower.embeddings.position_embedding.weight")
         .context("mmproj missing v.position_embd.weight")?
         .dim(0)?;
-    let side = (pos as f64).sqrt().round() as usize;
+    let side = f64_to_usize((pos as f64).sqrt().round());
     if side * side != pos {
         bail!("position table has {pos} entries, not a square grid");
     }
