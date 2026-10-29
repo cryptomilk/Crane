@@ -10,6 +10,7 @@ use candle_nn::{
 };
 // TODO(candle-transformers-removal): Mimi is a model-component dependency; see
 // CANDLE_TRANSFORMERS.md.
+use crate::utils::float_cast::f64_to_usize;
 use candle_transformers::models::mimi;
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -603,7 +604,7 @@ impl CausalConvNet {
         let n_frames = (length as f64 - self.kernel_size as f64 + self.padding as f64)
             / self.stride as f64
             + 1.0;
-        let ideal_len = ((n_frames.ceil() as usize).saturating_sub(1)) * self.stride
+        let ideal_len = (f64_to_usize(n_frames.ceil()).saturating_sub(1)) * self.stride
             + (self.kernel_size.saturating_sub(self.padding));
         let extra_padding = ideal_len.saturating_sub(length);
         let hidden = hidden.pad_with_zeros(D::Minus1, self.padding, extra_padding)?;
@@ -1630,7 +1631,7 @@ impl HfMimiEncoder {
 
         let encoder_frame_rate =
             cfg.sample_rate / cfg.seanet.ratios.iter().product::<usize>() as f64;
-        let downsample_stride = (encoder_frame_rate / cfg.frame_rate) as usize;
+        let downsample_stride = f64_to_usize(encoder_frame_rate / cfg.frame_rate);
         let downsample = mimi::conv::ConvDownsample1d::new(
             downsample_stride,
             cfg.seanet.dimension,

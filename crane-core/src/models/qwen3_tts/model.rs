@@ -12,6 +12,7 @@ use super::modeling::{Qwen3TTSConfig, Qwen3TTSModel, StreamingState};
 use super::speech_tokenizer_v2::NativeSpeechTokenizerDecoder;
 use crate::generation::SpeechOptions;
 use crate::models::modules::mel::{MelSpectrogramConfig, compute_mel_spectrogram};
+use crate::utils::float_cast::f64_to_usize;
 use crate::utils::utils;
 
 // ── Speech Tokenizer decoders (codes → waveform) ───────────────────────
@@ -627,7 +628,7 @@ impl Model {
         let mut cut = ref_samples.min(total_samples.saturating_sub(1));
         if cut == 0 {
             let proportional =
-                (ref_t as f64 / total_t.max(1) as f64 * total_samples as f64) as usize;
+                f64_to_usize(ref_t as f64 / total_t.max(1) as f64 * total_samples as f64);
             cut = proportional.min(total_samples.saturating_sub(1));
         }
         let audio = audio_full.narrow(2, cut, total_samples - cut)?;
