@@ -13,6 +13,7 @@ use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use serde::Deserialize;
 
 use super::config::Config;
+use crate::utils::float_cast::f64_to_usize;
 
 /// Mirror of HF `preprocessor_config.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -69,7 +70,7 @@ pub fn load_preprocessor_config(model_dir: &str) -> Result<PreprocessorConfig> {
 // ── Slicing arithmetic (pure, no image ops) ─────────────────────────────
 
 pub(crate) fn ensure_divide(length: f64, divisor: usize) -> usize {
-    ((length / divisor as f64).round() as usize).max(1) * divisor
+    f64_to_usize((length / divisor as f64).round()).max(1) * divisor
 }
 
 /// Resize `(height, width)` to fit `scale_resolution` while keeping the
@@ -113,8 +114,8 @@ pub(crate) fn get_refine_size(
     let refine_width = ensure_divide(width as f64, grid_w);
     let refine_height = ensure_divide(height as f64, grid_h);
     let (best_h, best_w) = find_best_resize(
-        (refine_height as f64 / grid_h as f64).round() as usize,
-        (refine_width as f64 / grid_w as f64).round() as usize,
+        f64_to_usize((refine_height as f64 / grid_h as f64).round()),
+        f64_to_usize((refine_width as f64 / grid_w as f64).round()),
         scale_resolution,
         unit,
         allow_upscale,
@@ -138,7 +139,7 @@ pub(crate) fn get_sliced_grid(
 ) -> Option<(usize, usize)> {
     let log_ratio = (width as f64 / height as f64).ln();
     let ratio = (width * height) as f64 / (scale_resolution * scale_resolution) as f64;
-    let multiple = (ratio.ceil() as usize).min(max_slice_nums);
+    let multiple = f64_to_usize(ratio.ceil()).min(max_slice_nums);
     if multiple <= 1 {
         return None;
     }

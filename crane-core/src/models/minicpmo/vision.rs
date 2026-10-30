@@ -22,6 +22,7 @@ use candle_nn::{
 
 use crate::models::minicpm_v::config::VisionConfig;
 use crate::quantized::gguf_file::Gguf;
+use crate::utils::float_cast::f64_to_usize;
 
 // ── Attention ────────────────────────────────────────────────────────────
 
@@ -284,7 +285,7 @@ impl VisionEmbeddings {
         let n_side = self.num_patches_per_side;
         let bucket = |k: usize, n: usize| -> usize {
             let frac = k as f64 / n as f64;
-            ((frac * n_side as f64).floor() as usize).min(n_side - 1)
+            f64_to_usize((frac * n_side as f64).floor()).min(n_side - 1)
         };
 
         let mut pos_ids = vec![0u32; b * max_nb_patches];

@@ -13,6 +13,7 @@ use candle_nn::{Linear, RmsNorm, VarBuilder, linear_no_bias};
 use serde::Deserialize;
 
 use super::modeling::rms_normalize;
+use crate::utils::float_cast::f64_to_usize;
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -533,7 +534,7 @@ impl VisionPooler {
         length: usize,
     ) -> Result<Tensor> {
         let input_len = hidden_states.dim(1)?;
-        let k = ((input_len as f64 / length as f64).sqrt()) as usize;
+        let k = f64_to_usize((input_len as f64 / length as f64).sqrt());
         let k_squared = k * k;
 
         // Compute kernel indices from position IDs
@@ -774,8 +775,8 @@ fn get_aspect_ratio_preserving_size(
     let side_mult = (pooling_kernel_size * patch_size) as f64;
 
     // Round down to nearest multiple of pooling_kernel_size * patch_size
-    let target_h = ((ideal_h / side_mult).floor() * side_mult) as usize;
-    let target_w = ((ideal_w / side_mult).floor() * side_mult) as usize;
+    let target_h = f64_to_usize((ideal_h / side_mult).floor() * side_mult);
+    let target_w = f64_to_usize((ideal_w / side_mult).floor() * side_mult);
 
     let min_side = pooling_kernel_size * patch_size;
     (target_h.max(min_side), target_w.max(min_side))

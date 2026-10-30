@@ -15,6 +15,7 @@
 //! changes, sysex. `MuScriptor` never produces those, and Crane doesn't
 //! have a use case for them.
 
+use crate::utils::float_cast::f64_to_u32;
 use std::io::Write;
 
 /// Default tempo: 120 BPM (`500_000` µs / quarter).
@@ -302,7 +303,7 @@ fn secs_to_tick(secs: f64, ticks_per_beat: u16, tempo_us: u32) -> u32 {
     }
     // ticks = secs * 1e6 / tempo * ticks_per_beat
     let ticks = secs * 1_000_000.0 * (ticks_per_beat as f64) / (tempo_us as f64);
-    ticks.round().max(0.0) as u32
+    f64_to_u32(ticks.round().max(0.0))
 }
 
 fn build_header(num_tracks: u16, ticks_per_beat: u16) -> Vec<u8> {

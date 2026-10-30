@@ -2,6 +2,7 @@ use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor};
 use std::path::Path;
 
+use crate::utils::float_cast::f64_to_usize;
 use anyhow::Context;
 
 /// Interpolation mode for resizing.
@@ -171,12 +172,12 @@ pub fn smart_resize(
 
     if pixels > max_pixels {
         let scale = (pixels as f64 / max_pixels as f64).sqrt();
-        h_bar = ((height as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
-        w_bar = ((width as f64 / scale / factor as f64).floor() as usize).max(1) * factor;
+        h_bar = f64_to_usize((height as f64 / scale / factor as f64).floor()).max(1) * factor;
+        w_bar = f64_to_usize((width as f64 / scale / factor as f64).floor()).max(1) * factor;
     } else if pixels < min_pixels {
         let scale = (min_pixels as f64 / pixels as f64).sqrt();
-        h_bar = ((height as f64 * scale / factor as f64).ceil() as usize) * factor;
-        w_bar = ((width as f64 * scale / factor as f64).ceil() as usize) * factor;
+        h_bar = f64_to_usize((height as f64 * scale / factor as f64).ceil()) * factor;
+        w_bar = f64_to_usize((width as f64 * scale / factor as f64).ceil()) * factor;
     }
 
     if (h_bar as f64 / w_bar as f64).max(w_bar as f64 / h_bar as f64) > 200.0 {

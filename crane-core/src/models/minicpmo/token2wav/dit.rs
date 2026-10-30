@@ -11,6 +11,7 @@
 //! doubled cond/uncond CFG batch, not a real padding batch), so attention
 //! runs unmasked — see `cfm.rs`.
 
+use crate::utils::float_cast::f64_to_usize;
 use candle_core::{D, Module, Result, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, LayerNorm, Linear, VarBuilder, layer_norm, linear};
 
@@ -220,7 +221,7 @@ impl DiTBlock {
         mlp_ratio: f64,
         vb: &VarBuilder,
     ) -> Result<Self> {
-        let mlp_hidden = (hidden_size as f64 * mlp_ratio) as usize;
+        let mlp_hidden = f64_to_usize(hidden_size as f64 * mlp_ratio);
         Ok(Self {
             attn: DitAttention::new(hidden_size, num_heads, head_dim, &vb.pp("attn"))?,
             mlp: Mlp::new(hidden_size, mlp_hidden, &vb.pp("mlp"))?,

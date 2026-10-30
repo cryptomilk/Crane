@@ -43,6 +43,7 @@ use crate::models::muscriptor::mt3::{
 };
 use crate::models::muscriptor::transformer::{StreamingTransformer, TransformerState};
 use crate::ops::linear::LinearLayer;
+use crate::utils::float_cast::{f32_to_usize, f64_to_usize};
 
 // ── Public note/event stream types ────────────────────────────────────
 
@@ -567,11 +568,11 @@ impl Model {
             return samples.to_vec();
         }
         let ratio = SAMPLE_RATE as f64 / in_sr as f64;
-        let out_len = (samples.len() as f64 * ratio).round() as usize;
+        let out_len = f64_to_usize((samples.len() as f64 * ratio).round());
         let mut out = Vec::with_capacity(out_len);
         for i in 0..out_len {
             let src = i as f64 / ratio;
-            let i0 = src.floor() as usize;
+            let i0 = f64_to_usize(src.floor());
             let i1 = (i0 + 1).min(samples.len().saturating_sub(1));
             let frac = (src - i0 as f64) as f32;
             out.push(samples[i0] * (1.0 - frac) + samples[i1] * frac);
@@ -751,7 +752,7 @@ impl TranscriptionModel {
             samples.to_vec()
         };
 
-        let segment_samples = (SEGMENT_DURATION * SAMPLE_RATE as f32) as usize;
+        let segment_samples = f32_to_usize(SEGMENT_DURATION * SAMPLE_RATE as f32);
         let num_chunks = full.len().div_ceil(segment_samples).max(1);
 
         let instrument_group = if let Some(names) = &config.instruments {

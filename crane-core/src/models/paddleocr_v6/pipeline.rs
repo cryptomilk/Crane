@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{DEFAULT_CHECKPOINT_DIR, DICTIONARY_FILE, PaddleOcrV6};
+use crate::utils::float_cast::{f32_to_u32, f32_to_usize};
 
 #[derive(Debug, Clone)]
 pub struct OcrRegion {
@@ -156,7 +157,8 @@ impl PaddleOcrV6Pipeline {
                     candidate.bottom - candidate.top,
                 )
                 .to_image();
-                let width = (((crop.width() as f32 / crop.height() as f32) * 48.0) as usize).max(1);
+                let width =
+                    f32_to_usize((crop.width() as f32 / crop.height() as f32) * 48.0).max(1);
                 PreparedCrop {
                     candidate,
                     crop,
@@ -253,7 +255,7 @@ struct Candidate {
 }
 
 fn round_to_32(value: f32) -> u32 {
-    ((value / 32.0).round() * 32.0).max(32.0) as u32
+    f32_to_u32(((value / 32.0).round() * 32.0).max(32.0))
 }
 
 fn db_regions(
@@ -300,8 +302,8 @@ fn db_regions(
                 continue;
             }
             // Approximate DB unclip_ratio=1.5 for an axis-aligned component.
-            let grow_x = ((x1 - x0 + 1) as f32 * 0.25).ceil() as usize;
-            let grow_y = ((y1 - y0 + 1) as f32 * 0.25).ceil() as usize;
+            let grow_x = f32_to_usize(((x1 - x0 + 1) as f32 * 0.25).ceil());
+            let grow_y = f32_to_usize(((y1 - y0 + 1) as f32 * 0.25).ceil());
             x0 = x0.saturating_sub(grow_x);
             y0 = y0.saturating_sub(grow_y);
             x1 = (x1 + grow_x).min(width.saturating_sub(1));
@@ -312,10 +314,10 @@ fn db_regions(
             let map_to_source_y = source_height as f32 / resized_height as f32
                 * resized_height as f32
                 / height as f32;
-            let left = (x0 as f32 * map_to_source_x).floor() as u32;
-            let top = (y0 as f32 * map_to_source_y).floor() as u32;
-            let right = (((x1 + 1) as f32 * map_to_source_x).ceil() as u32).min(source_width);
-            let bottom = (((y1 + 1) as f32 * map_to_source_y).ceil() as u32).min(source_height);
+            let left = f32_to_u32((x0 as f32 * map_to_source_x).floor());
+            let top = f32_to_u32((y0 as f32 * map_to_source_y).floor());
+            let right = f32_to_u32(((x1 + 1) as f32 * map_to_source_x).ceil()).min(source_width);
+            let bottom = f32_to_u32(((y1 + 1) as f32 * map_to_source_y).ceil()).min(source_height);
             if right > left + 2 && bottom > top + 2 {
                 boxes.push(Candidate {
                     left,

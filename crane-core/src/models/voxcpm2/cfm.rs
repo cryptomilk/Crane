@@ -13,6 +13,7 @@
 use candle_core::{DType, Device, Result, Tensor};
 
 use super::local_dit::VoxCpmLocDit;
+use crate::utils::float_cast::f64_to_usize;
 
 pub struct UnifiedCfm {
     estimator: VoxCpmLocDit,
@@ -95,7 +96,7 @@ impl UnifiedCfm {
         dtype: DType,
     ) -> Result<Tensor> {
         let n = t_span.len();
-        let zero_init_steps = ((0.04 * n as f64) as usize).max(1);
+        let zero_init_steps = f64_to_usize(0.04 * n as f64).max(1);
 
         // CFG batch base `[cond ; uncond]`: `mu`/`cond` are fixed across the
         // whole Euler integration, so double them once rather than per step.

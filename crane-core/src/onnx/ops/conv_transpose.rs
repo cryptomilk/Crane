@@ -17,16 +17,16 @@ pub(crate) fn conv_transpose(
 ) -> Result<Tensor> {
     validate_common_attributes(node)?;
     let group = int_attribute(node, "group", 1)?;
-    if group <= 0 {
+    let Some(group) = usize::try_from(group).ok().filter(|&group| group > 0) else {
         bail!(
             "ConvTranspose node '{}' has invalid group {group}",
             node.name
         );
-    }
+    };
 
     let output = match weight.rank() {
-        3 => conv_transpose1d(node, input, weight, group as usize)?,
-        4 => conv_transpose2d(node, input, weight, group as usize)?,
+        3 => conv_transpose1d(node, input, weight, group)?,
+        4 => conv_transpose2d(node, input, weight, group)?,
         rank => bail!(
             "ConvTranspose node '{}' requires a rank-3 or rank-4 weight, got rank {rank}",
             node.name
@@ -138,11 +138,14 @@ fn symmetric_value(
             attribute.ints
         );
     }
+    // Every value was checked non-negative above, so the sign is never lost.
+    #[allow(clippy::cast_sign_loss)]
     let value = attribute.ints[0] as usize;
+    // `value` is non-negative, so equality on `i64` is equality on `usize`.
     if attribute
         .ints
         .iter()
-        .any(|&candidate| candidate as usize != value)
+        .any(|&candidate| candidate != attribute.ints[0])
     {
         bail!(
             "ConvTranspose node '{}' has asymmetric '{}'={:?}; the current Candle kernel requires identical values on every spatial axis",
